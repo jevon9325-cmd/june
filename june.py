@@ -76,15 +76,15 @@ MOMENTUM_PCT = 0.30   # |change_5m| % to flag as momentum alert
 # verify_epics() runs on startup and calls discover_epic() to fix any that
 # return 404 or error. Correct epics are logged for future reference.
 INSTRUMENTS: dict = {
-    "EURUSD": "CS.D.EURUSD.CFD.IP",
-    "GBPUSD": "CS.D.GBPUSD.CFD.IP",
-    "USDJPY": "CS.D.USDJPY.CFD.IP",
-    "SPX500": "IX.D.SPTRD.FWS.IP",
-    "GER40":  "IX.D.DAX.CFD.IP",
-    "UK100":  "IX.D.FTSE.CFD.IP",
-    "GOLD":   "CS.D.CFEGOLD.CFE.IP",
-    "SILVER": "CS.D.CSILVER.CFD.IP",
-    "OIL":    "CC.D.LCO.USS.IP",
+    "EURUSD": "CS.D.EURUSD.CFD.IP",    # verified demo
+    "GBPUSD": "CS.D.GBPUSD.CFD.IP",    # verified demo
+    "USDJPY": "CS.D.USDJPY.CFD.IP",    # verified demo
+    "SPX500": "IX.D.SPTRD.IFD.IP",     # discovered: US 500 Cash (50)
+    "GER40":  "IX.D.DAX.IFD.IP",       # discovered: Germany 40 Cash (E25)
+    "UK100":  "IX.D.FTSE.CFD.IP",      # verified demo
+    "GOLD":   "CS.D.IN_GOLD.MFI.IP",   # discovered: Spot Gold
+    "SILVER": "CS.D.CFDSILVER.CFM.IP", # discovered: Mini Spot Silver (500oz)
+    "OIL":    "CC.D.LCO.USS.IP",       # verified demo
 }
 
 # Fallback search terms if an epic is rejected — passed to /markets?searchTerm=
