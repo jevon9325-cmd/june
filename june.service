@@ -1,0 +1,22 @@
+[Unit]
+Description=June — IG CFD Signal Publisher (beta v0.1)
+Documentation=https://github.com/jevon9325-cmd/june
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/bots/june
+EnvironmentFile=/opt/bots/june.env
+ExecStart=/opt/bots/june/venv/bin/python /opt/bots/june/june.py
+Restart=on-failure
+RestartSec=30
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=june
+
+[Install]
+WantedBy=multi-user.target
