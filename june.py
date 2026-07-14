@@ -1075,7 +1075,7 @@ _SIM_MAX_DURATION      = 24 * 3600  # hard stop at 24h
 _SIM_SIZING_ORDER      = ["fixed_5", "fixed_10", "pct_5", "pct_10"]
 _SIM_SIZING_CYCLE      = 2 * 3600   # rotate sizing approach every 2 hours
 
-_SIM_ENTRY_VOL_MIN     = 0.30       # |change_5m| >= 0.30% required to enter
+_SIM_ENTRY_VOL_MIN     = 0.15       # |change_5m| >= 0.15% required to enter
 _SIM_STOP_PCT          = 0.02       # 2% adverse move → stop loss
 _SIM_TP_PCT            = 0.03       # 3% favorable move → take profit
 _SIM_MAX_HOLD_SECS     = 4 * 3600   # force-close after 4 hours
@@ -1515,9 +1515,6 @@ def run_simulation_step(signals: dict) -> None:
         return
 
     # No position — look for entry signal (skip neutral regime)
-    if regime == "neutral":
-        return
-
     _sim_try_entry(signals, regime, leverage, approach)
 
 
