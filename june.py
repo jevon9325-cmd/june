@@ -132,6 +132,53 @@ CORR_PAIRS = [
     ("SPX500", "USDJPY",  "SPX500 and USD/JPY are a risk-on/risk-off proxy"),
 ]
 
+
+# ── T212 to June instrument reverse mapping (for exit warning monitor) ────────
+# Derived from JUNE_INSTRUMENT_SECTORS / _JUNE_GAP_T212 in alert_system.py.
+# Maps T212 base ticker -> June instrument name for CFD deterioration crosscheck.
+T212_TO_JUNE_INSTRUMENT: dict = {
+    # Gold proxies
+    "NEM": "GOLD", "GDX": "GOLD", "GLD": "GOLD", "GDX3": "GOLD", "SGDE": "GOLD",
+    # Silver proxies
+    "AG": "SILVER", "PAAS": "SILVER", "SLV": "SILVER", "SILG": "SILVER",
+    "SSLN": "SILVER", "3LSI": "SILVER",
+    # Oil proxies
+    "XOM": "OIL", "CVX": "OIL", "USO": "OIL", "3OIL": "OIL",
+    "OXY": "OIL", "SLB": "OIL", "STNG": "OIL",
+    # S&P 500 proxies
+    "SPY": "SPX500", "VTI": "SPX500", "XS2D": "SPX500",
+    "SPXU": "SPX500",
+    # QQQ proxies -> SPX500 (no Nasdaq CFD, use SPX500 as broad tech proxy)
+    "QQQ": "SPX500", "QQQ3": "SPX500", "SQQQ": "SPX500",
+    # Europe/UK proxies
+    "CSPX": "UK100", "IWDA": "UK100", "EQQQ": "GER40",
+    # Tech via SPX500
+    "NVDA": "SPX500", "AAPL": "SPX500", "MSFT": "SPX500",
+    "AMD": "SPX500", "INTC": "SPX500", "MU": "SPX500",
+    # Finance via SPX500
+    "XLF": "SPX500", "XLF3": "SPX500", "XL3S": "SPX500",
+    # Defense via UK100/GER40 (3EDF is European Defence ETF)
+    "BA": "SPX500", "RTX": "SPX500", "LMT": "SPX500",
+    "3EDF": "UK100",
+}
+
+# Reverse: June instrument -> T212 equivalents for exit warning t212_equivalents field
+_JUNE_TO_T212_EQUIVALENTS: dict = {}
+for _sym, _inst in T212_TO_JUNE_INSTRUMENT.items():
+    _JUNE_TO_T212_EQUIVALENTS.setdefault(_inst, []).append(_sym)
+
+# Three-way confirmation instrument groups for macro regime detection
+_THREE_WAY_GROUPS = [
+    {"name": "safe_haven",     "instruments": ["GOLD", "SILVER", "USDJPY"],
+     "direction": "up",  "note": "Safe-haven flight: Gold + Silver + JPY strength"},
+    {"name": "risk_on",        "instruments": ["SPX500", "GER40", "GBPUSD"],
+     "direction": "up",  "note": "Risk-on: equities + GBP rising together"},
+    {"name": "commodity_bull", "instruments": ["GOLD", "SILVER", "OIL"],
+     "direction": "up",  "note": "Commodity bull: Gold + Silver + Oil rising"},
+    {"name": "dollar_strength", "instruments": ["USDJPY", "EURUSD", "GBPUSD"],
+     "direction": "mixed", "note": "Dollar strength: USDJPY up while EURUSD + GBPUSD down"},
+]
+
 # ── Module-level state ───────────────────────────────────────────────────────
 
 # IG session
@@ -640,6 +687,255 @@ def compute_signal(sym: str, price: dict, spread_alert: bool = False) -> dict:
 
 
 # ── Poll cycle ────────────────────────────────────────────────────────────────
+
+# ── Sister-bot crosscheck functions ───────────────────────────────────────────
+
+def _check_equity_signals() -> None:
+    """Read Claudia's june_check_requests and publish per-symbol CFD crosscheck signals.
+    Uses sector-proxy mapping since June has no individual equity CFDs."""
+    THREE_WAY_THRESHOLD = 0.15
+    try:
+        r = _redis()
+        raw = r.get("june_check_requests")
+        if not raw:
+            return
+        req = json.loads(raw)
+        candidates = req.get("candidates", [])
+        if not candidates:
+            return
+
+        confirmed = []
+        contradicted = []
+        ts_now = int(time.time())
+
+        for c in candidates:
+            sym = c.get("symbol", "")
+            change_pct_fmp = c.get("change_pct", 0.0)
+
+            june_inst = T212_TO_JUNE_INSTRUMENT.get(sym)
+            if june_inst not in INSTRUMENTS:
+                continue
+
+            hist = _history.get(june_inst)
+            now_price = hist[-1][1] if hist else None
+            price_5m = _price_n_minutes_ago(june_inst, 5.0)
+            if now_price is None or price_5m is None or price_5m == 0:
+                continue
+
+            change_5m = (now_price - price_5m) / price_5m * 100.0
+
+            fmp_up = change_pct_fmp > 0.2
+            fmp_dn = change_pct_fmp < -0.2
+            cfd_up = change_5m > THREE_WAY_THRESHOLD
+            cfd_dn = change_5m < -THREE_WAY_THRESHOLD
+
+            entry = {
+                "symbol": sym,
+                "cfd_instrument": june_inst,
+                "pct": round(change_5m, 3),
+                "direction": "up" if cfd_up else ("down" if cfd_dn else "flat"),
+                "ts": ts_now,
+            }
+            if (fmp_up and cfd_up) or (fmp_dn and cfd_dn):
+                confirmed.append(entry)
+            elif (fmp_up and cfd_dn) or (fmp_dn and cfd_up):
+                contradicted.append(entry)
+
+        if confirmed or contradicted:
+            payload = {"confirmed": confirmed, "contradicted": contradicted, "ts": ts_now}
+            r.set("june_equity_signals", json.dumps(payload), ex=90)
+            if confirmed:
+                print(f"[{_ts()}] \u2705 june_equity_signals: confirmed {[e['symbol'] for e in confirmed]}", flush=True)
+            if contradicted:
+                print(f"[{_ts()}] \u26a0\ufe0f  june_equity_signals: contradicted {[e['symbol'] for e in contradicted]}", flush=True)
+    except Exception as exc:
+        print(f"[{_ts()}] \u26a0\ufe0f  _check_equity_signals error (non-fatal): {exc}", flush=True)
+
+
+def _check_exit_warnings() -> None:
+    """Read ms_held_positions and publish CFD-based exit warnings for deteriorating proxies."""
+    try:
+        r = _redis()
+        raw = r.get("ms_held_positions")
+        if not raw:
+            return
+        positions = json.loads(raw)
+        if not positions:
+            return
+
+        warnings = []
+        ts_now = int(time.time())
+
+        for t212_ticker, pos in positions.items():
+            base = t212_ticker.split("_")[0].upper()
+            june_inst = T212_TO_JUNE_INSTRUMENT.get(base)
+            if june_inst not in INSTRUMENTS:
+                continue
+
+            hist = _history.get(june_inst)
+            now_price = hist[-1][1] if hist else None
+            price_5m = _price_n_minutes_ago(june_inst, 5.0)
+            if now_price is None or price_5m is None or price_5m == 0:
+                continue
+
+            change_5m = (now_price - price_5m) / price_5m * 100.0
+            if change_5m >= -0.5:
+                continue
+
+            abs_chg = abs(change_5m)
+            severity = "severe" if abs_chg >= 2.0 else ("moderate" if abs_chg >= 1.0 else "mild")
+            warnings.append({
+                "cfd_instrument": june_inst,
+                "t212_equivalents": _JUNE_TO_T212_EQUIVALENTS.get(june_inst, []),
+                "direction": "down",
+                "pct": round(change_5m, 3),
+                "severity": severity,
+                "ts": ts_now,
+            })
+
+        if warnings:
+            r.set("june_exit_warnings", json.dumps({"warnings": warnings}), ex=120)
+            summary = [(w["cfd_instrument"], w["severity"], f"{w['pct']:+.2f}%") for w in warnings]
+            print(f"[{_ts()}] \U0001f6a8 june_exit_warnings: {summary}", flush=True)
+        else:
+            r.delete("june_exit_warnings")
+    except Exception as exc:
+        print(f"[{_ts()}] \u26a0\ufe0f  _check_exit_warnings error (non-fatal): {exc}", flush=True)
+
+
+def _publish_macro_regime() -> None:
+    """Compute and publish a structured macro regime assessment to june_macro_regime (TTL 90s)."""
+    CONFIRM_THRESHOLD = 0.15
+    try:
+        ts_now = int(time.time())
+        signals_by_sym = {}
+        for sym in INSTRUMENTS:
+            hist = _history.get(sym)
+            if not hist:
+                continue
+            now_px = hist[-1][1] if hist else None
+            px_5m  = _price_n_minutes_ago(sym, 5.0)
+            if now_px is None or px_5m is None or px_5m == 0:
+                continue
+            signals_by_sym[sym] = (now_px - px_5m) / px_5m * 100.0
+
+        if not signals_by_sym:
+            return
+
+        three_way = []
+        for group in _THREE_WAY_GROUPS:
+            insts = group["instruments"]
+            if group["direction"] == "mixed":
+                if (
+                    signals_by_sym.get("USDJPY", 0) > CONFIRM_THRESHOLD and
+                    signals_by_sym.get("EURUSD", 0) < -CONFIRM_THRESHOLD and
+                    signals_by_sym.get("GBPUSD", 0) < -CONFIRM_THRESHOLD
+                ):
+                    three_way.append({
+                        "instruments": insts,
+                        "direction": "dollar_strength",
+                        "note": group["note"],
+                    })
+            else:
+                ci = [
+                    i for i in insts if i in signals_by_sym and (
+                        (group["direction"] == "up"   and signals_by_sym[i] >  CONFIRM_THRESHOLD) or
+                        (group["direction"] == "down" and signals_by_sym[i] < -CONFIRM_THRESHOLD)
+                    )
+                ]
+                if len(ci) >= 2:
+                    three_way.append({
+                        "instruments": ci,
+                        "direction": group["direction"],
+                        "note": group["note"],
+                    })
+
+        corr_breaks = []
+        for sym_a, sym_b, description in CORR_PAIRS:
+            a = signals_by_sym.get(sym_a)
+            b = signals_by_sym.get(sym_b)
+            if a is None or b is None:
+                continue
+            if (
+                abs(a - b) >= CORR_DIVERGENCE_PCT and
+                abs(a) > CONFIRM_THRESHOLD and
+                abs(b) > CONFIRM_THRESHOLD and
+                (a > 0) != (b > 0)
+            ):
+                corr_breaks.append({"pair": [sym_a, sym_b], "note": description})
+
+        liq_warnings = []
+        for sym, hist_sp in _spread_hist.items():
+            if len(hist_sp) < SPREAD_MIN_READINGS:
+                continue
+            avg_sp = sum(hist_sp) / len(hist_sp)
+            if avg_sp <= 0:
+                continue
+            current_sp = hist_sp[-1] if hist_sp else 0
+            if current_sp > SPREAD_ALERT_FACTOR * avg_sp:
+                liq_warnings.append({
+                    "instrument": sym,
+                    "spread_pct": round(current_sp, 4),
+                    "vs_avg": round(avg_sp, 4),
+                    "note": f"Spread {current_sp:.3f}% vs avg {avg_sp:.3f}%",
+                })
+
+        spx_chg = signals_by_sym.get("SPX500")
+        spx_signal = None
+        if spx_chg is not None:
+            spx_signal = {
+                "direction": "up" if spx_chg > 0 else ("down" if spx_chg < 0 else "flat"),
+                "change_5m": round(spx_chg, 3),
+                "note": f"SPX500 {spx_chg:+.3f}% last 5 min",
+            }
+
+        pos_count = sum(1 for v in signals_by_sym.values() if v > CONFIRM_THRESHOLD)
+        neg_count = sum(1 for v in signals_by_sym.values() if v < -CONFIRM_THRESHOLD)
+        total = len(signals_by_sym)
+        all_moves = list(signals_by_sym.values())
+        avg_abs = sum(abs(v) for v in all_moves) / len(all_moves) if all_moves else 0
+
+        if pos_count >= total * 0.7:
+            regime = "bull"
+        elif neg_count >= total * 0.7:
+            regime = "bear"
+        elif avg_abs > 0.5:
+            regime = "volatile"
+        else:
+            regime = "neutral"
+
+        if three_way:
+            confidence = "high"
+        elif len(corr_breaks) == 0 and (pos_count >= total * 0.6 or neg_count >= total * 0.6):
+            confidence = "medium"
+        else:
+            confidence = "low"
+
+        summary_parts = [f"Regime: {regime} (confidence: {confidence})."]
+        if spx_signal:
+            summary_parts.append(f"SPX500 {spx_signal['change_5m']:+.3f}% (5m).")
+        if three_way:
+            summary_parts.append(f"Three-way: {[g['note'] for g in three_way]}.")
+        if corr_breaks:
+            summary_parts.append(f"Corr breaks: {[b['pair'] for b in corr_breaks]}.")
+        if liq_warnings:
+            summary_parts.append(f"Spread alerts: {[w['instrument'] for w in liq_warnings]}.")
+        summary = " ".join(summary_parts)
+
+        payload = {
+            "timestamp": ts_now,
+            "regime": regime,
+            "confidence": confidence,
+            "three_way_confirmations": three_way,
+            "correlation_breaks": corr_breaks,
+            "liquidity_warnings": liq_warnings,
+            "spx_futures_signal": spx_signal,
+            "summary": summary,
+        }
+        _redis().set("june_macro_regime", json.dumps(payload), ex=90)
+    except Exception as exc:
+        print(f"[{_ts()}] \u26a0\ufe0f  _publish_macro_regime error (non-fatal): {exc}", flush=True)
+
 def poll_cycle() -> bool:
     """Fetch all instrument prices, update state, publish june_signals. Returns True if prices returned."""
     now          = time.time()
@@ -710,6 +1006,11 @@ def poll_cycle() -> bool:
     # Pre-London gap check (only during 06:00-07:00 UTC window)
     if is_premarket():
         _check_premarket_gaps(current_mids)
+
+    # Sister-bot crosscheck (equity signals, exit warnings, macro regime)
+    _check_equity_signals()
+    _check_exit_warnings()
+    _publish_macro_regime()
 
     # Log summary
     alert_tag = f"  🚨 ALERTS → {alerts}" if alerts else ""
