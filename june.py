@@ -920,6 +920,39 @@ def _publish_macro_regime() -> None:
             summary_parts.append(f"Corr breaks: {[b['pair'] for b in corr_breaks]}.")
         if liq_warnings:
             summary_parts.append(f"Spread alerts: {[w['instrument'] for w in liq_warnings]}.")
+
+        # Enrich with Claudia sector momentum direction
+        try:
+            _csm_raw = _redis().get("claudia_sector_momentum")
+            if _csm_raw:
+                _csm       = json.loads(_csm_raw)
+                _csm_accel = _csm.get("accelerating", [])
+                _csm_decel = _csm.get("decelerating", [])
+                _csm_secs  = _csm.get("sectors", {})
+                if len(_csm_accel) >= 3:
+                    summary_parts.append(
+                        f"Broad sector acceleration across {len(_csm_accel)} sectors "
+                        f"({', '.join(_csm_accel[:3])})."
+                    )
+                elif _csm_accel:
+                    _sustained_accel = [
+                        s for s in _csm_accel
+                        if _csm_secs.get(s, {}).get("cycles_in_direction", 0) >= 3
+                    ]
+                    if _sustained_accel:
+                        summary_parts.append(
+                            f"Sustained sector acceleration: {', '.join(_sustained_accel)} "
+                            f"({_csm_secs[_sustained_accel[0]].get('cycles_in_direction', 0)}+ cycles)."
+                        )
+                _sustained_decel = [
+                    s for s in _csm_decel
+                    if _csm_secs.get(s, {}).get("cycles_in_direction", 0) >= 3
+                ]
+                if _sustained_decel:
+                    summary_parts.append(f"Sustained sector deceleration: {', '.join(_sustained_decel)}.")
+        except Exception:
+            pass
+
         summary = " ".join(summary_parts)
 
         payload = {
