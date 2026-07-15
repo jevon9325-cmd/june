@@ -1451,6 +1451,26 @@ def _sim_try_entry(signals: dict, regime: str, leverage: int, approach: str) -> 
     chg       = sig.get("change_5m", 0.0)
     vol       = abs(chg)
     direction = "long" if chg > 0 else "short"
+
+    # 1-minute momentum confirmation gate
+    # Skip if the 5-minute signal is present but the 1-minute direction has
+    # already reversed -- avoids entering at the tail end of a move.
+    price_1m = _price_n_minutes_ago(sym, 1)
+    if price_1m is not None:
+        current_px = sig.get("price", 0.0)
+        if direction == "long" and current_px <= price_1m:
+            _sim_log(
+                f"⏭️ Skip {sym} -- 5m bull signal but 1m reversing "
+                f"({price_1m:.4f} -> {current_px:.4f}) (entry timing gate)"
+            )
+            return
+        if direction == "short" and current_px >= price_1m:
+            _sim_log(
+                f"⏭️ Skip {sym} -- 5m bear signal but 1m reversing "
+                f"({price_1m:.4f} -> {current_px:.4f}) (entry timing gate)"
+            )
+            return
+
     stage     = _sim.get("stage", "sprout")
 
     if stage == "sprout":
@@ -1804,14 +1824,39 @@ def sim_startup() -> None:
                                                for b in ("high", "mid", "low")}),
         })
 
-        balance   = _sim["balance"]
-        stage     = _sim["stage"].upper()
-        tw        = _sim["total_wins"] + _sim["total_losses"]
-        elapsed_h = (now - _sim["sim_start_time"]) / 3600.0
+        # Validate sim_start_time -- future timestamps mean state was reconstructed
+        total_trades = _sim["total_wins"] + _sim["total_losses"]
+        if _sim["sim_start_time"] > now:
+            bad_ts = _sim["sim_start_time"]
+            est_s  = total_trades * 8 * 60   # ~8 min average per completed trade
+            _sim["sim_start_time"] = now - est_s
+            print(
+                f"[{_ts()}] \u26a0\ufe0f SIM: Bad sim_start_time detected "
+                f"(future ts {bad_ts:.0f}) -- correcting elapsed to "
+                f"~{est_s/3600:.1f}h ({total_trades} trades x 8 min avg)",
+                flush=True,
+            )
+
+        # Validate open_position.entry_time -- also correct if in the future
+        open_pos = _sim.get("open_position")
+        if open_pos and open_pos.get("entry_time", 0) > now:
+            open_pos["entry_time"] = now - 30 * 60  # treat as 30 min ago
+            _sim["open_position"]  = open_pos
+            print(
+                f"[{_ts()}] \u26a0\ufe0f SIM: Bad open_position.entry_time (future) -- "
+                f"treated as 30 min ago",
+                flush=True,
+            )
+
+        elapsed_s = now - _sim["sim_start_time"]
+        elapsed_h = elapsed_s / 3600.0
+
+        balance = _sim["balance"]
+        stage   = _sim["stage"].upper()
         print(
             f"[{_ts()}] \U0001f9ea SIM: Resuming from saved state -- "
             f"Balance ${balance:.2f} | Stage: {stage} | "
-            f"Trades: {tw} | Elapsed: {elapsed_h:.1f}h",
+            f"Trades: {total_trades} | Elapsed: {elapsed_h:.1f}h",
             flush=True,
         )
 
@@ -1825,15 +1870,22 @@ def sim_startup() -> None:
                 flush=True,
             )
 
-        # Immediately transition to Phase 2 if criteria already met on resume
-        total_trades = _sim["total_wins"] + _sim["total_losses"]
-        elapsed_s    = now - _sim["sim_start_time"]
+        # Sanity check: if phase=2 is saved but criteria not yet met, revert to phase 1
+        if _sim["phase"] == 2 and total_trades < _SIM_PHASE_SWITCH_TRADES and elapsed_s < _SIM_PHASE_SWITCH_SECS:
+            _sim["phase"] = 1
+            print(
+                f"[{_ts()}] \u26a0\ufe0f SIM: Phase 2 in saved state but criteria not met "
+                f"[trades={total_trades}, elapsed={elapsed_h:.1f}h] -- reverting to Phase 1",
+                flush=True,
+            )
+
+        # Transition to Phase 2 immediately if criteria already met on resume
         if _sim["phase"] == 1 and (total_trades >= _SIM_PHASE_SWITCH_TRADES or elapsed_s >= _SIM_PHASE_SWITCH_SECS):
             _sim["phase"]            = 2
             _sim["phase_start_time"] = now
             print(
                 f"[{_ts()}] \U0001f9ea SIM: Phase 1 criteria met on resume "
-                f"[trades={total_trades}, elapsed={elapsed_s/3600:.1f}h] -- "
+                f"[trades={total_trades}, elapsed={elapsed_h:.1f}h] -- "
                 f"transitioning to Phase 2 (10:1 leverage) immediately",
                 flush=True,
             )
