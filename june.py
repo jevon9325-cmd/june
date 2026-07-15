@@ -1061,70 +1061,261 @@ def poll_cycle() -> bool:
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # VIRTUAL TRADING SIMULATION
-# Paper trades only — zero real orders, zero writes to intelligence Redis keys.
-# Reads june_macro_regime + signals each cycle. Writes june_sim_results on stop.
-# State is in-memory only; simulation resets if June restarts (acceptable).
-# All output uses 🧪 SIM: prefix. Filter: journalctl -u june | grep "🧪 SIM"
+# Self-graduating paper trading framework with persistent Redis state.
+# Stages: SPROUT -> SEEDLING -> GERMINATION -> VEGETATIVE -> FULL BLOOM
+# State key: june_sim_state (TTL 72h) -- survives June restarts.
+# Results key: june_sim_results (TTL 48h) -- written on stop/graduation end.
+# Manual stop: set Redis key june_sim_stop = "1"
+# All output tagged [STAGE/Pn]. Filter: journalctl -u june | grep "SIM"
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-_SIM_START_BALANCE     = 50.0
-_SIM_PROFIT_STOP       = 100.0      # stop if virtual P&L reaches +$100 (doubled)
-_SIM_LOSS_STOP         = -30.0      # stop if virtual P&L reaches -$30 (60% loss)
-_SIM_MAX_DURATION      = 24 * 3600  # hard stop at 24h
+# ── Global stops ──────────────────────────────────────────────────────────────
+_SIM_START_BALANCE   = 50.0
+_SIM_PROFIT_STOP     = 100.0    # doubled from start
+_SIM_LOSS_STOP       = -30.0   # 60% loss from start
 
-_SIM_SIZING_ORDER      = ["fixed_5", "fixed_10", "pct_5", "pct_10"]
-_SIM_SIZING_CYCLE      = 2 * 3600   # rotate sizing approach every 2 hours
+# ── Entry / exit parameters ───────────────────────────────────────────────────
+_SIM_ENTRY_VOL_MIN   = 0.15    # |change_5m| >= 0.15% to consider entry
+_SIM_STOP_PCT        = 0.02    # 2% adverse -> stop loss
+_SIM_TP_PCT          = 0.03    # 3% favourable -> take profit
+_SIM_MAX_HOLD_SECS   = 4 * 3600
 
-_SIM_ENTRY_VOL_MIN     = 0.15       # |change_5m| >= 0.15% required to enter
-_SIM_STOP_PCT          = 0.02       # 2% adverse move → stop loss
-_SIM_TP_PCT            = 0.03       # 3% favorable move → take profit
-_SIM_MAX_HOLD_SECS     = 4 * 3600   # force-close after 4 hours
+# ── Phase timing ──────────────────────────────────────────────────────────────
+_SIM_CONSERVATIVE_LEV    = 3
+_SIM_AGGRESSIVE_LEV      = 10
+_SIM_PHASE_SWITCH_TRADES = 10     # >= 10 completed trades triggers phase 2
+_SIM_PHASE_SWITCH_SECS   = 12 * 3600  # OR 12h elapsed, whichever first
 
-_SIM_CONSERVATIVE_LEV  = 3          # phase 1: first 12h
-_SIM_AGGRESSIVE_LEV    = 10         # phase 2: after 12h
-_SIM_PHASE_SWITCH_SECS = 12 * 3600
+# ── Sprout sizing rotation ─────────────────────────────────────────────────────
+_SIM_SIZING_ORDER    = ["fixed_5", "fixed_10", "pct_5", "pct_10"]
+_SIM_SIZING_CYCLE    = 2 * 3600
 
-_SIM_HIGH_VOL_THRESH   = 0.50       # |change_5m| > 0.50% = high volatility entry
-_SIM_LOW_VOL_THRESH    = 0.20       # |change_5m| < 0.20% = low volatility entry
+# ── Volatility buckets ────────────────────────────────────────────────────────
+_SIM_HIGH_VOL_THRESH = 0.50
+_SIM_LOW_VOL_THRESH  = 0.20
 
-# Approximate FX rates used only for minimum notional calculation at startup
-_SIM_APPROX_GBPUSD = 1.34
-_SIM_APPROX_EURUSD = 1.14
-_SIM_APPROX_USDJPY = 162.0
+# ── Stage definitions ─────────────────────────────────────────────────────────
+_SIM_STAGE_DEFS = {
+    "sprout":      {"label": "SPROUT",      "min_trades": 10, "min_wr": 0.50, "min_pnl_pct": 0.00, "fail_after": 30},
+    "seedling":    {"label": "SEEDLING",    "min_trades": 15, "min_wr": 0.55, "min_pnl_pct": 0.20, "fail_after": 40},
+    "germination": {"label": "GERMINATION", "min_trades": 20, "min_wr": 0.55, "min_pnl_pct": 0.30, "fail_after": 50},
+    "vegetative":  {"label": "VEGETATIVE",  "min_trades": 25, "min_wr": 0.60, "min_pnl_pct": 0.25, "fail_after": 60},
+    "full_bloom":  {"label": "FULL BLOOM",  "min_trades":  0, "min_wr": 0.00, "min_pnl_pct": 0.00, "fail_after": None},
+}
+_SIM_STAGE_ORDER = ["sprout", "seedling", "germination", "vegetative", "full_bloom"]
 
-# Populated by sim_startup() from IG API; not hardcoded
-_sim_eligible:      set  = set()
-_sim_min_notional:  dict = {}   # {sym: approx_usd_min_notional}
+# ── Stage approach map (non-sprout sizing) ────────────────────────────────────
+_SIM_STAGE_APPROACH = {
+    "seedling": "pct_5", "germination": "pct_3",
+    "vegetative": "pct_2", "full_bloom": "pct_2",
+}
 
-# All state in memory
-_sim:     dict = {}   # simulation meta-state (empty = not yet started)
-_sim_pos: dict = {}   # current open paper position (empty = no position)
+# ── Approximate FX rates for notional estimation ──────────────────────────────
+_SIM_APPROX_GBPUSD   = 1.34
+_SIM_APPROX_EURUSD   = 1.14
+_SIM_APPROX_USDJPY   = 162.0
+
+# ── Module-level state ────────────────────────────────────────────────────────
+_sim_eligible:     set  = set()
+_sim_min_notional: dict = {}
+_sim:              dict = {}    # empty = not started; truthy = running (used by poll_cycle)
 
 
+# ── Logging ───────────────────────────────────────────────────────────────────
 def _sim_log(msg: str) -> None:
-    print(f"[{_ts()}] \U0001f9ea SIM: {msg}", flush=True)
+    stage = _sim.get("stage", "?").upper()
+    phase = _sim.get("phase", 1)
+    print(f"[{_ts()}] \U0001f9ea SIM [{stage}/P{phase}]: {msg}", flush=True)
 
 
+# ── State persistence ─────────────────────────────────────────────────────────
+def _sim_save_state() -> None:
+    if not _sim:
+        return
+    payload = {
+        "balance":              _sim["balance"],
+        "stage":                _sim["stage"],
+        "stage_entry_balance":  _sim["stage_entry_balance"],
+        "stage_trades":         _sim["stage_trades"],
+        "stage_wins":           _sim["stage_wins"],
+        "stage_losses":         _sim["stage_losses"],
+        "total_wins":           _sim["total_wins"],
+        "total_losses":         _sim["total_losses"],
+        "phase":                _sim["phase"],
+        "phase_start_time":     _sim["phase_start_time"],
+        "sim_start_time":       _sim["sim_start_time"],
+        "sizing_idx":           _sim["sizing_idx"],
+        "sizing_rotation_time": _sim["sizing_rotation_time"],
+        "eligible_instruments": sorted(_sim_eligible),
+        "min_notionals":        _sim_min_notional,
+        "open_position":        _sim.get("open_position"),
+        "trade_history":        _sim.get("trade_history", [])[-50:],
+        "stage_history":        _sim.get("stage_history", []),
+        "long_pnl":             _sim.get("long_pnl", 0.0),
+        "long_trades":          _sim.get("long_trades", 0),
+        "long_wins":            _sim.get("long_wins", 0),
+        "short_pnl":            _sim.get("short_pnl", 0.0),
+        "short_trades":         _sim.get("short_trades", 0),
+        "short_wins":           _sim.get("short_wins", 0),
+        "approach_stats":       _sim.get("approach_stats", {}),
+        "vol_stats":            _sim.get("vol_stats", {}),
+    }
+    try:
+        _redis().set("june_sim_state", json.dumps(payload), ex=72 * 3600)
+    except Exception as exc:
+        print(f"[{_ts()}] \U0001f9ea SIM: state save failed: {exc}", flush=True)
+
+
+def _sim_load_state():
+    try:
+        raw = _redis().get("june_sim_state")
+        if raw:
+            return json.loads(raw)
+    except Exception as exc:
+        print(f"[{_ts()}] \U0001f9ea SIM: state load failed: {exc}", flush=True)
+    return None
+
+
+# ── Stage helpers ─────────────────────────────────────────────────────────────
+def _sim_check_graduation() -> str:
+    """Return 'graduate', 'fail', or 'continue' based on current stage stats."""
+    stage = _sim.get("stage", "sprout")
+    if stage == "full_bloom":
+        return "continue"
+    defn    = _SIM_STAGE_DEFS[stage]
+    n       = _sim["stage_trades"]
+    wr      = _sim["stage_wins"] / n if n else 0.0
+    entry_b = _sim["stage_entry_balance"]
+    pnl_pct = (_sim["balance"] - entry_b) / entry_b if entry_b > 0 else 0.0
+    if n >= defn["min_trades"] and wr >= defn["min_wr"] and pnl_pct >= defn["min_pnl_pct"]:
+        return "graduate"
+    if defn["fail_after"] and n >= defn["fail_after"]:
+        return "fail"
+    return "continue"
+
+
+def _sim_do_graduate(signals) -> bool:
+    """Advance to next stage. Returns True if simulation should stop (full_bloom reached)."""
+    stage    = _sim.get("stage", "sprout")
+    n        = _sim["stage_trades"]
+    wr       = _sim["stage_wins"] / n if n else 0.0
+    pnl      = _sim["balance"] - _sim["stage_entry_balance"]
+    label    = _SIM_STAGE_DEFS[stage]["label"]
+    cur_idx  = _SIM_STAGE_ORDER.index(stage)
+    if cur_idx + 1 >= len(_SIM_STAGE_ORDER):
+        return True
+    next_stage = _SIM_STAGE_ORDER[cur_idx + 1]
+    next_label = _SIM_STAGE_DEFS[next_stage]["label"]
+
+    _sim["stage_history"].append({
+        "stage": stage, "trades": n, "wins": _sim["stage_wins"],
+        "win_rate": round(wr, 4), "pnl": round(pnl, 4),
+        "balance_exit": round(_sim["balance"], 2),
+    })
+    _sim["stage"]               = next_stage
+    _sim["stage_entry_balance"] = _sim["balance"]
+    _sim["stage_trades"]        = 0
+    _sim["stage_wins"]          = 0
+    _sim["stage_losses"]        = 0
+
+    _sim_log(
+        f"{label} COMPLETE: {n} trades, {wr:.0%} WR, balance "
+        f"${_sim['balance']:.2f} ({pnl:+.2f}) -- {next_label} UNLOCKED"
+    )
+
+    if next_stage == "full_bloom":
+        _sim_log("\U0001f338 FULL BLOOM REACHED -- simulation complete")
+        _sim_stop("full_bloom_reached", signals)
+        return True
+
+    if next_stage == "seedling":
+        _sim_unlock_seedling_instruments()
+
+    _sim_save_state()
+    return False
+
+
+def _sim_unlock_seedling_instruments() -> None:
+    """On SEEDLING entry, query IG API for GOLD, OIL, UK100 at higher leverage."""
+    candidates = {k: v for k, v in INSTRUMENTS.items() if k in ("GOLD", "OIL", "UK100")}
+    if not candidates:
+        return
+    leverage      = _SIM_AGGRESSIVE_LEV
+    max_effective = _sim["balance"] * 0.10 * leverage
+    for sym, epic in candidates.items():
+        if sym in _sim_eligible:
+            continue
+        data = _ig_get(f"/markets/{epic}")
+        if not data:
+            continue
+        inst    = data.get("instrument", {})
+        deal    = data.get("dealingRules", {})
+        snap    = data.get("snapshot", {})
+        min_val = float(deal.get("minDealSize", {}).get("value", 1.0))
+        lot_sz  = float(inst.get("lotSize", 1.0))
+        bid     = float(snap.get("bid") or 0)
+        offer   = float(snap.get("offer") or 0)
+        mid     = (bid + offer) / 2.0 if bid and offer else 0.0
+        ccy0    = inst.get("currencies", [{}])[0] if inst.get("currencies") else {}
+        ccy     = ccy0.get("code", "USD")
+        if ccy == "GBP":
+            min_usd = min_val * lot_sz * mid * _SIM_APPROX_GBPUSD
+        elif ccy == "JPY":
+            min_usd = (min_val * lot_sz * mid) / _SIM_APPROX_USDJPY
+        else:
+            min_usd = min_val * lot_sz * mid
+        if min_usd <= max_effective:
+            _sim_eligible.add(sym)
+            _sim_min_notional[sym] = round(min_usd, 2)
+            _sim_log(f"SEEDLING unlock: {sym} eligible -- IG min ~${min_usd:.2f}")
+        else:
+            _sim_log(f"SEEDLING: {sym} still too large -- min ${min_usd:.2f} > max ${max_effective:.0f}")
+        time.sleep(0.3)
+    if any(s in _sim_eligible for s in ("GOLD", "OIL", "UK100")):
+        _sim_log(f"Eligible instruments now: {sorted(_sim_eligible)}")
+
+
+# ── Phase management ──────────────────────────────────────────────────────────
+def _sim_check_phase() -> None:
+    if _sim.get("phase", 1) != 1:
+        return
+    total   = _sim.get("total_wins", 0) + _sim.get("total_losses", 0)
+    elapsed = time.time() - _sim["sim_start_time"]
+    if total >= _SIM_PHASE_SWITCH_TRADES or elapsed >= _SIM_PHASE_SWITCH_SECS:
+        _sim["phase"]            = 2
+        _sim["phase_start_time"] = time.time()
+        _sim_log(
+            f"Phase switch -> AGGRESSIVE (10:1 leverage) "
+            f"[trades={total}, elapsed={elapsed/3600:.1f}h]"
+        )
+        _sim_save_state()
+
+
+# ── Price helpers ─────────────────────────────────────────────────────────────
 def _sim_reconstruct_prices(sym: str, signals: dict) -> dict:
-    """Reconstruct approximate bid/ask from mid + spread_pct in the signals dict."""
-    sig         = signals.get(sym, {})
-    mid         = sig.get("price", 0.0)
-    spread_pct  = sig.get("spread_pct", 0.0)   # spread as % of mid
-    half_spread = mid * spread_pct / 200.0
-    return {"bid": mid - half_spread, "ask": mid + half_spread, "mid": mid}
+    sig        = signals.get(sym, {})
+    mid        = sig.get("price", 0.0)
+    spread_pct = sig.get("spread_pct", 0.0)
+    half       = mid * spread_pct / 200.0
+    return {"bid": mid - half, "ask": mid + half, "mid": mid}
 
 
+# ── Position sizing ───────────────────────────────────────────────────────────
 def _sim_position_size(balance: float, approach: str) -> float:
-    """Return virtual position size ($) for the current sizing approach."""
-    if approach == "fixed_5":  return 5.0
-    if approach == "fixed_10": return 10.0
-    if approach == "pct_5":    return round(balance * 0.05, 2)
-    if approach == "pct_10":   return round(balance * 0.10, 2)
-    return 5.0
+    stage = _sim.get("stage", "sprout")
+    if stage == "sprout":
+        if approach == "fixed_5":  return 5.0
+        if approach == "fixed_10": return 10.0
+        if approach == "pct_5":    return round(balance * 0.05, 2)
+        if approach == "pct_10":   return round(balance * 0.10, 2)
+        return 5.0
+    if stage == "seedling":    return round(balance * 0.05, 2)
+    if stage == "germination": return round(balance * 0.03, 2)
+    if stage == "vegetative":  return round(balance * 0.02, 2)
+    return round(balance * 0.05, 2)
 
 
 def _sim_check_min_feasible(sym: str, pos_size: float, leverage: int) -> bool:
-    """True if effective exposure (pos_size × leverage) meets IG minimum notional."""
     return (pos_size * leverage) >= _sim_min_notional.get(sym, 0.0)
 
 
@@ -1134,21 +1325,20 @@ def _sim_vol_bucket(vol: float) -> str:
     return "mid"
 
 
+# ── Instrument selection ──────────────────────────────────────────────────────
 def _sim_select_instrument(signals: dict, regime: str):
-    """Pick eligible instrument with highest |change_5m| whose direction fits regime."""
-    best_sym = None
-    best_vol = 0.0
+    best_sym, best_vol = None, 0.0
     for sym in _sim_eligible:
         if sym not in signals:
             continue
         sig  = signals[sym]
-        vol  = abs(sig["change_5m"])
-        dirn = sig["direction"]
+        vol  = abs(sig.get("change_5m", 0.0))
+        dirn = sig.get("direction", "neutral")
         if vol < _SIM_ENTRY_VOL_MIN:
             continue
-        if regime == "bull"   and dirn not in ("bull",):
+        if regime == "bull"  and dirn != "bull":
             continue
-        if regime == "bear"   and dirn not in ("bear",):
+        if regime == "bear"  and dirn != "bear":
             continue
         if regime in ("volatile", "neutral") and dirn == "neutral":
             continue
@@ -1158,20 +1348,22 @@ def _sim_select_instrument(signals: dict, regime: str):
     return best_sym
 
 
+# ── P&L calculation ───────────────────────────────────────────────────────────
 def _sim_compute_pnl_pct(prices: dict) -> float:
-    """Current P&L % for the open position (negative = loss)."""
-    pos   = _sim_pos
-    entry = pos["fill_price"]
-    dirn  = pos["direction"]
-    if dirn == "long":
-        return (prices["bid"] - entry) / entry
-    else:
-        return (entry - prices["ask"]) / entry
+    pos   = _sim.get("open_position") or {}
+    entry = pos.get("fill_price", 0)
+    dirn  = pos.get("direction", "long")
+    if not entry:
+        return 0.0
+    return (prices["bid"] - entry) / entry if dirn == "long" else (entry - prices["ask"]) / entry
 
 
+# ── Position close ────────────────────────────────────────────────────────────
 def _sim_close_position(prices: dict, exit_reason: str) -> None:
-    """Close open paper position, record trade, update stats, log."""
-    pos      = _sim_pos.copy()
+    pos = (_sim.get("open_position") or {}).copy()
+    if not pos:
+        return
+
     dirn     = pos["direction"]
     entry    = pos["fill_price"]
     size     = pos["size"]
@@ -1179,41 +1371,42 @@ def _sim_close_position(prices: dict, exit_reason: str) -> None:
     approach = pos["approach"]
     vol_bkt  = pos["vol_bucket"]
     entry_t  = pos["entry_time"]
-
     pnl_pct  = _sim_compute_pnl_pct(prices)
     hold_min = (time.time() - entry_t) / 60.0
 
-    # Snap exit price to stop/TP if that was the trigger
     if dirn == "long":
-        exit_price = prices["bid"]
-        if exit_reason == "stop_loss":    exit_price = pos["stop_price"]
-        elif exit_reason == "take_profit": exit_price = pos["tp_price"]
+        exit_px = pos["stop_price"] if exit_reason == "stop_loss"    else \
+                  pos["tp_price"]   if exit_reason == "take_profit"   else \
+                  prices["bid"]
     else:
-        exit_price = prices["ask"]
-        if exit_reason == "stop_loss":    exit_price = pos["stop_price"]
-        elif exit_reason == "take_profit": exit_price = pos["tp_price"]
+        exit_px = pos["stop_price"] if exit_reason == "stop_loss"    else \
+                  pos["tp_price"]   if exit_reason == "take_profit"   else \
+                  prices["ask"]
 
     dollar_pnl = size * lev * pnl_pct
     won        = dollar_pnl > 0
 
-    _sim["balance"] += dollar_pnl
+    _sim["balance"]       += dollar_pnl
+    _sim["stage_trades"]  += 1
+    _sim["stage_wins"]    += int(won)
+    _sim["stage_losses"]  += int(not won)
+    _sim["total_wins"]    += int(won)
+    _sim["total_losses"]  += int(not won)
 
     trade_rec = {
-        "instrument":  pos["instrument"],
-        "direction":   dirn,
-        "entry_price": entry,
-        "exit_price":  exit_price,
-        "size":        size,
-        "leverage":    lev,
-        "pnl_pct":     round(pnl_pct, 6),
-        "dollar_pnl":  round(dollar_pnl, 4),
-        "hold_min":    round(hold_min, 1),
-        "exit_reason": exit_reason,
-        "approach":    approach,
-        "vol_bucket":  vol_bkt,
-        "entry_vol":   pos["entry_vol"],
+        "instrument": pos["instrument"], "direction": dirn,
+        "entry_price": entry, "exit_price": exit_px,
+        "size": size, "leverage": lev,
+        "pnl_pct": round(pnl_pct, 6), "dollar_pnl": round(dollar_pnl, 4),
+        "hold_min": round(hold_min, 1), "exit_reason": exit_reason,
+        "approach": approach, "vol_bucket": vol_bkt,
+        "entry_vol": pos.get("entry_vol", 0),
+        "stage": _sim.get("stage", "sprout"), "phase": _sim.get("phase", 1),
     }
-    _sim["trades"].append(trade_rec)
+    history = _sim.setdefault("trade_history", [])
+    history.append(trade_rec)
+    if len(history) > 50:
+        _sim["trade_history"] = history[-50:]
 
     if dirn == "long":
         _sim["long_pnl"]    += dollar_pnl
@@ -1224,217 +1417,214 @@ def _sim_close_position(prices: dict, exit_reason: str) -> None:
         _sim["short_trades"] += 1
         if won: _sim["short_wins"] += 1
 
-    st  = _sim["approach_stats"][approach]
+    st = _sim.setdefault("approach_stats", {}).setdefault(approach, {"pnl": 0.0, "trades": 0, "wins": 0})
     st["pnl"] += dollar_pnl; st["trades"] += 1
     if won: st["wins"] += 1
 
-    vs  = _sim["vol_stats"][vol_bkt]
+    vs = _sim.setdefault("vol_stats", {}).setdefault(vol_bkt, {"pnl": 0.0, "trades": 0, "wins": 0})
     vs["pnl"] += dollar_pnl; vs["trades"] += 1
     if won: vs["wins"] += 1
 
-    total = len(_sim["trades"])
-    wins  = sum(1 for t in _sim["trades"] if t["dollar_pnl"] > 0)
-    sign  = "+" if dollar_pnl >= 0 else ""
-
+    sign = "+" if dollar_pnl >= 0 else ""
     _sim_log(
-        f"EXIT: {pos['instrument']} @ {exit_price:.6g} | "
+        f"EXIT: {pos['instrument']} @ {exit_px:.6g} | "
         f"P&L {sign}{dollar_pnl:.2f} ({pnl_pct:+.2%}) | "
-        f"hold {hold_min:.0f}min | exit: {exit_reason}"
+        f"hold {hold_min:.0f}min | {exit_reason}"
     )
     _sim_log(
-        f"BALANCE: ${_sim['balance']:.2f} | trades: {wins}W/{total - wins}L | "
-        f"long P&L: {_sim['long_pnl']:+.2f} | short P&L: {_sim['short_pnl']:+.2f}"
+        f"BALANCE: ${_sim['balance']:.2f} | "
+        f"stage {_sim['stage_wins']}W/{_sim['stage_losses']}L | "
+        f"total {_sim['total_wins']}W/{_sim['total_losses']}L"
     )
-    _sim_pos.clear()
+    _sim["open_position"] = None
+    _sim_save_state()
 
 
+# ── Entry ─────────────────────────────────────────────────────────────────────
 def _sim_try_entry(signals: dict, regime: str, leverage: int, approach: str) -> None:
-    """Try to open a simulated paper position if conditions are met."""
     balance = _sim["balance"]
     sym     = _sim_select_instrument(signals, regime)
-    if not sym:
+    if not sym or sym not in signals:
         return
 
     sig       = signals[sym]
-    prices    = _sim_reconstruct_prices(sym, signals)
-    vol       = abs(sig["change_5m"])
-    direction = "long" if sig["change_5m"] > 0 else "short"
-    # Try current sizing approach; if effective notional is too small, escalate.
-    start_idx       = _SIM_SIZING_ORDER.index(approach) if approach in _SIM_SIZING_ORDER else 0
-    chosen_approach = None
-    pos_size        = None
-    for try_approach in _SIM_SIZING_ORDER[start_idx:]:
-        candidate = min(_sim_position_size(balance, try_approach), balance)
-        if candidate < 1.0:
-            continue
-        if _sim_check_min_feasible(sym, candidate, leverage):
-            chosen_approach = try_approach
-            pos_size        = candidate
-            break
+    chg       = sig.get("change_5m", 0.0)
+    vol       = abs(chg)
+    direction = "long" if chg > 0 else "short"
+    stage     = _sim.get("stage", "sprout")
 
-    if chosen_approach is None:
-        min_n   = _sim_min_notional.get(sym, 0)
-        max_eff = min(_sim_position_size(balance, _SIM_SIZING_ORDER[-1]), balance) * leverage
-        _sim_log(
-            f"Skip {sym}: no sizing approach meets IG min notional ${min_n:.2f} "
-            f"(max effective ${max_eff:.2f} with {_SIM_SIZING_ORDER[-1]})"
-        )
-        return
+    if stage == "sprout":
+        # Rotation schedule with escalation if notional too small
+        start_idx       = _SIM_SIZING_ORDER.index(approach) if approach in _SIM_SIZING_ORDER else 0
+        chosen_approach = None
+        pos_size        = None
+        for try_approach in _SIM_SIZING_ORDER[start_idx:]:
+            candidate = min(_sim_position_size(balance, try_approach), balance)
+            if candidate < 1.0:
+                continue
+            if _sim_check_min_feasible(sym, candidate, leverage):
+                chosen_approach = try_approach
+                pos_size        = candidate
+                break
+        if chosen_approach is None:
+            min_n   = _sim_min_notional.get(sym, 0)
+            max_eff = min(_sim_position_size(balance, _SIM_SIZING_ORDER[-1]), balance) * leverage
+            _sim_log(
+                f"Skip {sym}: no sizing approach meets IG min ${min_n:.2f} "
+                f"(max effective ${max_eff:.2f} with {_SIM_SIZING_ORDER[-1]})"
+            )
+            return
+        if chosen_approach != approach:
+            _sim_log(f"Size up: {approach} -> {chosen_approach} to meet {sym} min notional")
+        approach = chosen_approach
+    else:
+        # Formula-based sizing for later stages
+        pos_size = min(_sim_position_size(balance, approach), balance)
+        if pos_size < 1.0:
+            _sim_log(f"Skip {sym}: position size ${pos_size:.2f} < $1 floor")
+            return
+        if not _sim_check_min_feasible(sym, pos_size, leverage):
+            min_n = _sim_min_notional.get(sym, 0)
+            _sim_log(f"Skip {sym}: effective ${pos_size * leverage:.2f} < IG min ${min_n:.2f}")
+            return
 
-    if chosen_approach != approach:
-        _sim_log(f"Size up: {approach} -> {chosen_approach} to meet {sym} min notional")
-    approach = chosen_approach
-
-    fill = prices["ask"] if direction == "long" else prices["bid"]
+    prices  = _sim_reconstruct_prices(sym, signals)
+    fill    = prices["ask"] if direction == "long" else prices["bid"]
     if fill <= 0:
         return
 
     stop_px = fill * (1 - _SIM_STOP_PCT) if direction == "long" else fill * (1 + _SIM_STOP_PCT)
     tp_px   = fill * (1 + _SIM_TP_PCT)   if direction == "long" else fill * (1 - _SIM_TP_PCT)
     vbkt    = _sim_vol_bucket(vol)
+    notl    = round(pos_size * leverage, 2)
 
-    _sim_pos.update({
-        "instrument":  sym,
-        "direction":   direction,
-        "fill_price":  fill,
-        "stop_price":  stop_px,
-        "tp_price":    tp_px,
-        "size":        pos_size,
-        "leverage":    leverage,
-        "entry_time":  time.time(),
-        "entry_vol":   vol,
-        "vol_bucket":  vbkt,
-        "approach":    approach,
-        "regime":      regime,
-    })
+    _sim["open_position"] = {
+        "instrument": sym, "direction": direction,
+        "fill_price": fill, "stop_price": stop_px, "tp_price": tp_px,
+        "size": pos_size, "leverage": leverage,
+        "entry_time": time.time(), "entry_vol": vol,
+        "vol_bucket": vbkt, "approach": approach, "regime": regime,
+    }
 
     action = "BUY" if direction == "long" else "SELL"
     _sim_log(
         f"{action}: {sym} @ {fill:.6g} | size ${pos_size:.2f} | "
-        f"leverage {leverage}:1 | volatility {vol:.2f}% | approach: {approach}"
+        f"{leverage}:1 lev | notional ${notl:.0f} | vol {vol:.2f}% | {approach}"
     )
+    _sim_save_state()
 
 
+# ── Exit checks ───────────────────────────────────────────────────────────────
 def _sim_check_exit(signals: dict, regime: str) -> None:
-    """Check all exit conditions for the open paper position."""
-    if not _sim_pos:
+    pos = _sim.get("open_position")
+    if not pos:
         return
-    pos     = _sim_pos
-    sym     = pos["instrument"]
+    sym = pos["instrument"]
     if sym not in signals:
         return
-
     prices   = _sim_reconstruct_prices(sym, signals)
     pnl_pct  = _sim_compute_pnl_pct(prices)
     hold_sec = time.time() - pos["entry_time"]
-    sig_dir  = signals[sym]["direction"]
     dirn     = pos["direction"]
+    sig_dir  = signals[sym].get("direction", "neutral")
 
     if pnl_pct <= -_SIM_STOP_PCT:
-        _sim_close_position(prices, "stop_loss")
-        return
+        _sim_close_position(prices, "stop_loss"); return
     if pnl_pct >= _SIM_TP_PCT:
-        _sim_close_position(prices, "take_profit")
-        return
+        _sim_close_position(prices, "take_profit"); return
     if hold_sec >= _SIM_MAX_HOLD_SECS:
-        _sim_close_position(prices, "max_hold")
-        return
+        _sim_close_position(prices, "max_hold"); return
     if dirn == "long"  and (regime == "bear" or sig_dir == "bear"):
-        _sim_close_position(prices, "reversal")
-        return
+        _sim_close_position(prices, "reversal"); return
     if dirn == "short" and (regime == "bull" or sig_dir == "bull"):
-        _sim_close_position(prices, "reversal")
-        return
+        _sim_close_position(prices, "reversal"); return
 
 
+# ── Hourly summary ────────────────────────────────────────────────────────────
 def _sim_hourly_log() -> None:
-    """Print hourly simulation summary."""
-    trades = _sim.get("trades", [])
-    total  = len(trades)
-    wins   = sum(1 for t in trades if t["dollar_pnl"] > 0)
+    stage     = _sim.get("stage", "sprout")
+    st_t      = _sim.get("stage_trades", 0)
+    st_w      = _sim.get("stage_wins", 0)
+    balance   = _sim.get("balance", _SIM_START_BALANCE)
+    stage_pnl = balance - _sim.get("stage_entry_balance", _SIM_START_BALANCE)
+    grad_min  = _SIM_STAGE_DEFS.get(stage, {}).get("min_trades", 0)
+    wr_str    = f"{st_w/st_t:.0%}" if st_t else "n/a"
 
-    best_app = max(
-        _sim["approach_stats"].items(), key=lambda x: x[1]["pnl"],
-        default=("none", {"pnl": 0})
-    )[0]
+    app_stats = _sim.get("approach_stats", {})
+    best_app  = (max(app_stats.items(), key=lambda x: x[1]["pnl"])[0]
+                 if any(v.get("trades", 0) for v in app_stats.values()) else "none")
 
-    lt, lw = _sim["long_trades"],  _sim["long_wins"]
-    st, sw = _sim["short_trades"], _sim["short_wins"]
-    lr = f"{lw}/{lt} ({lw/lt*100:.0f}%)" if lt else "0/0"
-    sr = f"{sw}/{st} ({sw/st*100:.0f}%)" if st else "0/0"
+    lt = _sim.get("long_trades", 0);  lw = _sim.get("long_wins", 0)
+    st = _sim.get("short_trades", 0); sw = _sim.get("short_wins", 0)
+    lr = f"{lw}/{lt} ({lw/lt:.0%})" if lt else "0/0"
+    sr = f"{sw}/{st} ({sw/st:.0%})" if st else "0/0"
 
-    def wr(k):
-        v = _sim["vol_stats"].get(k, {})
-        return v["wins"] / max(v["trades"], 1)
-    best_vol = max(["high", "mid", "low"], key=wr)
+    vol_stats = _sim.get("vol_stats", {})
+    def _wv(k): v = vol_stats.get(k, {}); return v.get("wins", 0) / max(v.get("trades", 1), 1)
+    best_vol = max(["high", "mid", "low"], key=_wv)
 
     now_str = datetime.now(timezone.utc).strftime("%H:%M UTC")
     _sim_log(
-        f"SUMMARY [{now_str}]: Balance ${_sim['balance']:.2f} | "
-        f"trades {wins}W/{total - wins}L | best approach: {best_app} | "
+        f"SUMMARY [{now_str}] {stage.upper()} STAGE ({st_t}/{grad_min} trades, "
+        f"{wr_str} WR, {stage_pnl:+.2f}): Balance ${balance:.2f} | "
+        f"P{_sim.get('phase', 1)} | best approach: {best_app} | "
         f"long {lr} | short {sr} | best vol: {best_vol}"
     )
 
 
+# ── Simulation stop ───────────────────────────────────────────────────────────
 def _sim_stop(reason: str, signals=None) -> None:
-    """Force-close any open position, generate final report, publish to Redis."""
-    if _sim_pos and signals:
-        sym = _sim_pos.get("instrument", "")
+    pos = _sim.get("open_position")
+    if pos and signals:
+        sym = pos.get("instrument", "")
         if sym and sym in signals:
             _sim_close_position(_sim_reconstruct_prices(sym, signals), "simulation_stop")
 
     _sim["stopped"]     = True
     _sim["stop_reason"] = reason
 
-    balance = _sim["balance"]
-    pnl     = balance - _SIM_START_BALANCE
-    pnl_pct = pnl / _SIM_START_BALANCE * 100.0
-    trades  = _sim["trades"]
-    total   = len(trades)
-    wins    = sum(1 for t in trades if t["dollar_pnl"] > 0)
+    balance  = _sim["balance"]
+    pnl      = balance - _SIM_START_BALANCE
+    pnl_pct  = pnl / _SIM_START_BALANCE * 100.0
+    total    = _sim.get("total_wins", 0) + _sim.get("total_losses", 0)
+    wins     = _sim.get("total_wins", 0)
 
-    app_stats = _sim["approach_stats"]
-    best_app  = max(app_stats.items(), key=lambda x: x[1]["pnl"]) if any(
-        v["trades"] for v in app_stats.values()
-    ) else ("no_trades", {"pnl": 0})
+    app_stats = _sim.get("approach_stats", {})
+    best_app  = (max(app_stats.items(), key=lambda x: x[1]["pnl"])
+                 if any(v.get("trades", 0) for v in app_stats.values())
+                 else ("no_trades", {"pnl": 0.0}))
 
-    lt, lw = _sim["long_trades"],  _sim["long_wins"]
-    st, sw = _sim["short_trades"], _sim["short_wins"]
+    lt = _sim.get("long_trades", 0);  lw = _sim.get("long_wins", 0)
+    st = _sim.get("short_trades", 0); sw = _sim.get("short_wins", 0)
+    vs = _sim.get("vol_stats", {})
+    def _wv(k): v = vs.get(k, {}); return v.get("wins", 0) / max(v.get("trades", 1), 1)
+    best_vol = max(["high", "mid", "low"], key=_wv)
 
-    vs = _sim["vol_stats"]
-    def wr(k):
-        v = vs.get(k, {})
-        return v["wins"] / max(v["trades"], 1)
-    best_vol = max(["high", "mid", "low"], key=wr)
-
-    instr_pnl = {}
+    trades    = _sim.get("trade_history", [])
+    instr_pnl: dict = {}
+    lev_pnl:   dict = {}
     for t in trades:
         instr_pnl[t["instrument"]] = instr_pnl.get(t["instrument"], 0.0) + t["dollar_pnl"]
-
-    lev_pnl = {}
-    for t in trades:
-        lev_pnl[t["leverage"]] = lev_pnl.get(t["leverage"], 0.0) + t["dollar_pnl"]
+        lev_pnl[t["leverage"]]     = lev_pnl.get(t["leverage"],     0.0) + t["dollar_pnl"]
 
     best_instr  = max(instr_pnl.items(), key=lambda x: x[1]) if instr_pnl else ("none", 0)
     worst_instr = min(instr_pnl.items(), key=lambda x: x[1]) if instr_pnl else ("none", 0)
-    best_lev    = max(lev_pnl.items(),   key=lambda x: x[1]) if lev_pnl  else (3, 0)
+    best_lev    = max(lev_pnl.items(),   key=lambda x: x[1]) if lev_pnl   else (3, 0)
 
     if total:
         rec = (
             f"Best sizing: {best_app[0]} (P&L ${best_app[1]['pnl']:+.2f}). "
-            f"Longs: ${_sim['long_pnl']:+.2f} ({lw}/{lt} trades). "
-            f"Shorts: ${_sim['short_pnl']:+.2f} ({sw}/{st} trades) — "
-            f"{'net positive' if _sim['short_pnl'] > 0 else 'net negative'}. "
-            f"Best vol entry: {best_vol} (|change_5m| "
-            f"{'>' + str(_SIM_HIGH_VOL_THRESH) if best_vol == 'high' else '<' + str(_SIM_LOW_VOL_THRESH) if best_vol == 'low' else str(_SIM_LOW_VOL_THRESH) + '-' + str(_SIM_HIGH_VOL_THRESH)}%). "
+            f"Longs: ${_sim.get('long_pnl', 0):+.2f} ({lw}/{lt}). "
+            f"Shorts: ${_sim.get('short_pnl', 0):+.2f} ({sw}/{st}). "
+            f"Best vol entry: {best_vol}. "
             f"Best instrument: {best_instr[0]} (${best_instr[1]:+.2f}). "
-            f"Worst: {worst_instr[0]} (${worst_instr[1]:+.2f}). "
+            f"Worst instrument: {worst_instr[0]} (${worst_instr[1]:+.2f}). "
             f"Recommended leverage: {best_lev[0]}:1."
         )
     else:
-        rec = "No trades completed — insufficient data for recommendations."
+        rec = "No trades completed -- insufficient data for sizing recommendation."
 
-    _sim_log(f"STOPPED: Balance ${balance:.2f} ({pnl:+.2f} / {pnl_pct:+.1f}%) | Reason: {reason}")
+    _sim_log(f"STOPPED: Balance ${balance:.2f} ({pnl:+.2f} / {pnl_pct:+.1f}%) | {reason}")
     _sim_log(f"RECOMMENDATION: {rec}")
 
     result_payload = {
@@ -1445,8 +1635,10 @@ def _sim_stop(reason: str, signals=None) -> None:
         "pnl_pct":              round(pnl_pct, 2),
         "total_trades":         total,
         "win_rate_pct":         round(wins / max(total, 1) * 100, 1),
-        "long_pnl":             round(_sim["long_pnl"], 4),
-        "short_pnl":            round(_sim["short_pnl"], 4),
+        "stage_reached":        _sim.get("stage", "sprout"),
+        "stage_history":        _sim.get("stage_history", []),
+        "long_pnl":             round(_sim.get("long_pnl", 0), 4),
+        "short_pnl":            round(_sim.get("short_pnl", 0), 4),
         "approach_stats":       {k: {kk: round(vv, 4) if isinstance(vv, float) else vv
                                      for kk, vv in v.items()}
                                  for k, v in app_stats.items()},
@@ -1457,49 +1649,58 @@ def _sim_stop(reason: str, signals=None) -> None:
         "leverage_pnl":         {str(k): round(v, 4) for k, v in lev_pnl.items()},
         "recommendation":       rec,
         "eligible_instruments": sorted(_sim_eligible),
-        "trades":               trades,
+        "trades":               trades[-100:],
     }
 
     try:
         r = _redis()
         r.set("june_sim_results", json.dumps(result_payload), ex=48 * 3600)
-        _sim_log("Results published → Redis key june_sim_results (TTL 48h)")
+        r.delete("june_sim_state")
+        _sim_log("Results published -> Redis june_sim_results (TTL 48h)")
     except Exception as exc:
-        _sim_log(f"Redis write failed (results lost): {exc}")
+        _sim_log(f"Redis results write failed: {exc}")
 
 
+# ── Main simulation step ──────────────────────────────────────────────────────
 def run_simulation_step(signals: dict) -> None:
     """Called from poll_cycle() after intelligence functions. Paper trades only."""
     if not _sim or _sim.get("stopped"):
         return
 
+    # Manual stop via Redis
+    try:
+        if _redis().get("june_sim_stop") == b"1":
+            _sim_log("Manual stop signal (june_sim_stop=1)")
+            _sim_stop("manual_stop", signals)
+            return
+    except Exception:
+        pass
+
     now     = time.time()
-    elapsed = now - _sim["start_time"]
+    elapsed = now - _sim["sim_start_time"]
 
-    # Phase transition at 12h (runs through overnight so timer stays accurate)
-    if _sim["phase"] == "conservative" and elapsed >= _SIM_PHASE_SWITCH_SECS:
-        _sim["phase"] = "aggressive"
-        _sim_log("Phase switch -> AGGRESSIVE (10:1 leverage)")
+    # Phase check (runs through overnight so timer stays accurate)
+    _sim_check_phase()
 
-    # Rotate sizing approach every 2h (runs through overnight)
-    if now - _sim["sizing_start"] >= _SIM_SIZING_CYCLE:
-        _sim["sizing_idx"]   = (_sim["sizing_idx"] + 1) % len(_SIM_SIZING_ORDER)
-        _sim["sizing_start"] = now
-        _sim_log(f"Sizing approach -> {_SIM_SIZING_ORDER[_sim['sizing_idx']]}")
+    # Sizing rotation for SPROUT only (runs through overnight)
+    if _sim.get("stage") == "sprout":
+        if now - _sim["sizing_rotation_time"] >= _SIM_SIZING_CYCLE:
+            _sim["sizing_idx"]           = (_sim["sizing_idx"] + 1) % len(_SIM_SIZING_ORDER)
+            _sim["sizing_rotation_time"] = now
+            _sim_log(f"Sizing approach -> {_SIM_SIZING_ORDER[_sim['sizing_idx']]}")
+            _sim_save_state()
 
-    # Duration stop (runs through overnight so 24h wall-clock is respected)
-    if elapsed >= _SIM_MAX_DURATION:
+    # Global duration stop (runs through overnight so 24h wall-clock is respected)
+    if elapsed >= 24 * 3600:
         _sim_stop("24h duration", signals)
         return
 
     # P&L boundary stops (runs through overnight)
     pnl = _sim["balance"] - _SIM_START_BALANCE
     if pnl >= _SIM_PROFIT_STOP:
-        _sim_stop(f"profit boundary (+${pnl:.2f})", signals)
-        return
+        _sim_stop(f"profit boundary (+${pnl:.2f})", signals); return
     if pnl <= _SIM_LOSS_STOP:
-        _sim_stop(f"loss boundary (${pnl:.2f})", signals)
-        return
+        _sim_stop(f"loss boundary (${pnl:.2f})", signals); return
 
     # Hourly log (fires even during overnight so the sim stays visible)
     if now >= _sim["hourly_next"]:
@@ -1510,44 +1711,148 @@ def run_simulation_step(signals: dict) -> None:
     if is_overnight():
         return
 
-    # Read current macro regime
+    # Compute stage / leverage / approach for this cycle
+    stage    = _sim.get("stage", "sprout")
+    leverage = _SIM_CONSERVATIVE_LEV if _sim["phase"] == 1 else _SIM_AGGRESSIVE_LEV
+    approach = (_SIM_SIZING_ORDER[_sim.get("sizing_idx", 0)]
+                if stage == "sprout" else _SIM_STAGE_APPROACH.get(stage, "pct_5"))
+
+    # Read macro regime
     regime = "neutral"
     try:
-        r   = _redis()
-        raw = r.get("june_macro_regime")
+        raw = _redis().get("june_macro_regime")
         if raw:
             regime = json.loads(raw).get("regime", "neutral")
     except Exception:
         pass
 
-    leverage = _SIM_CONSERVATIVE_LEV if _sim["phase"] == "conservative" else _SIM_AGGRESSIVE_LEV
-    approach = _SIM_SIZING_ORDER[_sim["sizing_idx"]]
-
-    # Handle open position (check exit first — max 1 concurrent position)
-    if _sim_pos:
+    # Handle open position -- exit check first
+    if _sim.get("open_position"):
         _sim_check_exit(signals, regime)
-        return
+        if _sim.get("open_position"):
+            return  # still holding, nothing else to do this cycle
+        # Position just closed -- check graduation before next entry
+        result = _sim_check_graduation()
+        if result == "graduate":
+            if _sim_do_graduate(signals):
+                return  # simulation ended (full_bloom)
+            return  # graduated: next cycle uses new stage params
+        elif result == "fail":
+            n   = _sim["stage_trades"]
+            wr  = _sim["stage_wins"] / n if n else 0.0
+            lbl = _SIM_STAGE_DEFS.get(stage, {}).get("label", stage.upper())
+            _sim_log(
+                f"{lbl} STAGE: {n} trades, {wr:.0%} WR -- "
+                f"graduation criteria not met after {n} attempts"
+            )
+            _sim_stop(f"{stage}_stage_fail", signals)
+            return
+        # "continue" -- fall through to entry in same cycle
+        # Recompute in case stage changed
+        stage    = _sim.get("stage", "sprout")
+        leverage = _SIM_CONSERVATIVE_LEV if _sim["phase"] == 1 else _SIM_AGGRESSIVE_LEV
+        approach = (_SIM_SIZING_ORDER[_sim.get("sizing_idx", 0)]
+                    if stage == "sprout" else _SIM_STAGE_APPROACH.get(stage, "pct_5"))
 
-    # No position — look for entry signal (skip neutral regime)
+    # No open position -- look for entry
     _sim_try_entry(signals, regime, leverage, approach)
 
 
+# ── Startup / resume ──────────────────────────────────────────────────────────
 def sim_startup() -> None:
-    """Query IG API for minimum deal sizes, determine eligible instruments, init state."""
+    """Try to resume from saved Redis state, otherwise start fresh."""
     global _sim_eligible, _sim_min_notional
 
-    _sim_log("Initializing virtual trading simulation...")
-    _sim_log(
-        f"Balance ${_SIM_START_BALANCE} | "
-        f"Stop: +${_SIM_PROFIT_STOP} (doubled) or ${_SIM_LOSS_STOP} (60% loss) | "
-        f"Duration: 24h"
+    saved = _sim_load_state()
+    if saved:
+        _sim_eligible     = set(saved.get("eligible_instruments", []))
+        _sim_min_notional = saved.get("min_notionals", {})
+
+        now = time.time()
+        _sim.update({
+            "active":               True,
+            "balance":              saved["balance"],
+            "stage":                saved.get("stage", "sprout"),
+            "stage_entry_balance":  saved.get("stage_entry_balance", _SIM_START_BALANCE),
+            "stage_trades":         saved.get("stage_trades", 0),
+            "stage_wins":           saved.get("stage_wins", 0),
+            "stage_losses":         saved.get("stage_losses", 0),
+            "total_wins":           saved.get("total_wins", 0),
+            "total_losses":         saved.get("total_losses", 0),
+            "phase":                saved.get("phase", 1),
+            "phase_start_time":     saved.get("phase_start_time", now),
+            "sim_start_time":       saved.get("sim_start_time", now),
+            "sizing_idx":           saved.get("sizing_idx", 0),
+            "sizing_rotation_time": saved.get("sizing_rotation_time", now),
+            "open_position":        saved.get("open_position"),
+            "trade_history":        saved.get("trade_history", []),
+            "stage_history":        saved.get("stage_history", []),
+            "hourly_next":          now + 3600,
+            "stopped":              False,
+            "stop_reason":          "",
+            "long_pnl":             saved.get("long_pnl", 0.0),
+            "long_trades":          saved.get("long_trades", 0),
+            "long_wins":            saved.get("long_wins", 0),
+            "short_pnl":            saved.get("short_pnl", 0.0),
+            "short_trades":         saved.get("short_trades", 0),
+            "short_wins":           saved.get("short_wins", 0),
+            "approach_stats":       saved.get("approach_stats",
+                                              {k: {"pnl": 0.0, "trades": 0, "wins": 0}
+                                               for k in _SIM_SIZING_ORDER}),
+            "vol_stats":            saved.get("vol_stats",
+                                              {b: {"pnl": 0.0, "trades": 0, "wins": 0}
+                                               for b in ("high", "mid", "low")}),
+        })
+
+        balance   = _sim["balance"]
+        stage     = _sim["stage"].upper()
+        tw        = _sim["total_wins"] + _sim["total_losses"]
+        elapsed_h = (now - _sim["sim_start_time"]) / 3600.0
+        print(
+            f"[{_ts()}] \U0001f9ea SIM: Resuming from saved state -- "
+            f"Balance ${balance:.2f} | Stage: {stage} | "
+            f"Trades: {tw} | Elapsed: {elapsed_h:.1f}h",
+            flush=True,
+        )
+
+        if _sim.get("open_position"):
+            pos  = _sim["open_position"]
+            held = (now - pos["entry_time"]) / 60.0
+            print(
+                f"[{_ts()}] \U0001f9ea SIM: Restoring open {pos['direction'].upper()} "
+                f"{pos['instrument']} @ {pos['fill_price']:.6g} "
+                f"(held {held:.0f} min) -- monitoring for exits",
+                flush=True,
+            )
+
+        # Immediately transition to Phase 2 if criteria already met on resume
+        total_trades = _sim["total_wins"] + _sim["total_losses"]
+        elapsed_s    = now - _sim["sim_start_time"]
+        if _sim["phase"] == 1 and (total_trades >= _SIM_PHASE_SWITCH_TRADES or elapsed_s >= _SIM_PHASE_SWITCH_SECS):
+            _sim["phase"]            = 2
+            _sim["phase_start_time"] = now
+            print(
+                f"[{_ts()}] \U0001f9ea SIM: Phase 1 criteria met on resume "
+                f"[trades={total_trades}, elapsed={elapsed_s/3600:.1f}h] -- "
+                f"transitioning to Phase 2 (10:1 leverage) immediately",
+                flush=True,
+            )
+            _sim_save_state()
+        return
+
+    # ── Fresh start ───────────────────────────────────────────────────────────
+    print(f"[{_ts()}] \U0001f9ea SIM: Fresh start -- no saved state found", flush=True)
+    print(
+        f"[{_ts()}] \U0001f9ea SIM: Balance ${_SIM_START_BALANCE} | "
+        f"Stop: +${_SIM_PROFIT_STOP} (doubled) or ${_SIM_LOSS_STOP} (60% loss)",
+        flush=True,
     )
-    _sim_log("Querying IG API for minimum deal sizes (determining eligible instruments)...")
+    print(f"[{_ts()}] \U0001f9ea SIM: Querying IG API for minimum deal sizes ...", flush=True)
 
     for sym, epic in list(INSTRUMENTS.items()):
         data = _ig_get(f"/markets/{epic}")
         if not data:
-            _sim_log(f"  {sym}: API query failed — excluded")
+            print(f"[{_ts()}] \U0001f9ea SIM:   {sym}: API query failed -- excluded", flush=True)
             continue
 
         inst    = data.get("instrument", {})
@@ -1559,69 +1864,70 @@ def sim_startup() -> None:
         offer   = float(snap.get("offer") or 0)
         mid     = (bid + offer) / 2.0 if bid and offer else 0.0
         ccy0    = inst.get("currencies", [{}])[0] if inst.get("currencies") else {}
-        ccy     = ccy0.get("code", "$.")
+        ccy     = ccy0.get("code", "USD")
 
-        # Estimate minimum notional in USD
-        # Rule: min_val contracts × lot_sz units × mid_price_in_native_ccy → convert to USD
-        if sym == "EURUSD" and mid > 1000:
-            # IG quotes EURUSD ×10000 (e.g. 11441 = 1.1441 USD/EUR)
-            actual_rate = mid / 10000.0
-            min_usd     = min_val * lot_sz * actual_rate
-        elif sym == "USDJPY":
-            # Exposure is JPY (lot_sz × contracts); divide by USDJPY to get USD
-            jpy_rate = mid if mid > 50 else _SIM_APPROX_USDJPY
-            min_usd  = (min_val * lot_sz) / jpy_rate
-        elif "£" in ccy or "#" in ccy or sym in ("OIL", "UK100"):
-            # GBP-denominated (mid may be in pence: divide by 100 first)
-            pence_scale = 100.0 if mid > 1000 else 1.0
-            min_usd     = (min_val * lot_sz * mid / pence_scale) * _SIM_APPROX_GBPUSD
-        elif "E" in ccy and "E." in ccy or sym == "GER40":
-            min_usd = min_val * lot_sz * mid * _SIM_APPROX_EURUSD
+        if ccy == "GBP":
+            min_usd = min_val * lot_sz * mid * _SIM_APPROX_GBPUSD
+        elif ccy == "JPY":
+            min_usd = (min_val * lot_sz * mid) / _SIM_APPROX_USDJPY
         else:
-            # USD-denominated (GOLD, SILVER, SPX500, GBPUSD, etc.)
             min_usd = min_val * lot_sz * mid
 
-        _sim_min_notional[sym] = round(min_usd, 2)
-
-        # Eligible if effective $10 position at max leverage (10:1) covers minimum
-        max_effective = 10.0 * _SIM_AGGRESSIVE_LEV  # $100
-        if min_usd <= max_effective:
+        max_eff = _SIM_START_BALANCE * 0.10 * _SIM_AGGRESSIVE_LEV
+        if min_usd <= max_eff:
             _sim_eligible.add(sym)
-            _sim_log(f"  {sym}: ELIGIBLE  — IG min notional ~${min_usd:.2f}")
+            _sim_min_notional[sym] = round(min_usd, 2)
+            print(f"[{_ts()}] \U0001f9ea SIM:   {sym}: ELIGIBLE  -- IG min notional ~${min_usd:.2f}", flush=True)
         else:
-            _sim_log(f"  {sym}: EXCLUDED  — IG min notional ~${min_usd:.2f} exceeds ${max_effective:.0f} effective max")
-
+            print(
+                f"[{_ts()}] \U0001f9ea SIM:   {sym}: EXCLUDED  -- "
+                f"IG min ~${min_usd:.2f} exceeds ${max_eff:.0f} effective max",
+                flush=True,
+            )
         time.sleep(0.3)
 
     if not _sim_eligible:
-        _sim_log("WARNING: No eligible instruments — simulation will run but cannot trade")
+        print(f"[{_ts()}] \U0001f9ea SIM: WARNING: no eligible instruments found", flush=True)
 
     now = time.time()
     _sim.update({
-        "active":         True,
-        "balance":        _SIM_START_BALANCE,
-        "start_time":     now,
-        "phase":          "conservative",
-        "sizing_idx":     0,
-        "sizing_start":   now,
-        "trades":         [],
-        "long_pnl":       0.0,
-        "short_pnl":      0.0,
-        "long_trades":    0,
-        "long_wins":      0,
-        "short_trades":   0,
-        "short_wins":     0,
-        "hourly_next":    now + 3600,
-        "stopped":        False,
-        "stop_reason":    "",
-        "approach_stats": {k: {"pnl": 0.0, "trades": 0, "wins": 0} for k in _SIM_SIZING_ORDER},
-        "vol_stats":      {b: {"pnl": 0.0, "trades": 0, "wins": 0} for b in ("high", "mid", "low")},
+        "active":               True,
+        "balance":              _SIM_START_BALANCE,
+        "stage":                "sprout",
+        "stage_entry_balance":  _SIM_START_BALANCE,
+        "stage_trades":         0,
+        "stage_wins":           0,
+        "stage_losses":         0,
+        "total_wins":           0,
+        "total_losses":         0,
+        "phase":                1,
+        "phase_start_time":     now,
+        "sim_start_time":       now,
+        "sizing_idx":           0,
+        "sizing_rotation_time": now,
+        "open_position":        None,
+        "trade_history":        [],
+        "stage_history":        [],
+        "hourly_next":          now + 3600,
+        "stopped":              False,
+        "stop_reason":          "",
+        "long_pnl":             0.0,
+        "long_trades":          0,
+        "long_wins":            0,
+        "short_pnl":            0.0,
+        "short_trades":         0,
+        "short_wins":           0,
+        "approach_stats":       {k: {"pnl": 0.0, "trades": 0, "wins": 0} for k in _SIM_SIZING_ORDER},
+        "vol_stats":            {b: {"pnl": 0.0, "trades": 0, "wins": 0} for b in ("high", "mid", "low")},
     })
-    _sim_pos.clear()
 
-    _sim_log(f"Eligible instruments: {sorted(_sim_eligible)}")
-    _sim_log("Phase 1 (conservative, 3:1 leverage) — running alongside normal intelligence")
-
+    print(f"[{_ts()}] \U0001f9ea SIM: Eligible instruments: {sorted(_sim_eligible)}", flush=True)
+    print(
+        f"[{_ts()}] \U0001f9ea SIM: Phase 1 (conservative, 3:1 leverage) -- "
+        f"running alongside normal intelligence",
+        flush=True,
+    )
+    _sim_save_state()
 
 def _ts() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
