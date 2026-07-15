@@ -1259,19 +1259,31 @@ def _sim_try_entry(signals: dict, regime: str, leverage: int, approach: str) -> 
     prices    = _sim_reconstruct_prices(sym, signals)
     vol       = abs(sig["change_5m"])
     direction = "long" if sig["change_5m"] > 0 else "short"
-    pos_size  = min(_sim_position_size(balance, approach), balance)
+    # Try current sizing approach; if effective notional is too small, escalate.
+    start_idx       = _SIM_SIZING_ORDER.index(approach) if approach in _SIM_SIZING_ORDER else 0
+    chosen_approach = None
+    pos_size        = None
+    for try_approach in _SIM_SIZING_ORDER[start_idx:]:
+        candidate = min(_sim_position_size(balance, try_approach), balance)
+        if candidate < 1.0:
+            continue
+        if _sim_check_min_feasible(sym, candidate, leverage):
+            chosen_approach = try_approach
+            pos_size        = candidate
+            break
 
-    if pos_size < 1.0:
-        _sim_log(f"Skip {sym}: position size ${pos_size:.2f} < $1 floor")
-        return
-
-    if not _sim_check_min_feasible(sym, pos_size, leverage):
-        min_n = _sim_min_notional.get(sym, 0)
+    if chosen_approach is None:
+        min_n   = _sim_min_notional.get(sym, 0)
+        max_eff = min(_sim_position_size(balance, _SIM_SIZING_ORDER[-1]), balance) * leverage
         _sim_log(
-            f"Skip {sym}: effective ${pos_size * leverage:.2f} < IG min "
-            f"notional ${min_n:.2f} — position too small to trade"
+            f"Skip {sym}: no sizing approach meets IG min notional ${min_n:.2f} "
+            f"(max effective ${max_eff:.2f} with {_SIM_SIZING_ORDER[-1]})"
         )
         return
+
+    if chosen_approach != approach:
+        _sim_log(f"Size up: {approach} -> {chosen_approach} to meet {sym} min notional")
+    approach = chosen_approach
 
     fill = prices["ask"] if direction == "long" else prices["bid"]
     if fill <= 0:
@@ -1460,29 +1472,27 @@ def run_simulation_step(signals: dict) -> None:
     """Called from poll_cycle() after intelligence functions. Paper trades only."""
     if not _sim or _sim.get("stopped"):
         return
-    if is_overnight():
-        return   # pause when both London + NY sessions are closed
 
     now     = time.time()
     elapsed = now - _sim["start_time"]
 
-    # Phase transition at 12h
+    # Phase transition at 12h (runs through overnight so timer stays accurate)
     if _sim["phase"] == "conservative" and elapsed >= _SIM_PHASE_SWITCH_SECS:
         _sim["phase"] = "aggressive"
-        _sim_log("Phase switch → AGGRESSIVE (10:1 leverage)")
+        _sim_log("Phase switch -> AGGRESSIVE (10:1 leverage)")
 
-    # Rotate sizing approach every 2h
+    # Rotate sizing approach every 2h (runs through overnight)
     if now - _sim["sizing_start"] >= _SIM_SIZING_CYCLE:
         _sim["sizing_idx"]   = (_sim["sizing_idx"] + 1) % len(_SIM_SIZING_ORDER)
         _sim["sizing_start"] = now
-        _sim_log(f"Sizing approach → {_SIM_SIZING_ORDER[_sim['sizing_idx']]}")
+        _sim_log(f"Sizing approach -> {_SIM_SIZING_ORDER[_sim['sizing_idx']]}")
 
-    # Duration stop
+    # Duration stop (runs through overnight so 24h wall-clock is respected)
     if elapsed >= _SIM_MAX_DURATION:
         _sim_stop("24h duration", signals)
         return
 
-    # P&L boundary stops
+    # P&L boundary stops (runs through overnight)
     pnl = _sim["balance"] - _SIM_START_BALANCE
     if pnl >= _SIM_PROFIT_STOP:
         _sim_stop(f"profit boundary (+${pnl:.2f})", signals)
@@ -1491,10 +1501,14 @@ def run_simulation_step(signals: dict) -> None:
         _sim_stop(f"loss boundary (${pnl:.2f})", signals)
         return
 
-    # Hourly log
+    # Hourly log (fires even during overnight so the sim stays visible)
     if now >= _sim["hourly_next"]:
         _sim_hourly_log()
         _sim["hourly_next"] = now + 3600
+
+    # Pause entries and exits while both sessions are closed
+    if is_overnight():
+        return
 
     # Read current macro regime
     regime = "neutral"
