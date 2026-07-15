@@ -1178,7 +1178,13 @@ def _sim_load_state():
 
 # ── Stage helpers ─────────────────────────────────────────────────────────────
 def _sim_check_graduation() -> str:
-    """Return 'graduate', 'fail', or 'continue' based on current stage stats."""
+    """Return 'graduate', 'graduate_rolling', 'fail', or 'continue'.
+
+    Path A (cumulative): stage_trades >= min AND cumulative WR >= threshold AND P&L positive.
+    Path B (rolling window): stage_trades >= min AND last-10-same-stage WR >= threshold AND
+        rolling P&L positive. Prevents pre-fix historical losses from permanently blocking
+        graduation when recent trades clearly meet criteria.
+    """
     stage = _sim.get("stage", "sprout")
     if stage == "full_bloom":
         return "continue"
@@ -1187,14 +1193,25 @@ def _sim_check_graduation() -> str:
     wr      = _sim["stage_wins"] / n if n else 0.0
     entry_b = _sim["stage_entry_balance"]
     pnl_pct = (_sim["balance"] - entry_b) / entry_b if entry_b > 0 else 0.0
+    # Path A: cumulative stage performance
     if n >= defn["min_trades"] and wr >= defn["min_wr"] and pnl_pct >= defn["min_pnl_pct"]:
         return "graduate"
+    # Path B: rolling window -- last 10 trades recorded under the current stage label.
+    # trade_history entries carry a "stage" field set at exit time, so filtering by stage
+    # prevents trades from a previous stage contaminating this check after graduation.
+    if n >= defn["min_trades"]:
+        recent = [t for t in _sim.get("trade_history", []) if t.get("stage") == stage][-10:]
+        if len(recent) >= 10:
+            rw = sum(1 for t in recent if t["dollar_pnl"] > 0) / 10
+            rp = sum(t["dollar_pnl"] for t in recent)
+            if rw >= defn["min_wr"] and rp > 0:
+                return "graduate_rolling"
     if defn["fail_after"] and n >= defn["fail_after"]:
         return "fail"
     return "continue"
 
 
-def _sim_do_graduate(signals) -> bool:
+def _sim_do_graduate(signals, via_rolling: bool = False) -> bool:
     """Advance to next stage. Returns True if simulation should stop (full_bloom reached)."""
     stage    = _sim.get("stage", "sprout")
     n        = _sim["stage_trades"]
@@ -1218,10 +1235,20 @@ def _sim_do_graduate(signals) -> bool:
     _sim["stage_wins"]          = 0
     _sim["stage_losses"]        = 0
 
-    _sim_log(
-        f"{label} COMPLETE: {n} trades, {wr:.0%} WR, balance "
-        f"${_sim['balance']:.2f} ({pnl:+.2f}) -- {next_label} UNLOCKED"
-    )
+    if via_rolling:
+        recent = [t for t in _sim.get("trade_history", []) if t.get("stage") == stage][-10:]
+        rw = sum(1 for t in recent if t["dollar_pnl"] > 0) / len(recent) if recent else 0.0
+        rp = sum(t["dollar_pnl"] for t in recent)
+        _sim_log(
+            f"🌱 {label} COMPLETE (rolling window): last 10 trades {rw:.0%} WR, "
+            f"{rp:+.2f} -- cumulative {wr:.0%} WR dragged by pre-fix losses. "
+            f"{next_label} STAGE UNLOCKED"
+        )
+    else:
+        _sim_log(
+            f"{label} COMPLETE: {n} trades, {wr:.0%} WR, balance "
+            f"${_sim['balance']:.2f} ({pnl:+.2f}) -- {next_label} UNLOCKED"
+        )
 
     if next_stage == "full_bloom":
         _sim_log("\U0001f338 FULL BLOOM REACHED -- simulation complete")
@@ -1753,8 +1780,8 @@ def run_simulation_step(signals: dict) -> None:
             return  # still holding, nothing else to do this cycle
         # Position just closed -- check graduation before next entry
         result = _sim_check_graduation()
-        if result == "graduate":
-            if _sim_do_graduate(signals):
+        if result in ("graduate", "graduate_rolling"):
+            if _sim_do_graduate(signals, via_rolling=(result == "graduate_rolling")):
                 return  # simulation ended (full_bloom)
             return  # graduated: next cycle uses new stage params
         elif result == "fail":
