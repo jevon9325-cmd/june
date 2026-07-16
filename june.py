@@ -92,6 +92,23 @@ SPREAD_ALERT_FACTOR = 3.0    # current spread > 3× avg → spread_alert: True
 SPREAD_MIN_READINGS = 5      # minimum readings before anomaly detection active
 
 PREMARKET_GAP_PCT   = 0.50   # |change vs 06:00 baseline| to flag pre-London gap
+DIRECT_CFD_GAP_PCT  = 1.5    # daily % change to flag individual stock as gap candidate
+DIRECT_CFD_SEARCH_INTERVAL = 30        # seconds between IG search API calls
+DIRECT_CFD_MISS_TTL        = 6 * 3600  # 6h before re-searching a not-found symbol
+DIRECT_CFD_REDIS_TTL       = 24 * 3600 # Redis TTL for june_direct_cfd_map
+US_PREMARKET_START_MIN = 10 * 60       # 10:00 UTC = 05:00 ET (US pre-market opens)
+US_PREMARKET_END_MIN   = 14 * 60 + 30  # 14:30 UTC = 09:30 ET (US regular session)
+
+# Company name keywords for IG search validation: ticker -> fragment in IG instrument name.
+# Used in _search_direct_cfd() to filter false matches before the chartCode check.
+_DIRECT_CFD_KEYWORDS: dict = {
+    "NVDA": "NVIDIA",    "AAPL": "Apple",         "MSFT": "Microsoft",
+    "AVGO": "Broadcom",  "AMZN": "Amazon",        "GOOGL": "Alphabet",
+    "META": "Meta",      "TSLA": "Tesla",          "AMD": "Advanced Micro",
+    "INTC": "Intel",     "MU": "Micron",           "DAL": "Delta",
+    "UAL": "United Air", "NEM": "Newmont",         "AKAM": "Akamai",
+    "RKLB": "Rocket Lab","AEIS": "Advanced Energy","SCHD": "Schwab",
+}
 
 OVERNIGHT_VOL_THRESH = 1.0   # % overnight move to count an instrument as volatile
 OVERNIGHT_VOL_COUNT  = 3     # instruments needed to declare high_overnight_volatility
@@ -211,6 +228,15 @@ _flags: dict = {
 
 # Maintenance backoff state
 _maint: dict = {"consec": 0, "since": 0.0}
+
+# ── Direct CFD discovery state ────────────────────────────────────────────────
+_direct_cfd_map: dict      = {}    # {t212_base: epic}  e.g. {"NVDA": "UC.D.NVDA.CASH.IP"}
+_cfd_miss_cache: dict      = {}    # {t212_base: expiry_epoch}  6h cache for not-found
+_cfd_last_search: float    = 0.0   # epoch of last IG search call (rate-limiter)
+_direct_cfd_signals: dict  = {}    # {t212_base: {pct, direction, ts}}  daily snapshots
+_cfd_signal_refresh: float = 0.0   # epoch of last signal refresh pass
+_gap_disc_date: str        = ""    # UTC date _gap_disc_seen was reset
+_gap_disc_seen: set        = set() # bases already published to june_gap_discoveries today
 
 
 # ── Redis ────────────────────────────────────────────────────────────────────
@@ -688,6 +714,280 @@ def compute_signal(sym: str, price: dict, spread_alert: bool = False) -> dict:
 
 # ── Poll cycle ────────────────────────────────────────────────────────────────
 
+# ── Direct CFD discovery and gap detection ────────────────────────────────────
+
+def is_us_premarket() -> bool:
+    """True during US pre-market: 10:00–14:30 UTC (05:00–09:30 ET)."""
+    m = _now_mins()
+    return US_PREMARKET_START_MIN <= m < US_PREMARKET_END_MIN
+
+
+def _load_direct_cfd_cache() -> None:
+    """Load previously discovered direct CFD epics from Redis on startup."""
+    global _direct_cfd_map
+    try:
+        raw = _redis().get("june_direct_cfd_map")
+        if raw:
+            _direct_cfd_map = json.loads(raw)
+            print(
+                f"[{_ts()}] 📋 Loaded {len(_direct_cfd_map)} direct CFD mappings: "
+                f"{list(_direct_cfd_map.keys())}",
+                flush=True,
+            )
+    except Exception as exc:
+        print(f"[{_ts()}] ⚠️  Could not load june_direct_cfd_map: {exc}", flush=True)
+
+
+def _save_direct_cfd_cache() -> None:
+    """Persist _direct_cfd_map to Redis (TTL 24h)."""
+    try:
+        _redis().set("june_direct_cfd_map", json.dumps(_direct_cfd_map), ex=DIRECT_CFD_REDIS_TTL)
+    except Exception as exc:
+        print(f"[{_ts()}] ⚠️  Could not save june_direct_cfd_map: {exc}", flush=True)
+
+
+def _search_direct_cfd(base: str) -> Optional[str]:
+    """Search IG for a direct SHARES CFD matching the T212 base ticker.
+
+    Validates: instrumentType=SHARES, expiry=DFB/-, chartCode==base, country==US, USD.
+    IG demo note: found epics have streamingPricesAvailable=False — daily
+    percentageChange snapshot is available; live bid/offer requires a live account.
+    Returns the epic string, or None if no valid match.
+    """
+    data = _ig_get("/markets", params={"searchTerm": base})
+    if not data:
+        return None
+    markets = data.get("markets", [])
+    shares = [
+        m for m in markets
+        if m.get("instrumentType") == "SHARES"
+        and m.get("expiry", "").upper() in ("-", "DFB", "")
+    ]
+    if not shares:
+        print(f"[{_ts()}]   ℹ️  No direct CFD for {base} — 0 SHARES results", flush=True)
+        return None
+    keyword = _DIRECT_CFD_KEYWORDS.get(base, "").lower()
+    if keyword:
+        filtered = [m for m in shares if keyword in m.get("instrumentName", "").lower()]
+        if filtered:
+            shares = filtered
+    for m in shares[:3]:
+        epic = m.get("epic", "")
+        if not epic:
+            continue
+        time.sleep(1)
+        detail = _ig_get(f"/markets/{epic}")
+        if not detail:
+            continue
+        inst       = detail.get("instrument", {})
+        chart_code = inst.get("chartCode", "")
+        country    = inst.get("country", "")
+        ccy_list   = inst.get("currencies", [])
+        ccy_name   = ccy_list[0].get("name", "") if ccy_list else ""
+        if chart_code.upper() == base.upper() and country == "US" and "USD" in ccy_name:
+            snap = detail.get("snapshot", {})
+            note = " [demo: daily snapshot only — no live bid/offer]" if snap.get("bid") is None else ""
+            print(
+                f"[{_ts()}]   ✅ Direct CFD found: {base} → {epic} "
+                f"({inst.get('name', '?')[:45]}){note}",
+                flush=True,
+            )
+            return epic
+    print(f"[{_ts()}]   ℹ️  No direct CFD for {base} — chartCode/USD match failed", flush=True)
+    return None
+
+
+def _get_needed_symbols() -> set:
+    """Return T212 base tickers from held positions and check_requests for CFD discovery."""
+    needed: set = set()
+    try:
+        r = _redis()
+        pos_raw = r.get("ms_held_positions")
+        if pos_raw:
+            for ticker in json.loads(pos_raw).keys():
+                base = ticker.split("_")[0].upper()
+                if len(base) >= 2:
+                    needed.add(base)
+        req_raw = r.get("june_check_requests")
+        if req_raw:
+            for c in json.loads(req_raw).get("candidates", []):
+                base = c.get("symbol", "").split("_")[0].upper()
+                if len(base) >= 2:
+                    needed.add(base)
+    except Exception:
+        pass
+    return needed
+
+
+def _maybe_discover_cfd(needed_bases: set) -> None:
+    """Rate-limited CFD discovery: one IG search per call, at most every 30 seconds."""
+    global _cfd_last_search
+    now = time.time()
+    if now - _cfd_last_search < DIRECT_CFD_SEARCH_INTERVAL:
+        return
+    for base in sorted(needed_bases):
+        if base in _direct_cfd_map:
+            continue
+        if _cfd_miss_cache.get(base, 0) > now:
+            continue
+        _cfd_last_search = now
+        epic = _search_direct_cfd(base)
+        if epic:
+            _direct_cfd_map[base] = epic
+            _save_direct_cfd_cache()
+        else:
+            _cfd_miss_cache[base] = now + DIRECT_CFD_MISS_TTL
+        return  # one search per invocation
+
+
+def _refresh_direct_cfd_signals() -> None:
+    """Fetch daily snapshot signals for all known direct CFD epics (every 5 min).
+
+    IG demo limitation: stock CFDs return null bid/offer (streamingPricesAvailable=False).
+    percentageChange reflects today's move from prior session close — directionally
+    accurate but not intraday real-time. Sync validation (Change 2) requires live
+    bid/offer and is therefore not implemented on IG demo.
+    """
+    global _cfd_signal_refresh
+    if not _direct_cfd_map:
+        return
+    if time.time() - _cfd_signal_refresh < 5 * 60:
+        return
+    updated = []
+    for base, epic in list(_direct_cfd_map.items()):
+        detail = _ig_get(f"/markets/{epic}")
+        if not detail:
+            continue
+        snap = detail.get("snapshot", {})
+        pct  = snap.get("percentageChange")
+        if pct is None:
+            continue
+        pct       = float(pct)
+        direction = "bull" if pct > 0.1 else ("bear" if pct < -0.1 else "flat")
+        _direct_cfd_signals[base] = {"pct": round(pct, 3), "direction": direction, "ts": int(time.time())}
+        updated.append(f"{base}={pct:+.2f}%")
+        time.sleep(1)
+    if updated:
+        _cfd_signal_refresh = time.time()
+        print(f"[{_ts()}] 📈 Direct CFD daily signals: {', '.join(updated)}", flush=True)
+
+
+def _check_direct_cfd_gaps() -> None:
+    """Detect pre-market gaps on individual stocks via direct CFD daily snapshots.
+
+    Gap threshold: |percentageChange from prior close| >= DIRECT_CFD_GAP_PCT (1.5%).
+    Confidence: 'medium' — IG demo has no live bid/offer for stock CFDs, so the
+    spread liquidity check and sustained-2-cycles requirement cannot be verified.
+    Publishes new gaps to june_gap_discoveries (TTL 2h), merging with any existing.
+    """
+    global _gap_disc_date, _gap_disc_seen
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    if _gap_disc_date != today:
+        _gap_disc_date = today
+        _gap_disc_seen = set()
+    if not _direct_cfd_signals:
+        return
+    new_gaps = []
+    for base, sig in _direct_cfd_signals.items():
+        if base in _gap_disc_seen:
+            continue
+        pct = sig.get("pct", 0.0)
+        if abs(pct) < DIRECT_CFD_GAP_PCT:
+            continue
+        direction   = "bull" if pct > 0 else "bear"
+        t212_ticker = f"{base}_US_EQ"
+        new_gaps.append({
+            "t212_ticker":            t212_ticker,
+            "cfd_epic":               _direct_cfd_map.get(base, ""),
+            "gap_pct":                round(pct, 3),
+            "direction":              direction,
+            "prior_close_pct_change": round(pct, 3),
+            "confidence":             "medium",
+        })
+        _gap_disc_seen.add(base)
+        print(
+            f"[{_ts()}] 📊 Direct CFD gap: {t212_ticker} {pct:+.2f}% ({direction}) "
+            f"— publishing to june_gap_discoveries",
+            flush=True,
+        )
+    if not new_gaps:
+        return
+    try:
+        r         = _redis()
+        existing  = r.get("june_gap_discoveries")
+        all_gaps  = json.loads(existing).get("gaps", []) if existing else []
+        seen_tkrs = {g["t212_ticker"] for g in all_gaps}
+        all_gaps.extend(g for g in new_gaps if g["t212_ticker"] not in seen_tkrs)
+        r.set(
+            "june_gap_discoveries",
+            json.dumps({"timestamp": int(time.time()), "gaps": all_gaps}),
+            ex=2 * 3600,
+        )
+    except Exception as exc:
+        print(f"[{_ts()}] ⚠️  Redis error (gap_discoveries): {exc}", flush=True)
+
+
+def _validate_gap_requests() -> None:
+    """Read Claudia's june_gap_validation_requests and publish agreement results.
+
+    Uses direct CFD daily signal when available; falls back to sector-proxy 5-min change.
+    Publishes to june_gap_validations (TTL 90s).
+    """
+    try:
+        r   = _redis()
+        raw = r.get("june_gap_validation_requests")
+        if not raw:
+            return
+        req        = json.loads(raw)
+        candidates = req.get("candidates", [])
+        if not candidates:
+            return
+        ts_now  = int(time.time())
+        results = {}
+        for c in candidates:
+            sym     = c.get("t212_symbol", "")
+            gap_pct = c.get("gap_pct", 0.0)
+            c_dir   = c.get("direction", "bull")
+            base    = sym.split("_")[0].upper()
+            direct  = _direct_cfd_signals.get(base)
+            if direct:
+                june_pct = direct["pct"]
+                june_dir = direct["direction"]
+                agree    = (c_dir == june_dir) and abs(june_pct) >= 0.5
+                entry    = {
+                    "claudia_gap_pct": gap_pct, "june_cfd_pct": june_pct,
+                    "june_source": "direct_cfd", "agreement": agree,
+                    "confidence": "medium", "ts": ts_now,
+                }
+                if not agree:
+                    entry["note"] = f"CFD {june_pct:+.2f}% vs Claudia {c_dir}"
+                results[sym] = entry
+            else:
+                june_inst = T212_TO_JUNE_INSTRUMENT.get(base)
+                if june_inst and june_inst in INSTRUMENTS:
+                    hist      = _history.get(june_inst)
+                    now_price = hist[-1][1] if hist else None
+                    price_5m  = _price_n_minutes_ago(june_inst, 5.0)
+                    if now_price and price_5m and price_5m != 0:
+                        chg_5m   = (now_price - price_5m) / price_5m * 100.0
+                        june_dir = "bull" if chg_5m > 0.15 else ("bear" if chg_5m < -0.15 else "flat")
+                        results[sym] = {
+                            "claudia_gap_pct": gap_pct, "june_cfd_pct": round(chg_5m, 3),
+                            "june_source": f"proxy_{june_inst}", "agreement": c_dir == june_dir,
+                            "confidence": "low", "ts": ts_now,
+                        }
+        if results:
+            r.set("june_gap_validations", json.dumps(results), ex=90)
+            agreed       = [s for s, v in results.items() if v["agreement"]]
+            contradicted = [s for s, v in results.items() if not v["agreement"]]
+            if agreed:
+                print(f"[{_ts()}] ✅ june_gap_validations: agreed {agreed}", flush=True)
+            if contradicted:
+                print(f"[{_ts()}] ⚠️  june_gap_validations: contradicted {contradicted}", flush=True)
+    except Exception as exc:
+        print(f"[{_ts()}] ⚠️  _validate_gap_requests error (non-fatal): {exc}", flush=True)
+
+
 # ── Sister-bot crosscheck functions ───────────────────────────────────────────
 
 def _check_equity_signals() -> None:
@@ -712,6 +1012,21 @@ def _check_equity_signals() -> None:
             sym = c.get("symbol", "")
             change_pct_fmp = c.get("change_pct", 0.0)
 
+            # Direct CFD daily signal (more precise than sector proxy mapping)
+            direct = _direct_cfd_signals.get(sym)
+            if direct:
+                fmp_up = change_pct_fmp > 0.2
+                fmp_dn = change_pct_fmp < -0.2
+                entry  = {
+                    "symbol": sym, "cfd_instrument": f"{sym}_direct_cfd",
+                    "pct": direct["pct"], "direction": direct["direction"],
+                    "source": "direct_cfd", "ts": ts_now,
+                }
+                if (fmp_up and direct["direction"] == "bull") or (fmp_dn and direct["direction"] == "bear"):
+                    confirmed.append(entry)
+                elif (fmp_up and direct["direction"] == "bear") or (fmp_dn and direct["direction"] == "bull"):
+                    contradicted.append(entry)
+                continue
             june_inst = T212_TO_JUNE_INSTRUMENT.get(sym)
             if june_inst not in INSTRUMENTS:
                 continue
@@ -768,6 +1083,24 @@ def _check_exit_warnings() -> None:
 
         for t212_ticker, pos in positions.items():
             base = t212_ticker.split("_")[0].upper()
+            # Direct CFD daily signal (more precise than sector proxy mapping)
+            direct = _direct_cfd_signals.get(base)
+            if direct:
+                pct_val  = direct["pct"]
+                if pct_val >= -1.5:
+                    continue
+                abs_chg  = abs(pct_val)
+                severity = "severe" if abs_chg >= 5.0 else ("moderate" if abs_chg >= 3.0 else "mild")
+                warnings.append({
+                    "cfd_instrument":   f"{base}_direct_cfd",
+                    "t212_equivalents": [t212_ticker],
+                    "direction":        "down",
+                    "pct":              round(pct_val, 3),
+                    "severity":         severity,
+                    "source":           "direct_cfd",
+                    "ts":               ts_now,
+                })
+                continue
             june_inst = T212_TO_JUNE_INSTRUMENT.get(base)
             if june_inst not in INSTRUMENTS:
                 continue
@@ -1044,6 +1377,13 @@ def poll_cycle() -> bool:
     _check_equity_signals()
     _check_exit_warnings()
     _publish_macro_regime()
+
+    # Direct CFD discovery and daily signal refresh (rate-limited)
+    _maybe_discover_cfd(_get_needed_symbols())
+    _refresh_direct_cfd_signals()
+    if is_us_premarket():
+        _check_direct_cfd_gaps()
+    _validate_gap_requests()
 
     # Virtual trading simulation (paper trades only — no real orders)
     if _sim:
@@ -2053,6 +2393,7 @@ def main():
         sys.exit(1)
 
     verify_epics()
+    _load_direct_cfd_cache()
 
     # Start virtual trading simulation (runs in parallel with intelligence)
     sim_startup()
