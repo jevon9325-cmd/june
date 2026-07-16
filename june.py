@@ -1086,11 +1086,14 @@ def _startup_discovery_pass() -> None:
         f"unmapped proactive bases ...",
         flush=True,
     )
+    # Wait for IG rate limit to reset after verify_epics (9 calls) and auth.
+    # Without this pause, startup discovery 403s from the 3rd symbol onward.
+    time.sleep(15)
     # Build nav cache once before symbol loop (returns {} on demo)
     _build_market_nav_cache()
     found = 0
     for base in to_search:
-        time.sleep(2)
+        time.sleep(5)  # 5s: enough for IG demo rate limit between symbols
         epic = _search_direct_cfd(base)
         if epic:
             _direct_cfd_map[base] = epic
