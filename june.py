@@ -97,6 +97,7 @@ DIRECT_CFD_SEARCH_INTERVAL = 30        # seconds between IG search API calls
 DIRECT_CFD_MISS_TTL        = 6 * 3600  # 6h before re-searching a not-found symbol
 DIRECT_CFD_CONFIRMED_MISS_TTL = 24 * 3600  # 24h after all search strategies exhausted
 DIRECT_CFD_REDIS_TTL       = 24 * 3600 # Redis TTL for june_direct_cfd_map
+NAV_CACHE_TTL              = 6 * 3600  # Redis TTL for june_market_nav_cache
 US_PREMARKET_START_MIN = 10 * 60       # 10:00 UTC = 05:00 ET (US pre-market opens)
 US_PREMARKET_END_MIN   = 14 * 60 + 30  # 14:30 UTC = 09:30 ET (US regular session)
 
@@ -151,9 +152,13 @@ _CFD_ALT_NAMES: dict = {
 }
 
 # Bases probed proactively each poll cycle even when MS is not holding them.
-# Covers proxy-mapped symbols that would gain direct CFDs on a live IG account.
+# Includes known-good symbols (NVDA/AAPL/AVGO/MSFT) to recover after Redis TTL expiry.
+# Includes proxy-mapped symbols that gain direct CFDs on a live IG account.
 _CFD_PROACTIVE_BASES: frozenset = frozenset({
-    "XOM", "CVX", "BA", "RTX", "LMT", "DAL", "UAL",
+    # Known direct CFDs (re-discover after Redis expiry)
+    "NVDA", "AAPL", "AVGO", "MSFT",
+    # Proxy-mapped: expected absent on demo, available on funded live account
+    "XOM", "CVX", "BA", "NEM", "RTX", "LMT", "DAL", "UAL",
     "OXY", "SLB", "AMZN", "GOOGL", "TSLA", "META",
     "STNG", "AKAM", "AEIS", "RKLB", "INOD", "PBI",
 })
@@ -285,6 +290,8 @@ _direct_cfd_signals: dict  = {}    # {t212_base: {pct, direction, ts}}  daily sn
 _cfd_signal_refresh: float = 0.0   # epoch of last signal refresh pass
 _gap_disc_date: str        = ""    # UTC date _gap_disc_seen was reset
 _gap_disc_seen: set        = set() # bases already published to june_gap_discoveries today
+_nav_cache: dict           = {}    # {chartCode.upper(): epic} from /marketnavigation
+_nav_tried: bool           = False  # True once navigation was attempted this session
 
 
 # ── Redis ────────────────────────────────────────────────────────────────────
@@ -794,6 +801,106 @@ def _save_direct_cfd_cache() -> None:
         print(f"[{_ts()}] ⚠️  Could not save june_direct_cfd_map: {exc}", flush=True)
 
 
+def _build_market_nav_cache() -> dict:
+    """Build a chartCode->epic lookup from IG /marketnavigation.
+
+    Queries the navigation hierarchy to find SHARES DFB instruments by browsing
+    rather than text search, bypassing the index that returns wrong-company hits
+    (XOM->Xometry, CVX->CVRx, BA->BAE Systems). Validates each instrument via
+    detail call: chartCode, country==US, USD currency.
+
+    Investigation (2026-07-16): /marketnavigation returns HTTP 404 on both the
+    IG demo and live REST API endpoints. The endpoint is not part of the external
+    REST API. This function fails gracefully and returns {} on demo. Code is
+    forward-compatible for any future API version that exposes navigation.
+
+    Results cached in-memory (_nav_cache) and Redis june_market_nav_cache (6h TTL).
+    After the first call per session, subsequent calls return the cached result.
+    """
+    global _nav_cache, _nav_tried
+    if _nav_tried:
+        return _nav_cache
+    _nav_tried = True
+
+    # Try Redis first (populated by a previous session or live account run)
+    try:
+        raw = _redis().get("june_market_nav_cache")
+        if raw:
+            _nav_cache = json.loads(raw)
+            print(
+                f"[{_ts()}] 📚 Market nav cache loaded from Redis: "
+                f"{len(_nav_cache)} US SHARES instruments",
+                flush=True,
+            )
+            return _nav_cache
+    except Exception:
+        pass
+
+    # Query root navigation node — returns None (404) on demo and standard REST API
+    root = _ig_get("/marketnavigation")
+    if not root:
+        print(
+            f"[{_ts()}] ℹ️  /marketnavigation unavailable — "
+            f"nav strategy inactive (live account with navigation API required)",
+            flush=True,
+        )
+        return {}
+
+    # Walk hierarchy for US SHARES nodes
+    lookup: dict = {}
+    visited: set = set()
+
+    def _walk(node_id: str, depth: int) -> None:
+        if depth > 3 or node_id in visited:
+            return
+        visited.add(node_id)
+        time.sleep(0.3)
+        sub = _ig_get(f"/marketnavigation/{node_id}")
+        if not sub:
+            return
+        for m in sub.get("markets", []):
+            if (m.get("instrumentType") == "SHARES"
+                    and m.get("expiry", "").upper() in ("-", "DFB", "")):
+                epic = m.get("epic", "")
+                if epic:
+                    time.sleep(0.3)
+                    det = _ig_get(f"/markets/{epic}")
+                    if det:
+                        inst    = det.get("instrument") or {}
+                        chart   = (inst.get("chartCode") or "").upper()
+                        country = inst.get("country") or ""
+                        ccys    = inst.get("currencies") or []
+                        ccy     = ccys[0].get("name", "") if ccys else ""
+                        if chart and country == "US" and "USD" in ccy:
+                            lookup[chart] = epic
+        for sn in sub.get("nodes", []):
+            _walk(str(sn.get("id", "")), depth + 1)
+
+    nodes = root.get("nodes", [])
+    for n in nodes:
+        name = (n.get("name") or "").lower()
+        if any(kw in name for kw in ("share", "us ", "equit", "stock", "amer")):
+            _walk(str(n.get("id", "")), 0)
+
+    if lookup:
+        try:
+            _redis().set("june_market_nav_cache", json.dumps(lookup), ex=NAV_CACHE_TTL)
+        except Exception:
+            pass
+        print(
+            f"[{_ts()}] 📚 Market nav cache built: {len(lookup)} US SHARES indexed",
+            flush=True,
+        )
+    else:
+        print(
+            f"[{_ts()}] ℹ️  Market nav walked {len(nodes)} root nodes — "
+            f"0 US SHARES DFB found (demo or no US equity hierarchy exposed)",
+            flush=True,
+        )
+    _nav_cache = lookup
+    return _nav_cache
+
+
 def _search_direct_cfd(base: str) -> Optional[str]:
     """Search IG for a direct SHARES DFB CFD for the given T212 base ticker.
 
@@ -877,8 +984,20 @@ def _search_direct_cfd(base: str) -> Optional[str]:
         if epic:
             return epic
 
+    # Strategy 4: market navigation cache
+    # /marketnavigation returns 404 on demo/standard REST API; returns {} gracefully.
+    _nav = _build_market_nav_cache()
+    if _nav:
+        nav_epic = _nav.get(base.upper())
+        if nav_epic:
+            print(
+                f"[{_ts()}]   ✅ Direct CFD found (market nav): {base}_US_EQ → {nav_epic}",
+                flush=True,
+            )
+            return nav_epic
+
     # All strategies exhausted
-    n_strategies = 1 + len(alt_names)
+    n_strategies = 1 + len(alt_names) + (1 if _nav else 0)
     if ko_hits:
         ko_name = (ko_hits[0].get("instrumentName") or "")[:50]
         print(
@@ -938,6 +1057,54 @@ def _maybe_discover_cfd(needed_bases: set) -> None:
         else:
             _cfd_miss_cache[base] = now + DIRECT_CFD_CONFIRMED_MISS_TTL
         return  # one search per invocation
+
+
+def _startup_discovery_pass() -> None:
+    """Synchronous discovery pass for all proactive bases at startup.
+
+    Change 1 (W-8BEN): clears stale confirmed-miss state by re-searching all
+    proactive bases. In-memory _cfd_miss_cache is always empty on restart, so
+    every previously-failed symbol is tried fresh.
+
+    Change 3 (W-8BEN): runs before the main poll loop to eager-load results
+    rather than waiting for symbols to appear in ms_held_positions. Uses a
+    short 2s inter-call delay instead of the 30s poll rate limit.
+
+    Logs a summary: 'Startup discovery complete: N/M direct CFDs found'.
+    """
+    global _cfd_last_search
+    to_search = sorted(b for b in _CFD_PROACTIVE_BASES if b not in _direct_cfd_map)
+    total     = len(_CFD_PROACTIVE_BASES)
+    if not to_search:
+        print(
+            f"[{_ts()}] 🔍 Startup discovery: all {total} proactive bases already mapped — skipping",
+            flush=True,
+        )
+        return
+    print(
+        f"[{_ts()}] 🔍 Startup discovery: checking {len(to_search)}/{total} "
+        f"unmapped proactive bases ...",
+        flush=True,
+    )
+    # Build nav cache once before symbol loop (returns {} on demo)
+    _build_market_nav_cache()
+    found = 0
+    for base in to_search:
+        time.sleep(2)
+        epic = _search_direct_cfd(base)
+        if epic:
+            _direct_cfd_map[base] = epic
+            _save_direct_cfd_cache()
+            found += 1
+        else:
+            _cfd_miss_cache[base] = time.time() + DIRECT_CFD_CONFIRMED_MISS_TTL
+    _cfd_last_search = time.time()
+    mapped = len([b for b in _CFD_PROACTIVE_BASES if b in _direct_cfd_map])
+    print(
+        f"[{_ts()}] 🔍 Startup discovery complete: "
+        f"{mapped}/{total} direct CFDs found, {total - mapped} proxy-only",
+        flush=True,
+    )
 
 
 def _refresh_direct_cfd_signals() -> None:
@@ -2494,6 +2661,7 @@ def main():
 
     verify_epics()
     _load_direct_cfd_cache()
+    _startup_discovery_pass()   # Change 3: eager search all proactive bases (2s/symbol)
 
     # Start virtual trading simulation (runs in parallel with intelligence)
     sim_startup()
