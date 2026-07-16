@@ -52,6 +52,12 @@ IG_USER    = os.environ.get("IG_USERNAME", "")
 IG_PASS    = os.environ.get("IG_PASSWORD", "")
 IG_ACCOUNT = os.environ.get("IG_ACCOUNT_ID", "Z6CPCQ")
 
+# IG Live account (W-8BEN activated — intelligence only, no orders placed)
+IG_LIVE_BASE = os.environ.get("IG_LIVE_BASE_URL", "")
+IG_LIVE_KEY  = os.environ.get("IG_LIVE_API_KEY", "")
+IG_LIVE_USER = os.environ.get("IG_LIVE_USERNAME", "")
+IG_LIVE_PASS = os.environ.get("IG_LIVE_PASSWORD", "")
+
 REDIS_HOST  = os.environ.get("REDIS_HOST", "")
 REDIS_PORT  = int(os.environ.get("REDIS_PORT", 15074))
 REDIS_PASS  = os.environ.get("REDIS_PASSWORD", "")
@@ -252,7 +258,9 @@ _THREE_WAY_GROUPS = [
 # ── Module-level state ───────────────────────────────────────────────────────
 
 # IG session
-_sess: dict = {"cst": None, "token": None, "born": 0.0}
+_sess: dict      = {"cst": None, "token": None, "born": 0.0}
+_live_sess: dict = {"cst": None, "token": None, "born": 0.0}
+_live_available: bool = False  # True after successful live account auth
 
 # Rolling price history: {sym: deque([(epoch, mid), ...])}
 _history: dict = {sym: deque(maxlen=HISTORY_LEN) for sym in INSTRUMENTS}
@@ -371,6 +379,100 @@ def _ig_get(path: str, params: Optional[dict] = None, version: str = "1") -> Opt
         return None
     except Exception as exc:
         print(f"[{_ts()}] ⚠️  {path} error: {exc}", flush=True)
+        return None
+
+
+
+def authenticate_live() -> bool:
+    # Authenticate with IG live account (W-8BEN activated).
+    # Intelligence-only: no orders placed via live endpoint under any circumstances.
+    global _live_available
+    if not all([IG_LIVE_BASE, IG_LIVE_KEY, IG_LIVE_USER, IG_LIVE_PASS]):
+        print(f"[{_ts()}] ℹ️  Live account not configured — demo only", flush=True)
+        return False
+    url  = f"{IG_LIVE_BASE}/session"
+    body = {"identifier": IG_LIVE_USER, "password": IG_LIVE_PASS, "encryptedPassword": False}
+    hdrs = {
+        "X-IG-API-KEY":  IG_LIVE_KEY,
+        "Content-Type":  "application/json; charset=UTF-8",
+        "Accept":        "application/json; charset=UTF-8",
+        "Version":       "2",
+    }
+    try:
+        r = requests.post(url, json=body, headers=hdrs, timeout=15)
+        if r.status_code == 200:
+            data = r.json()
+            _live_sess["cst"]   = r.headers.get("CST")
+            _live_sess["token"] = r.headers.get("X-SECURITY-TOKEN")
+            _live_sess["born"]  = time.time()
+            _live_available = True
+            acct_id   = data.get("currentAccountId", "?")
+            acct_type = data.get("accountType", "?")
+            avail     = data.get("accountInfo", {}).get("available", 0)
+            ccy       = data.get("currencyIsoCode", "USD")
+            print(
+                f"[{_ts()}] ✅ Live account connected: {IG_LIVE_USER} "
+                f"(account {acct_id}, {acct_type}, balance: {avail} {ccy}) "
+                f"— intelligence mode only (no orders placed)",
+                flush=True,
+            )
+            return True
+        print(
+            f"[{_ts()}] ℹ️  Live account auth failed (HTTP {r.status_code}) — demo only",
+            flush=True,
+        )
+        _live_available = False
+        return False
+    except Exception as exc:
+        print(f"[{_ts()}] ℹ️  Live account unavailable: {exc} — demo only", flush=True)
+        _live_available = False
+        return False
+
+
+def _ensure_live_session() -> bool:
+    # Return True if live session tokens are fresh; re-auth if near 6h expiry.
+    global _live_available
+    if not _live_available:
+        return False
+    if not _live_sess.get("cst"):
+        return False
+    if time.time() - _live_sess.get("born", 0) > SESSION_MAX:
+        print(f"[{_ts()}] 🔄 Live session near 6h expiry — refreshing", flush=True)
+        return authenticate_live()
+    return True
+
+
+def _ig_live_get(path: str, params: Optional[dict] = None, version: str = "1") -> Optional[dict]:
+    # GET against IG live endpoint. Intelligence-only, no orders.
+    # Mirrors _ig_get() using live base URL and live session tokens.
+    # 403/429 silently return None (rate-limit recovery expected).
+    if not _ensure_live_session():
+        return None
+    url  = f"{IG_LIVE_BASE}{path}"
+    hdrs = {
+        "X-IG-API-KEY":     IG_LIVE_KEY,
+        "CST":              _live_sess["cst"],
+        "X-SECURITY-TOKEN": _live_sess["token"],
+        "Content-Type":     "application/json; charset=UTF-8",
+        "Accept":           "application/json; charset=UTF-8",
+        "Version":          version,
+    }
+    try:
+        r = requests.get(url, headers=hdrs, params=params, timeout=10)
+        if r.status_code == 401:
+            print(f"[{_ts()}] 🔄 Live 401 — re-authenticating", flush=True)
+            if not authenticate_live():
+                return None
+            hdrs["CST"]              = _live_sess["cst"]
+            hdrs["X-SECURITY-TOKEN"] = _live_sess["token"]
+            r = requests.get(url, headers=hdrs, params=params, timeout=10)
+        if r.status_code == 200:
+            return r.json()
+        if r.status_code not in (403, 429):
+            print(f"[{_ts()}] ⚠️  LIVE {path}: HTTP {r.status_code} {r.text[:80]}", flush=True)
+        return None
+    except Exception as exc:
+        print(f"[{_ts()}] ⚠️  LIVE {path} error: {exc}", flush=True)
         return None
 
 
@@ -925,8 +1027,11 @@ def _search_direct_cfd(base: str) -> Optional[str]:
     alt_names = _CFD_ALT_NAMES.get(base, [])
     ko_hits: list = []
 
-    def _try_candidate_list(search_term: str, is_ticker: bool) -> Optional[str]:
-        data = _ig_get("/markets", params={"searchTerm": search_term})
+    def _try_candidate_list(search_term: str, is_ticker: bool,
+                            ig_get_fn=None, label: str = "DEMO") -> Optional[str]:
+        if ig_get_fn is None:
+            ig_get_fn = _ig_get
+        data = ig_get_fn("/markets", params={"searchTerm": search_term})
         if not data:
             return None
         markets = data.get("markets", [])
@@ -954,7 +1059,7 @@ def _search_direct_cfd(base: str) -> Optional[str]:
             if not epic:
                 continue
             time.sleep(1)
-            detail = _ig_get(f"/markets/{epic}")
+            detail = ig_get_fn(f"/markets/{epic}")
             if not detail:
                 continue
             inst       = detail.get("instrument") or {}
@@ -966,7 +1071,7 @@ def _search_direct_cfd(base: str) -> Optional[str]:
                 snap = detail.get("snapshot") or {}
                 note = " [demo: daily snapshot only]" if snap.get("bid") is None else ""
                 print(
-                    f"[{_ts()}]   \u2705 Direct CFD found: {base}_US_EQ \u2192 {epic} "
+                    f"[{_ts()}]   \u2705 Direct CFD found ({label}): {base}_US_EQ \u2192 {epic} "
                     f"({inst.get('name', '?')[:45]}){note}{via}",
                     flush=True,
                 )
@@ -996,6 +1101,19 @@ def _search_direct_cfd(base: str) -> Optional[str]:
             )
             return nav_epic
 
+    # Live endpoint fallback: retry same search strategies via W-8BEN live account.
+    # Confirmed live-only symbols (2026-07-16): XOM LMT BA NEM UAL OXY SLB.
+    if _live_available and _ensure_live_session():
+        epic = _try_candidate_list(base, is_ticker=True, ig_get_fn=_ig_live_get, label="LIVE")
+        if not epic:
+            for name_term in alt_names:
+                epic = _try_candidate_list(name_term, is_ticker=False,
+                                           ig_get_fn=_ig_live_get, label="LIVE")
+                if epic:
+                    break
+        if epic:
+            return epic
+
     # All strategies exhausted
     n_strategies = 1 + len(alt_names) + (1 if _nav else 0)
     if ko_hits:
@@ -1007,9 +1125,10 @@ def _search_direct_cfd(base: str) -> Optional[str]:
             flush=True,
         )
     else:
+        live_note = " + live" if _live_available else ""
         print(
-            f"[{_ts()}]   \u2139\ufe0f  {base}_US_EQ: not found across {n_strategies} "
-            f"search strategies \u2014 proxy mapping retained",
+            f"[{_ts()}]   \u2139\ufe0f  {base}_US_EQ: not found across "
+            f"{n_strategies} demo{live_note} search strategies \u2014 proxy mapping retained",
             flush=True,
         )
     return None
