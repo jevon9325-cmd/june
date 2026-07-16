@@ -2659,6 +2659,7 @@ def main():
     if not authenticate():
         print(f"[{_ts()}] ❌ IG authentication failed — cannot start", flush=True)
         sys.exit(1)
+    authenticate_live()  # optional — logs ✅ or ℹ️; does not block startup
 
     verify_epics()
     _load_direct_cfd_cache()
