@@ -1096,8 +1096,9 @@ def _startup_discovery_pass() -> None:
             _direct_cfd_map[base] = epic
             _save_direct_cfd_cache()
             found += 1
-        else:
-            _cfd_miss_cache[base] = time.time() + DIRECT_CFD_CONFIRMED_MISS_TTL
+        # No miss-cache ban here: startup failures may be transient 403s.
+        # _maybe_discover_cfd() sets the 24h ban after confirmed multi-strategy
+        # failure in the main loop, once the rate limit has recovered.
     _cfd_last_search = time.time()
     mapped = len([b for b in _CFD_PROACTIVE_BASES if b in _direct_cfd_map])
     print(
