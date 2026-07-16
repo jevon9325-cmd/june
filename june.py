@@ -95,20 +95,68 @@ PREMARKET_GAP_PCT   = 0.50   # |change vs 06:00 baseline| to flag pre-London gap
 DIRECT_CFD_GAP_PCT  = 1.5    # daily % change to flag individual stock as gap candidate
 DIRECT_CFD_SEARCH_INTERVAL = 30        # seconds between IG search API calls
 DIRECT_CFD_MISS_TTL        = 6 * 3600  # 6h before re-searching a not-found symbol
+DIRECT_CFD_CONFIRMED_MISS_TTL = 24 * 3600  # 24h after all search strategies exhausted
 DIRECT_CFD_REDIS_TTL       = 24 * 3600 # Redis TTL for june_direct_cfd_map
 US_PREMARKET_START_MIN = 10 * 60       # 10:00 UTC = 05:00 ET (US pre-market opens)
 US_PREMARKET_END_MIN   = 14 * 60 + 30  # 14:30 UTC = 09:30 ET (US regular session)
 
-# Company name keywords for IG search validation: ticker -> fragment in IG instrument name.
-# Used in _search_direct_cfd() to filter false matches before the chartCode check.
+# Post-filter keyword after ticker-symbol search: ticker -> lowercase fragment in IG name.
+# Rejects wrong-company hits before the detail API call
+# (e.g. "XOM"->Xometry, "CVX"->CVRx, "BA"->BAE Systems).
 _DIRECT_CFD_KEYWORDS: dict = {
-    "NVDA": "NVIDIA",    "AAPL": "Apple",         "MSFT": "Microsoft",
-    "AVGO": "Broadcom",  "AMZN": "Amazon",        "GOOGL": "Alphabet",
-    "META": "Meta",      "TSLA": "Tesla",          "AMD": "Advanced Micro",
-    "INTC": "Intel",     "MU": "Micron",           "DAL": "Delta",
-    "UAL": "United Air", "NEM": "Newmont",         "AKAM": "Akamai",
-    "RKLB": "Rocket Lab","AEIS": "Advanced Energy","SCHD": "Schwab",
+    "NVDA": "nvidia",      "AAPL": "apple",           "MSFT": "microsoft",
+    "AVGO": "broadcom",    "AMZN": "amazon",          "GOOGL": "alphabet",
+    "META": "meta",        "TSLA": "tesla",           "AMD": "advanced micro",
+    "INTC": "intel",       "MU": "micron",            "DAL": "delta",
+    "UAL": "united air",   "NEM": "newmont",          "AKAM": "akamai",
+    "RKLB": "rocket lab",  "AEIS": "advanced energy", "SCHD": "schwab",
+    "XOM": "exxon",        "CVX": "chevron",          "BA": "boeing",
+    "RTX": "raytheon",     "LMT": "lockheed",         "OXY": "occidental",
+    "SLB": "schlumberger", "STNG": "scorpio",         "PBI": "pitney",
+    "INOD": "innodata",    "GOOG": "alphabet",        "AMGN": "amgen",
 }
+
+# Alternative company-name search terms tried after ticker-symbol search fails.
+# Confirmed on IG demo (2026-07-16): XOM/CVX/BA/NEM/RTX/LMT/DAL/UAL and all other
+# proxy-mapped symbols absent from demo universe (0 SHARES DFB results).
+# These terms are forward-compatible for a funded live IG account.
+_CFD_ALT_NAMES: dict = {
+    "XOM":   ["Exxon Mobil",            "Exxon Mobil Corp"],
+    "CVX":   ["Chevron",                "Chevron Corp"],
+    "BA":    ["Boeing",                 "Boeing Co"],
+    "NEM":   ["Newmont",                "Newmont Corp"],
+    "RTX":   ["Raytheon Technologies",  "RTX Corp"],
+    "LMT":   ["Lockheed Martin"],
+    "OXY":   ["Occidental Petroleum",   "Occidental"],
+    "SLB":   ["Schlumberger",           "SLB Ltd"],
+    "DAL":   ["Delta Air Lines",        "Delta Air"],
+    "UAL":   ["United Airlines",        "United Air Lines"],
+    "AMZN":  ["Amazon"],
+    "GOOGL": ["Alphabet"],
+    "GOOG":  ["Alphabet"],
+    "TSLA":  ["Tesla"],
+    "AMD":   ["Advanced Micro Devices"],
+    "INTC":  ["Intel Corp"],
+    "MU":    ["Micron Technology"],
+    "META":  ["Meta Platforms"],
+    "AVGO":  ["Broadcom"],
+    "STNG":  ["Scorpio Tankers"],
+    "INOD":  ["Innodata"],
+    "AEIS":  ["Advanced Energy Industries"],
+    "AKAM":  ["Akamai Technologies"],
+    "RKLB":  ["Rocket Lab"],
+    "PBI":   ["Pitney Bowes"],
+    "SCHD":  ["Schwab US Dividend Equity"],
+    "AMGN":  ["Amgen"],
+}
+
+# Bases probed proactively each poll cycle even when MS is not holding them.
+# Covers proxy-mapped symbols that would gain direct CFDs on a live IG account.
+_CFD_PROACTIVE_BASES: frozenset = frozenset({
+    "XOM", "CVX", "BA", "RTX", "LMT", "DAL", "UAL",
+    "OXY", "SLB", "AMZN", "GOOGL", "TSLA", "META",
+    "STNG", "AKAM", "AEIS", "RKLB", "INOD", "PBI",
+})
 
 OVERNIGHT_VOL_THRESH = 1.0   # % overnight move to count an instrument as volatile
 OVERNIGHT_VOL_COUNT  = 3     # instruments needed to declare high_overnight_volatility
@@ -747,56 +795,105 @@ def _save_direct_cfd_cache() -> None:
 
 
 def _search_direct_cfd(base: str) -> Optional[str]:
-    """Search IG for a direct SHARES CFD matching the T212 base ticker.
+    """Search IG for a direct SHARES DFB CFD for the given T212 base ticker.
 
-    Validates: instrumentType=SHARES, expiry=DFB/-, chartCode==base, country==US, USD.
-    IG demo note: found epics have streamingPricesAvailable=False — daily
-    percentageChange snapshot is available; live bid/offer requires a live account.
-    Returns the epic string, or None if no valid match.
+    Strategy 1: search by ticker symbol; apply _DIRECT_CFD_KEYWORDS filter to
+    reject wrong-company hits (XOM->Xometry, CVX->CVRx, BA->BAE Systems, etc.);
+    validate chartCode/country/USD on up to 4 candidates.
+
+    Strategy 2+: search by company name variants from _CFD_ALT_NAMES. Same
+    validation — chartCode must still equal base, so false-company hits are
+    automatically rejected.
+
+    IG demo finding (2026-07-16): only NVDA/AAPL/MSFT/AVGO confirmed as DFB
+    SHARES. All other proxy-mapped symbols (XOM, CVX, BA, NEM, RTX, LMT, DAL,
+    UAL ...) absent from the demo universe; company-name searches also return
+    0 SHARES DFB results. The multi-strategy approach is forward-compatible with
+    a funded live IG account.
+
+    Logs a warning if the symbol exists only as a knockout (probable live-only
+    restriction). Returns the epic string or None.
     """
-    data = _ig_get("/markets", params={"searchTerm": base})
-    if not data:
-        return None
-    markets = data.get("markets", [])
-    shares = [
-        m for m in markets
-        if m.get("instrumentType") == "SHARES"
-        and m.get("expiry", "").upper() in ("-", "DFB", "")
-    ]
-    if not shares:
-        print(f"[{_ts()}]   ℹ️  No direct CFD for {base} — 0 SHARES results", flush=True)
-        return None
-    keyword = _DIRECT_CFD_KEYWORDS.get(base, "").lower()
-    if keyword:
-        filtered = [m for m in shares if keyword in m.get("instrumentName", "").lower()]
-        if filtered:
-            shares = filtered
-    for m in shares[:3]:
-        epic = m.get("epic", "")
-        if not epic:
-            continue
-        time.sleep(1)
-        detail = _ig_get(f"/markets/{epic}")
-        if not detail:
-            continue
-        inst       = detail.get("instrument", {})
-        chart_code = inst.get("chartCode", "")
-        country    = inst.get("country", "")
-        ccy_list   = inst.get("currencies", [])
-        ccy_name   = ccy_list[0].get("name", "") if ccy_list else ""
-        if chart_code.upper() == base.upper() and country == "US" and "USD" in ccy_name:
-            snap = detail.get("snapshot", {})
-            note = " [demo: daily snapshot only — no live bid/offer]" if snap.get("bid") is None else ""
-            print(
-                f"[{_ts()}]   ✅ Direct CFD found: {base} → {epic} "
-                f"({inst.get('name', '?')[:45]}){note}",
-                flush=True,
+    keyword   = _DIRECT_CFD_KEYWORDS.get(base, "").lower()
+    alt_names = _CFD_ALT_NAMES.get(base, [])
+    ko_hits: list = []
+
+    def _try_candidate_list(search_term: str, is_ticker: bool) -> Optional[str]:
+        data = _ig_get("/markets", params={"searchTerm": search_term})
+        if not data:
+            return None
+        markets = data.get("markets", [])
+        if is_ticker:
+            ko_hits.extend(
+                m for m in markets
+                if "KNOCKOUT" in m.get("instrumentType", "")
+                and (base.lower() in m.get("epic", "").lower()
+                     or (keyword and keyword in m.get("instrumentName", "").lower()))
             )
+        shares = [
+            m for m in markets
+            if m.get("instrumentType") == "SHARES"
+            and m.get("expiry", "").upper() in ("-", "DFB", "")
+        ]
+        if not shares:
+            return None
+        if is_ticker and keyword:
+            filtered = [m for m in shares if keyword in m.get("instrumentName", "").lower()]
+            if filtered:
+                shares = filtered
+        via = "" if is_ticker else f" [via '{search_term}']"
+        for m in shares[:4]:
+            epic = m.get("epic", "")
+            if not epic:
+                continue
+            time.sleep(1)
+            detail = _ig_get(f"/markets/{epic}")
+            if not detail:
+                continue
+            inst       = detail.get("instrument") or {}
+            chart_code = (inst.get("chartCode") or "").upper()
+            country    = inst.get("country") or ""
+            ccy_list   = inst.get("currencies") or []
+            ccy_name   = ccy_list[0].get("name", "") if ccy_list else ""
+            if chart_code == base.upper() and country == "US" and "USD" in ccy_name:
+                snap = detail.get("snapshot") or {}
+                note = " [demo: daily snapshot only]" if snap.get("bid") is None else ""
+                print(
+                    f"[{_ts()}]   \u2705 Direct CFD found: {base}_US_EQ \u2192 {epic} "
+                    f"({inst.get('name', '?')[:45]}){note}{via}",
+                    flush=True,
+                )
+                return epic
+        return None
+
+    # Strategy 1: ticker symbol search
+    epic = _try_candidate_list(base, is_ticker=True)
+    if epic:
+        return epic
+
+    # Strategy 2+: company name variant searches
+    for name_term in alt_names:
+        epic = _try_candidate_list(name_term, is_ticker=False)
+        if epic:
             return epic
-    print(f"[{_ts()}]   ℹ️  No direct CFD for {base} — chartCode/USD match failed", flush=True)
+
+    # All strategies exhausted
+    n_strategies = 1 + len(alt_names)
+    if ko_hits:
+        ko_name = (ko_hits[0].get("instrumentName") or "")[:50]
+        print(
+            f"[{_ts()}]   \u26a0\ufe0f  {base}_US_EQ: exists on IG as knockout only "
+            f"({ko_name}) \u2014 DFB SHARES CFD unavailable on demo; "
+            f"proxy mapping retained",
+            flush=True,
+        )
+    else:
+        print(
+            f"[{_ts()}]   \u2139\ufe0f  {base}_US_EQ: not found across {n_strategies} "
+            f"search strategies \u2014 proxy mapping retained",
+            flush=True,
+        )
     return None
-
-
 def _get_needed_symbols() -> set:
     """Return T212 base tickers from held positions and check_requests for CFD discovery."""
     needed: set = set()
@@ -816,6 +913,9 @@ def _get_needed_symbols() -> set:
                     needed.add(base)
     except Exception:
         pass
+    # Probe proactive bases even when MS is not holding them; miss cache
+    # (24h TTL) prevents re-querying confirmed-absent symbols.
+    needed.update(b for b in _CFD_PROACTIVE_BASES if b not in _direct_cfd_map)
     return needed
 
 
@@ -836,7 +936,7 @@ def _maybe_discover_cfd(needed_bases: set) -> None:
             _direct_cfd_map[base] = epic
             _save_direct_cfd_cache()
         else:
-            _cfd_miss_cache[base] = now + DIRECT_CFD_MISS_TTL
+            _cfd_miss_cache[base] = now + DIRECT_CFD_CONFIRMED_MISS_TTL
         return  # one search per invocation
 
 
