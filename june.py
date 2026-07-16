@@ -157,6 +157,15 @@ _CFD_ALT_NAMES: dict = {
     "AMGN":  ["Amgen"],
 }
 
+# Known alternative epics for symbols where IG's chartCode does not match the NYSE ticker.
+# Validated 2026-07-16 via live IG account: CVX=FIO, RTX=UTX(legacy), DAL=MMR.
+# Strategy 5 in _search_direct_cfd() uses these when all other strategies fail.
+_CFD_ALTERNATIVE_EPICS: dict = {
+    "CVX": ("SB.D.CVX.CASH.IP", "chevron"),   # chartCode=FIO — IG data quirk
+    "RTX": ("SH.D.UTX.CASH.IP", "rtx"),        # chartCode=UTX — pre-merger legacy ticker
+    "DAL": ("SB.D.DAL.CASH.IP", "delta"),       # chartCode=MMR — IG data quirk
+}
+
 # Bases probed proactively each poll cycle even when MS is not holding them.
 # Includes known-good symbols (NVDA/AAPL/AVGO/MSFT) to recover after Redis TTL expiry.
 # Includes proxy-mapped symbols that gain direct CFDs on a live IG account.
@@ -300,6 +309,8 @@ _gap_disc_date: str        = ""    # UTC date _gap_disc_seen was reset
 _gap_disc_seen: set        = set() # bases already published to june_gap_discoveries today
 _nav_cache: dict           = {}    # {chartCode.upper(): epic} from /marketnavigation
 _nav_tried: bool           = False  # True once navigation was attempted this session
+_sync_state: dict          = {}     # {base: {agree: int, disagree: int}}
+_sync_last_check: float    = 0.0   # epoch of last sync check pass
 
 
 # ── Redis ────────────────────────────────────────────────────────────────────
@@ -1114,6 +1125,32 @@ def _search_direct_cfd(base: str) -> Optional[str]:
         if epic:
             return epic
 
+    # Strategy 5: known alternative epics — IG chartCode doesn't match NYSE ticker.
+    # Validated 2026-07-16: CVX=FIO, RTX=UTX(legacy), DAL=MMR.
+    # Validates by name keyword + country + USD (bypasses chartCode check for these only).
+    alt = _CFD_ALTERNATIVE_EPICS.get(base)
+    if alt:
+        alt_epic, alt_keyword = alt
+        ig_fn = _ig_live_get if (_live_available and _ensure_live_session()) else _ig_get
+        detail = ig_fn(f"/markets/{alt_epic}")
+        if detail:
+            inst = detail.get("instrument") or {}
+            name_lower = (inst.get("name") or "").lower()
+            country    = inst.get("country") or ""
+            ccys       = inst.get("currencies") or []
+            ccy        = ccys[0].get("name", "") if ccys else ""
+            snap       = detail.get("snapshot") or {}
+            if (country == "US" and "USD" in ccy
+                    and (alt_keyword in name_lower or base.lower() in name_lower)):
+                note = " [demo: daily snapshot only]" if snap.get("bid") is None else ""
+                print(
+                    f"[{_ts()}]   \u2705 Direct CFD found (alternative search): "
+                    f"{base}_US_EQ \u2192 {alt_epic} "
+                    f"({inst.get('name', '?')[:45]}){note}",
+                    flush=True,
+                )
+                return alt_epic
+
     # All strategies exhausted
     n_strategies = 1 + len(alt_names) + (1 if _nav else 0)
     if ko_hits:
@@ -1689,6 +1726,151 @@ def _publish_macro_regime() -> None:
     except Exception as exc:
         print(f"[{_ts()}] \u26a0\ufe0f  _publish_macro_regime error (non-fatal): {exc}", flush=True)
 
+def _run_cfd_sync_check() -> None:
+    """Compare direct CFD daily % vs T212 price changes. Publishes june_cfd_sync_status.
+    Passive only — does not affect any other Redis key except to annotate existing
+    june_exit_warnings entries when DESYNCED."""
+    global _sync_last_check
+    if time.time() - _sync_last_check < 5 * 60:
+        return
+    if not _direct_cfd_signals:
+        return
+
+    # Gather T212 price-change data from available Redis sources.
+    t212_changes: dict = {}
+    try:
+        r = _redis()
+        req_raw = r.get("june_check_requests")
+        if req_raw:
+            for c in json.loads(req_raw).get("candidates", []):
+                base = c.get("symbol", "").split("_")[0].upper()
+                pct  = c.get("change_pct")
+                if base and pct is not None:
+                    t212_changes[base] = float(pct)
+        pos_raw = r.get("ms_held_positions")
+        if pos_raw:
+            for ticker, pos in json.loads(pos_raw).items():
+                base = ticker.split("_")[0].upper()
+                if base not in t212_changes:
+                    for field in ("pnl_pct", "pnl_percentage", "unrealised_pnl_pct"):
+                        v = pos.get(field)
+                        if v is not None:
+                            t212_changes[base] = float(v)
+                            break
+    except Exception:
+        pass
+
+    ts_now       = int(time.time())
+    sync_status  = {"timestamp": ts_now}
+    desynced_bases: set = set()
+
+    for base, sig in _direct_cfd_signals.items():
+        epic    = _direct_cfd_map.get(base, "")
+        cfd_pct = sig.get("pct", 0.0)
+        key     = base + "_US_EQ"
+        t212_pct = t212_changes.get(base)
+
+        if t212_pct is None:
+            sync_status[key] = {
+                "status": "unknown",
+                "reason": "no T212 price data available",
+                "cfd_epic": epic, "source": "demo", "last_check": ts_now,
+            }
+            if base in _sync_state:
+                _sync_state[base]["agree"]    = 0
+                _sync_state[base]["disagree"] = 0
+            continue
+
+        cfd_dir  = "bull" if cfd_pct > 0.1 else ("bear" if cfd_pct < -0.1 else "flat")
+        t212_dir = "bull" if t212_pct > 0.1 else ("bear" if t212_pct < -0.1 else "flat")
+        opposing = (
+            cfd_dir != "flat" and t212_dir != "flat" and cfd_dir != t212_dir
+            and abs(cfd_pct) >= 0.5 and abs(t212_pct) >= 0.5
+        )
+
+        state = _sync_state.setdefault(base, {"agree": 0, "disagree": 0})
+        if opposing:
+            state["disagree"] += 1
+            state["agree"]     = 0
+        else:
+            state["agree"] += 1
+            state["disagree"] = 0
+
+        if state["disagree"] >= 2:
+            desynced_bases.add(base)
+            sync_status[key] = {
+                "status": "desynced",
+                "cfd_change": cfd_pct, "t212_change": t212_pct,
+                "note": "opposing direction " + str(state["disagree"]) + " checks",
+                "cfd_epic": epic, "source": "demo", "last_check": ts_now,
+            }
+            print(
+                f"[{_ts()}] \u26a0\ufe0f  Sync check: {key} \u2014 "
+                f"CFD {cfd_pct:+.2f}% vs T212 {t212_pct:+.2f}% "
+                f"(opposing, check {state['disagree']}/2) \u2014 flagging DESYNCED",
+                flush=True,
+            )
+        elif state["agree"] >= 3:
+            sync_status[key] = {
+                "status": "synced",
+                "cfd_epic": epic, "source": "demo", "last_check": ts_now,
+            }
+            print(
+                f"[{_ts()}] \u2705 Sync check: {key} \u2014 "
+                f"CFD and T212 both {cfd_dir} \u2014 SYNCED",
+                flush=True,
+            )
+        else:
+            sync_status[key] = {
+                "status": "checking",
+                "cfd_change": cfd_pct, "t212_change": t212_pct,
+                "checks_agree": state["agree"], "checks_disagree": state["disagree"],
+                "cfd_epic": epic, "source": "demo", "last_check": ts_now,
+            }
+
+    try:
+        _redis().set("june_cfd_sync_status", json.dumps(sync_status), ex=10 * 60)
+    except Exception as exc:
+        print(f"[{_ts()}] \u26a0\ufe0f  Redis write error (cfd_sync_status): {exc}",
+              flush=True)
+
+    if desynced_bases:
+        _annotate_exit_warnings_with_sync(desynced_bases, sync_status)
+
+    _sync_last_check = time.time()
+
+
+def _annotate_exit_warnings_with_sync(desynced_bases: set, sync_status: dict) -> None:
+    """Add sync_warning to existing exit warnings for desynced instruments.
+    Never creates new warnings — passive annotation only."""
+    try:
+        r = _redis()
+        raw = r.get("june_exit_warnings")
+        if not raw:
+            return
+        warnings_data = json.loads(raw)
+        warnings      = warnings_data.get("warnings", [])
+        modified      = False
+        for w in warnings:
+            cfd_inst = w.get("cfd_instrument", "")
+            base     = cfd_inst.replace("_direct_cfd", "").split("_")[0].upper()
+            if base in desynced_bases:
+                key = base + "_US_EQ"
+                se  = sync_status.get(key, {})
+                w["sync_warning"] = {
+                    "status":      "desynced",
+                    "cfd_change":  se.get("cfd_change"),
+                    "t212_change": se.get("t212_change"),
+                    "note":        se.get("note", ""),
+                }
+                modified = True
+        if modified:
+            r.set("june_exit_warnings", json.dumps(warnings_data), ex=120)
+    except Exception as exc:
+        print(f"[{_ts()}] \u26a0\ufe0f  _annotate_exit_warnings_with_sync error: {exc}",
+              flush=True)
+
+
 def poll_cycle() -> bool:
     """Fetch all instrument prices, update state, publish june_signals. Returns True if prices returned."""
     now          = time.time()
@@ -1768,6 +1950,7 @@ def poll_cycle() -> bool:
     # Direct CFD discovery and daily signal refresh (rate-limited)
     _maybe_discover_cfd(_get_needed_symbols())
     _refresh_direct_cfd_signals()
+    _run_cfd_sync_check()
     if is_us_premarket():
         _check_direct_cfd_gaps()
     _validate_gap_requests()
