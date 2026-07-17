@@ -2011,8 +2011,8 @@ _SIM_THRESH_MULT     = 1.5    # std-dev multiplier for threshold calc
 _SIM_THRESH_MIN_HIST = 10     # min vol history samples before dynamic thresh
 _SIM_STREAK_BOOST    = 3      # loss streak count that raises threshold
 _SIM_STREAK_PAUSE    = 5      # loss streak count that pauses entries
-_SIM_BOOST_DUR       = 2 * 3600   # boost duration (2h)
-_SIM_PAUSE_DUR       = 4 * 3600   # pause duration (4h)
+_SIM_BOOST_DUR       = 30 * 60    # boost duration (30m)
+_SIM_PAUSE_DUR       = 45 * 60    # pause duration (45m)
 _SIM_BALANCE_FLOOR   = 40.0   # auto-reset if balance drops below this
 
 # ── Dynamic 15m reliability gate ───────────────────────────────────────────────
@@ -2352,7 +2352,7 @@ def _sim_update_streak(sym: str, direction: str, won: bool) -> None:
         resume = datetime.fromtimestamp(boost_end, tz=timezone.utc).strftime("%H:%M UTC")
         _sim_log(
             f"\u26a0\ufe0f  {sym} {direction.upper()} streak {n} "
-            f"\u2014 raising threshold {old_thresh:.2f}% \u2192 {new_thresh:.2f}% for 2h "
+            f"\u2014 raising threshold {old_thresh:.2f}% \u2192 {new_thresh:.2f}% for {int(_SIM_BOOST_DUR // 60)}m "
             f"(resumes {resume})"
         )
     elif n >= _SIM_STREAK_PAUSE:
@@ -2363,7 +2363,7 @@ def _sim_update_streak(sym: str, direction: str, won: bool) -> None:
         resume = datetime.fromtimestamp(pause_end, tz=timezone.utc).strftime("%H:%M UTC")
         _sim_log(
             f"\U0001f6d1 {sym} {direction.upper()} streak {n} "
-            f"\u2014 {action} entries for 4h (resumes {resume})"
+            f"\u2014 {action} entries for {int(_SIM_PAUSE_DUR // 60)}m (resumes {resume})"
         )
 
 
@@ -2424,11 +2424,18 @@ def _sim_select_instrument(signals: dict, regime: str):
         if direction_str and _sim_is_paused(_sim_combo_key(sym, direction_str)):
             exp = (_sim.get("pause_expiry") or {}).get(_sim_combo_key(sym, direction_str), 0.0)
             resume = datetime.fromtimestamp(exp, tz=timezone.utc).strftime("%H:%M UTC")
-            _sim_log(
-                f"\u23ed\ufe0f Skip {sym} {direction_str.upper()} "
-                f"-- paused until {resume}"
-            )
-            continue
+            if vol >= 2 * thresh:
+                _sim_log(
+                    f"\U0001f680 SIM: {sym} {direction_str.upper()} override "
+                    f"\u2014 signal {vol:.2f}% exceeds 2x threshold {thresh:.2f}% "
+                    f"\u2014 bypassing pause"
+                )
+            else:
+                _sim_log(
+                    f"\u23ed\ufe0f Skip {sym} {direction_str.upper()} "
+                    f"-- paused until {resume}"
+                )
+                continue
         if regime == "bull"  and dirn != "bull":
             continue
         if regime == "bear"  and dirn != "bear":
