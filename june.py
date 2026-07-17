@@ -2004,6 +2004,17 @@ _SIM_SIZING_CYCLE    = 2 * 3600
 _SIM_HIGH_VOL_THRESH = 0.50
 _SIM_LOW_VOL_THRESH  = 0.20
 
+# ── Dynamic threshold / streak parameters ────────────────────────────────────
+_SIM_THRESH_BASE     = 0.12   # minimum vol threshold (%)
+_SIM_THRESH_CAP      = 0.50   # maximum vol threshold (%)
+_SIM_THRESH_MULT     = 1.5    # std-dev multiplier for threshold calc
+_SIM_THRESH_MIN_HIST = 10     # min vol history samples before dynamic thresh
+_SIM_STREAK_BOOST    = 3      # loss streak count that raises threshold
+_SIM_STREAK_PAUSE    = 5      # loss streak count that pauses entries
+_SIM_BOOST_DUR       = 2 * 3600   # boost duration (2h)
+_SIM_PAUSE_DUR       = 4 * 3600   # pause duration (4h)
+_SIM_BALANCE_FLOOR   = 40.0   # auto-reset if balance drops below this
+
 # ── Stage definitions ─────────────────────────────────────────────────────────
 _SIM_STAGE_DEFS = {
     "sprout":      {"label": "SPROUT",      "min_trades": 10, "min_wr": 0.50, "min_pnl_pct": 0.00, "fail_after": 30},
@@ -2069,6 +2080,12 @@ def _sim_save_state() -> None:
         "short_wins":           _sim.get("short_wins", 0),
         "approach_stats":       _sim.get("approach_stats", {}),
         "vol_stats":            _sim.get("vol_stats", {}),
+        "reset_count":          _sim.get("reset_count", 0),
+        "vol_history":          _sim.get("vol_history", {}),
+        "streak_state":         _sim.get("streak_state", {}),
+        "boost_expiry":         _sim.get("boost_expiry", {}),
+        "pause_expiry":         _sim.get("pause_expiry", {}),
+        "last_entry_time":      _sim.get("last_entry_time", 0.0),
     }
     try:
         _redis().set("june_sim_state", json.dumps(payload), ex=72 * 3600)
@@ -2262,6 +2279,86 @@ def _sim_vol_bucket(vol: float) -> str:
     return "mid"
 
 
+# ── Dynamic threshold / streak helpers ───────────────────────────────────────
+def _sim_combo_key(sym: str, direction: str) -> str:
+    return f"{sym}_{direction}"
+
+
+def _sim_is_paused(combo: str) -> bool:
+    exp = (_sim.get("pause_expiry") or {}).get(combo, 0.0)
+    return time.time() < exp
+
+
+def _sim_has_boost(combo: str) -> bool:
+    exp = (_sim.get("boost_expiry") or {}).get(combo, 0.0)
+    return time.time() < exp
+
+
+def _sim_get_threshold(sym: str, direction: str = "") -> float:
+    hist = (_sim.get("vol_history") or {}).get(sym, [])
+    if len(hist) < _SIM_THRESH_MIN_HIST:
+        base_thresh = 0.15
+    else:
+        n = len(hist)
+        mean = sum(hist) / n
+        var = sum((x - mean) ** 2 for x in hist) / (n - 1) if n > 1 else 0.0
+        base_thresh = max(_SIM_THRESH_BASE, min(_SIM_THRESH_CAP, var ** 0.5 * _SIM_THRESH_MULT))
+    if direction:
+        combo = _sim_combo_key(sym, direction)
+        if _sim_has_boost(combo):
+            base_thresh = min(_SIM_THRESH_CAP, base_thresh * 1.5)
+    return round(base_thresh, 4)
+
+
+def _sim_update_vol_history(signals: dict) -> None:
+    if not _sim:
+        return
+    vol_hist = _sim.setdefault("vol_history", {})
+    for sym in _sim_eligible:
+        if sym not in signals:
+            continue
+        abs_chg = abs(signals[sym].get("change_5m", 0.0))
+        bucket = vol_hist.setdefault(sym, [])
+        bucket.append(abs_chg)
+        if len(bucket) > 20:
+            bucket.pop(0)
+
+
+def _sim_update_streak(sym: str, direction: str, won: bool) -> None:
+    combo        = _sim_combo_key(sym, direction)
+    streak_state = _sim.setdefault("streak_state", {})
+    boost_expiry = _sim.setdefault("boost_expiry", {})
+    pause_expiry = _sim.setdefault("pause_expiry", {})
+    if won:
+        streak_state[combo] = 0
+        boost_expiry[combo] = 0.0
+        pause_expiry[combo] = 0.0
+        return
+    streak_state[combo] = streak_state.get(combo, 0) + 1
+    n = streak_state[combo]
+    if n == _SIM_STREAK_BOOST:
+        old_thresh = _sim_get_threshold(sym)
+        new_thresh = min(_SIM_THRESH_CAP, old_thresh * 1.5)
+        boost_end  = time.time() + _SIM_BOOST_DUR
+        boost_expiry[combo] = boost_end
+        resume = datetime.fromtimestamp(boost_end, tz=timezone.utc).strftime("%H:%M UTC")
+        _sim_log(
+            f"\u26a0\ufe0f  {sym} {direction.upper()} streak {n} "
+            f"\u2014 raising threshold {old_thresh:.2f}% \u2192 {new_thresh:.2f}% for 2h "
+            f"(resumes {resume})"
+        )
+    elif n >= _SIM_STREAK_PAUSE:
+        pause_end = time.time() + _SIM_PAUSE_DUR
+        pause_expiry[combo] = pause_end
+        boost_expiry[combo] = 0.0
+        action = "pausing" if n == _SIM_STREAK_PAUSE else "extending pause"
+        resume = datetime.fromtimestamp(pause_end, tz=timezone.utc).strftime("%H:%M UTC")
+        _sim_log(
+            f"\U0001f6d1 {sym} {direction.upper()} streak {n} "
+            f"\u2014 {action} entries for 4h (resumes {resume})"
+        )
+
+
 # ── Instrument selection ──────────────────────────────────────────────────────
 def _sim_select_instrument(signals: dict, regime: str):
     best_sym, best_vol = None, 0.0
@@ -2271,7 +2368,17 @@ def _sim_select_instrument(signals: dict, regime: str):
         sig  = signals[sym]
         vol  = abs(sig.get("change_5m", 0.0))
         dirn = sig.get("direction", "neutral")
-        if vol < _SIM_ENTRY_VOL_MIN:
+        direction_str = "long" if dirn == "bull" else ("short" if dirn == "bear" else "")
+        thresh = _sim_get_threshold(sym, direction_str)
+        if vol < thresh:
+            continue
+        if direction_str and _sim_is_paused(_sim_combo_key(sym, direction_str)):
+            exp = (_sim.get("pause_expiry") or {}).get(_sim_combo_key(sym, direction_str), 0.0)
+            resume = datetime.fromtimestamp(exp, tz=timezone.utc).strftime("%H:%M UTC")
+            _sim_log(
+                f"\u23ed\ufe0f Skip {sym} {direction_str.upper()} "
+                f"-- paused until {resume}"
+            )
             continue
         if regime == "bull"  and dirn != "bull":
             continue
@@ -2374,6 +2481,7 @@ def _sim_close_position(prices: dict, exit_reason: str) -> None:
         f"total {_sim['total_wins']}W/{_sim['total_losses']}L"
     )
     _sim["open_position"] = None
+    _sim_update_streak(pos["instrument"], dirn, won)
     _sim_save_state()
 
 
@@ -2407,6 +2515,44 @@ def _sim_try_entry(signals: dict, regime: str, leverage: int, approach: str) -> 
                 f"({price_1m:.4f} -> {current_px:.4f}) (entry timing gate)"
             )
             return
+
+    # 15-minute trend confirmation gate
+    change_15m   = sig.get("change_15m", 0.0)
+    hist_sym     = _history.get(sym)
+    has_15m_hist = hist_sym is not None and len(hist_sym) >= 15
+    if has_15m_hist:
+        if direction == "long" and change_15m <= 0:
+            _sim_log(
+                f"\u23ed\ufe0f Skip {sym} -- bull signal but 15m negative "
+                f"({change_15m:+.3f}%) (multi-TF gate)"
+            )
+            return
+        if direction == "short" and change_15m >= 0:
+            _sim_log(
+                f"\u23ed\ufe0f Skip {sym} -- bear signal but 15m positive "
+                f"({change_15m:+.3f}%) (multi-TF gate)"
+            )
+            return
+    else:
+        count_h = len(hist_sym) if hist_sym else 0
+        _sim_log(
+            f"\u2139\ufe0f  {sym} 15m history insufficient ({count_h}/15 readings) "
+            f"-- using 5m+1m only"
+        )
+
+    # Dynamic threshold diagnostic (log when thresh meaningfully above base)
+    thresh_d = _sim_get_threshold(sym, direction)
+    if thresh_d > 0.16:
+        hist_d = (_sim.get("vol_history") or {}).get(sym, [])
+        if len(hist_d) >= _SIM_THRESH_MIN_HIST:
+            nd = len(hist_d)
+            meand = sum(hist_d) / nd
+            vard = sum((x - meand) ** 2 for x in hist_d) / (nd - 1) if nd > 1 else 0.0
+            _sim_log(
+                f"\U0001f4ca {sym} threshold: {thresh_d:.2f}% "
+                f"(vol_std={vard**0.5:.2f}%, \u00d7{_SIM_THRESH_MULT:.1f}) "
+                f"\u2014 above base {_SIM_THRESH_BASE:.2f}%"
+            )
 
     stage     = _sim.get("stage", "sprout")
 
@@ -2527,6 +2673,36 @@ def _sim_hourly_log() -> None:
         f"P{_sim.get('phase', 1)} | best approach: {best_app} | "
         f"long {lr} | short {sr} | best vol: {best_vol}"
     )
+
+    # Self-assessment: dynamic thresholds and streak state per instrument
+    sa_lines = []
+    vol_hist_sa   = _sim.get("vol_history", {})
+    streak_sa     = _sim.get("streak_state", {})
+    pause_exp_sa  = _sim.get("pause_expiry", {})
+    boost_exp_sa  = _sim.get("boost_expiry", {})
+    now_sa = time.time()
+    for sym_sa in sorted(_sim_eligible):
+        thresh_sa  = _sim_get_threshold(sym_sa)
+        samples_sa = len(vol_hist_sa.get(sym_sa, []))
+        parts = []
+        for dir_sa in ("long", "short"):
+            combo_sa = _sim_combo_key(sym_sa, dir_sa)
+            p_exp = pause_exp_sa.get(combo_sa, 0.0)
+            b_exp = boost_exp_sa.get(combo_sa, 0.0)
+            stk   = streak_sa.get(combo_sa, 0)
+            if now_sa < p_exp:
+                res = datetime.fromtimestamp(p_exp, tz=timezone.utc).strftime("%H:%M UTC")
+                parts.append(f"{dir_sa}:PAUSED(resume {res})")
+            elif now_sa < b_exp:
+                parts.append(f"{dir_sa}:boost(streak={stk})")
+            elif stk > 0:
+                parts.append(f"{dir_sa}:streak={stk}")
+        combo_str_sa = " | ".join(parts) if parts else "clean"
+        sa_lines.append(
+            f"  {sym_sa}: thresh={thresh_sa:.2f}% ({samples_sa}s) | {combo_str_sa}"
+        )
+    if sa_lines:
+        _sim_log("SELF-ASSESSMENT:\n" + "\n".join(sa_lines))
 
 
 # ── Simulation stop ───────────────────────────────────────────────────────────
@@ -2652,6 +2828,44 @@ def run_simulation_step(signals: dict) -> None:
         _sim_stop("24h duration", signals)
         return
 
+    # Balance floor auto-reset (runs through overnight)
+    if _sim["balance"] < _SIM_BALANCE_FLOOR:
+        pos_r = _sim.get("open_position")
+        if pos_r:
+            sym_r = pos_r.get("instrument", "")
+            if sym_r and sym_r in signals:
+                _sim_close_position(_sim_reconstruct_prices(sym_r, signals), "auto_reset")
+        reset_count_r = _sim.get("reset_count", 0) + 1
+        old_bal_r = _sim["balance"]
+        now_r = time.time()
+        print(
+            f"[{_ts()}] \U0001f504 SIM AUTO-RESET: Balance ${old_bal_r:.2f} fell below "
+            f"${_SIM_BALANCE_FLOOR:.0f} floor \u2014 resetting to "
+            f"${_SIM_START_BALANCE:.2f} Sprout Stage",
+            flush=True,
+        )
+        _sim.update({
+            "balance":              _SIM_START_BALANCE,
+            "stage":                "sprout",
+            "stage_entry_balance":  _SIM_START_BALANCE,
+            "stage_trades":         0,
+            "stage_wins":           0,
+            "stage_losses":         0,
+            "phase":                1,
+            "phase_start_time":     now_r,
+            "sizing_idx":           0,
+            "sizing_rotation_time": now_r,
+            "open_position":        None,
+            "reset_count":          reset_count_r,
+            "streak_state":         {},
+            "boost_expiry":         {},
+            "pause_expiry":         {},
+            "vol_history":          {},
+            "last_entry_time":      now_r,
+        })
+        _sim_save_state()
+        return
+
     # P&L boundary stops (runs through overnight)
     pnl = _sim["balance"] - _SIM_START_BALANCE
     if pnl >= _SIM_PROFIT_STOP:
@@ -2667,6 +2881,8 @@ def run_simulation_step(signals: dict) -> None:
     # Pause entries and exits while both sessions are closed
     if is_overnight():
         return
+
+    _sim_update_vol_history(signals)
 
     # Compute stage / leverage / approach for this cycle
     stage    = _sim.get("stage", "sprout")
@@ -2759,6 +2975,12 @@ def sim_startup() -> None:
             "vol_stats":            saved.get("vol_stats",
                                               {b: {"pnl": 0.0, "trades": 0, "wins": 0}
                                                for b in ("high", "mid", "low")}),
+            "reset_count":          saved.get("reset_count", 0),
+            "vol_history":          saved.get("vol_history", {}),
+            "streak_state":         saved.get("streak_state", {}),
+            "boost_expiry":         saved.get("boost_expiry", {}),
+            "pause_expiry":         saved.get("pause_expiry", {}),
+            "last_entry_time":      saved.get("last_entry_time", 0.0),
         })
 
         # Validate sim_start_time -- future timestamps mean state was reconstructed
@@ -2908,6 +3130,12 @@ def sim_startup() -> None:
         "short_wins":           0,
         "approach_stats":       {k: {"pnl": 0.0, "trades": 0, "wins": 0} for k in _SIM_SIZING_ORDER},
         "vol_stats":            {b: {"pnl": 0.0, "trades": 0, "wins": 0} for b in ("high", "mid", "low")},
+        "reset_count":          0,
+        "vol_history":          {},
+        "streak_state":         {},
+        "boost_expiry":         {},
+        "pause_expiry":         {},
+        "last_entry_time":      now,
     })
 
     print(f"[{_ts()}] \U0001f9ea SIM: Eligible instruments: {sorted(_sim_eligible)}", flush=True)
