@@ -2015,6 +2015,13 @@ _SIM_BOOST_DUR       = 2 * 3600   # boost duration (2h)
 _SIM_PAUSE_DUR       = 4 * 3600   # pause duration (4h)
 _SIM_BALANCE_FLOOR   = 40.0   # auto-reset if balance drops below this
 
+# ── Dynamic 15m reliability gate ───────────────────────────────────────────────
+_SIM_15M_MIN_SAMPLES = 5     # trades before reliability scoring activates; cold-start = relaxed
+_SIM_15M_LOOKBACK    = 20    # rolling history window per instrument+direction
+_SIM_15M_STRICT_MIN  = 0.20  # reliability score >= this -> STRICT mode (require 15m alignment)
+_SIM_15M_DEADZONE    = 0.05  # MODERATE mode: |change_15m| < deadzone treated as flat (passes)
+_SIM_1M_MIN_REVERSAL = 0.030 # 1m gate: min % price move to qualify as a real reversal
+
 # ── Stage definitions ─────────────────────────────────────────────────────────
 _SIM_STAGE_DEFS = {
     "sprout":      {"label": "SPROUT",      "min_trades": 10, "min_wr": 0.50, "min_pnl_pct": 0.00, "fail_after": 30},
@@ -2086,6 +2093,7 @@ def _sim_save_state() -> None:
         "boost_expiry":         _sim.get("boost_expiry", {}),
         "pause_expiry":         _sim.get("pause_expiry", {}),
         "last_entry_time":      _sim.get("last_entry_time", 0.0),
+        "15m_reliability":      _sim.get("15m_reliability", {}),
     }
     try:
         _redis().set("june_sim_state", json.dumps(payload), ex=72 * 3600)
@@ -2359,6 +2367,47 @@ def _sim_update_streak(sym: str, direction: str, won: bool) -> None:
         )
 
 
+def _sim_15m_record(sym, direction, change_15m, won):
+    """Record 15m signal vs outcome for per-instrument directional reliability scoring."""
+    rel      = _sim.setdefault("15m_reliability", {})
+    sym_data = rel.setdefault(sym, {})
+    dir_data = sym_data.setdefault(direction, {"history": []})
+    agreed   = (direction == "long" and change_15m > 0) or (direction == "short" and change_15m < 0)
+    dir_data["history"].append({"agreed": agreed, "won": won, "change_15m": round(change_15m, 4)})
+    if len(dir_data["history"]) > _SIM_15M_LOOKBACK:
+        dir_data["history"] = dir_data["history"][-_SIM_15M_LOOKBACK:]
+
+
+def _sim_15m_gate_mode(sym, direction):
+    """Returns (mode, score_or_None). Cold-start and low-reliability => relaxed.
+
+    strict   -- 15m must agree with 5m direction (reliability >= _SIM_15M_STRICT_MIN)
+    moderate -- 15m may be slightly opposing within deadzone
+    relaxed  -- no 15m requirement (cold-start or negative reliability)
+    """
+    dir_data = (_sim.get("15m_reliability") or {}).get(sym, {}).get(direction, {})
+    hist     = dir_data.get("history", [])
+    if len(hist) < _SIM_15M_MIN_SAMPLES:
+        return "relaxed", None
+    window = hist[-_SIM_15M_LOOKBACK:]
+    aw = al = dw = dl = 0
+    for rec in window:
+        if rec["agreed"]:
+            if rec["won"]: aw += 1
+            else:          al += 1
+        else:
+            if rec["won"]: dw += 1
+            else:          dl += 1
+    agreed_wr    = aw / (aw + al) if (aw + al) else 0.5
+    disagreed_wr = dw / (dw + dl) if (dw + dl) else 0.5
+    reliability  = round(agreed_wr - disagreed_wr, 3)
+    if reliability >= _SIM_15M_STRICT_MIN:
+        return "strict", reliability
+    if reliability >= 0.0:
+        return "moderate", reliability
+    return "relaxed", reliability
+
+
 # ── Instrument selection ──────────────────────────────────────────────────────
 def _sim_select_instrument(signals: dict, regime: str):
     best_sym, best_vol = None, 0.0
@@ -2482,6 +2531,7 @@ def _sim_close_position(prices: dict, exit_reason: str) -> None:
     )
     _sim["open_position"] = None
     _sim_update_streak(pos["instrument"], dirn, won)
+    _sim_15m_record(pos["instrument"], dirn, pos.get("entry_change_15m", 0.0), won)
     _sim_save_state()
 
 
@@ -2497,47 +2547,55 @@ def _sim_try_entry(signals: dict, regime: str, leverage: int, approach: str) -> 
     vol       = abs(chg)
     direction = "long" if chg > 0 else "short"
 
-    # 1-minute momentum confirmation gate
-    # Skip if the 5-minute signal is present but the 1-minute direction has
-    # already reversed -- avoids entering at the tail end of a move.
+    # 1m gate: only block if opposing move is >= _SIM_1M_MIN_REVERSAL%
+    # Noise-filtered -- tiny spread-level ticks no longer block entries.
     price_1m = _price_n_minutes_ago(sym, 1)
-    if price_1m is not None:
-        current_px = sig.get("price", 0.0)
-        if direction == "long" and current_px <= price_1m:
+    if price_1m is not None and price_1m > 0:
+        current_px   = sig.get("price", 0.0)
+        reversal_pct = abs(current_px - price_1m) / price_1m * 100.0
+        if direction == "long" and current_px < price_1m and reversal_pct >= _SIM_1M_MIN_REVERSAL:
             _sim_log(
-                f"⏭️ Skip {sym} -- 5m bull signal but 1m reversing "
-                f"({price_1m:.4f} -> {current_px:.4f}) (entry timing gate)"
+                f"\u23ed\ufe0f Skip {sym} -- 5m bull signal but 1m reversing "
+                f"({price_1m:.4f} -> {current_px:.4f}, -{reversal_pct:.3f}%) (entry timing gate)"
             )
             return
-        if direction == "short" and current_px >= price_1m:
+        if direction == "short" and current_px > price_1m and reversal_pct >= _SIM_1M_MIN_REVERSAL:
             _sim_log(
-                f"⏭️ Skip {sym} -- 5m bear signal but 1m reversing "
-                f"({price_1m:.4f} -> {current_px:.4f}) (entry timing gate)"
+                f"\u23ed\ufe0f Skip {sym} -- 5m bear signal but 1m reversing "
+                f"({price_1m:.4f} -> {current_px:.4f}, +{reversal_pct:.3f}%) (entry timing gate)"
             )
             return
 
-    # 15-minute trend confirmation gate
+    # 15-minute dynamic reliability gate
+    # Mode (strict/moderate/relaxed) self-calibrates per instrument+direction
+    # based on observed 15m predictive accuracy. Cold-start and low-reliability
+    # combos use relaxed mode so volume accumulates to build the scoring model.
     change_15m   = sig.get("change_15m", 0.0)
     hist_sym     = _history.get(sym)
     has_15m_hist = hist_sym is not None and len(hist_sym) >= 15
-    if has_15m_hist:
-        if direction == "long" and change_15m <= 0:
+    gate_mode, rel_score = _sim_15m_gate_mode(sym, direction)
+    rel_tag = f"rel={rel_score:.2f}" if rel_score is not None else "cold-start"
+
+    if has_15m_hist and gate_mode != "relaxed":
+        blocked = False
+        if gate_mode == "strict":
+            blocked = (direction == "long" and change_15m <= 0) or \
+                      (direction == "short" and change_15m >= 0)
+        else:  # moderate: only block meaningfully opposing 15m signal
+            blocked = (direction == "long" and change_15m <= -_SIM_15M_DEADZONE) or \
+                      (direction == "short" and change_15m >= _SIM_15M_DEADZONE)
+        if blocked:
+            oppose_desc = f"15m negative ({change_15m:+.3f}%)" if direction == "long" \
+                          else f"15m positive ({change_15m:+.3f}%)"
             _sim_log(
-                f"\u23ed\ufe0f Skip {sym} -- bull signal but 15m negative "
-                f"({change_15m:+.3f}%) (multi-TF gate)"
+                f"\u23ed\ufe0f Skip {sym} -- {oppose_desc} [{gate_mode}/{rel_tag}] (multi-TF gate)"
             )
             return
-        if direction == "short" and change_15m >= 0:
-            _sim_log(
-                f"\u23ed\ufe0f Skip {sym} -- bear signal but 15m positive "
-                f"({change_15m:+.3f}%) (multi-TF gate)"
-            )
-            return
-    else:
+    elif not has_15m_hist:
         count_h = len(hist_sym) if hist_sym else 0
         _sim_log(
             f"\u2139\ufe0f  {sym} 15m history insufficient ({count_h}/15 readings) "
-            f"-- using 5m+1m only"
+            f"-- using 5m+1m only [{gate_mode}/{rel_tag}]"
         )
 
     # Dynamic threshold diagnostic (log when thresh meaningfully above base)
@@ -2607,6 +2665,7 @@ def _sim_try_entry(signals: dict, regime: str, leverage: int, approach: str) -> 
         "size": pos_size, "leverage": leverage,
         "entry_time": time.time(), "entry_vol": vol,
         "vol_bucket": vbkt, "approach": approach, "regime": regime,
+        "entry_change_15m": change_15m,
     }
 
     action = "BUY" if direction == "long" else "SELL"
@@ -2674,7 +2733,7 @@ def _sim_hourly_log() -> None:
         f"long {lr} | short {sr} | best vol: {best_vol}"
     )
 
-    # Self-assessment: dynamic thresholds and streak state per instrument
+    # Self-assessment: thresholds, streak state, and 15m gate mode per instrument
     sa_lines = []
     vol_hist_sa   = _sim.get("vol_history", {})
     streak_sa     = _sim.get("streak_state", {})
@@ -2690,14 +2749,19 @@ def _sim_hourly_log() -> None:
             p_exp = pause_exp_sa.get(combo_sa, 0.0)
             b_exp = boost_exp_sa.get(combo_sa, 0.0)
             stk   = streak_sa.get(combo_sa, 0)
+            gmode_sa, grel_sa = _sim_15m_gate_mode(sym_sa, dir_sa)
+            grel_str = f"{grel_sa:.2f}" if grel_sa is not None else "cold"
+            gate_tag = f"15m:{gmode_sa}/{grel_str}"
             if now_sa < p_exp:
                 res = datetime.fromtimestamp(p_exp, tz=timezone.utc).strftime("%H:%M UTC")
-                parts.append(f"{dir_sa}:PAUSED(resume {res})")
+                parts.append(f"{dir_sa}:PAUSED(resume {res})[{gate_tag}]")
             elif now_sa < b_exp:
-                parts.append(f"{dir_sa}:boost(streak={stk})")
+                parts.append(f"{dir_sa}:boost(streak={stk})[{gate_tag}]")
             elif stk > 0:
-                parts.append(f"{dir_sa}:streak={stk}")
-        combo_str_sa = " | ".join(parts) if parts else "clean"
+                parts.append(f"{dir_sa}:streak={stk}[{gate_tag}]")
+            else:
+                parts.append(f"{dir_sa}:[{gate_tag}]")
+        combo_str_sa = " | ".join(parts)
         sa_lines.append(
             f"  {sym_sa}: thresh={thresh_sa:.2f}% ({samples_sa}s) | {combo_str_sa}"
         )
@@ -2862,6 +2926,7 @@ def run_simulation_step(signals: dict) -> None:
             "pause_expiry":         {},
             "vol_history":          {},
             "last_entry_time":      now_r,
+            "15m_reliability":      {},
         })
         _sim_save_state()
         return
@@ -2981,6 +3046,7 @@ def sim_startup() -> None:
             "boost_expiry":         saved.get("boost_expiry", {}),
             "pause_expiry":         saved.get("pause_expiry", {}),
             "last_entry_time":      saved.get("last_entry_time", 0.0),
+            "15m_reliability":      saved.get("15m_reliability", {}),
         })
 
         # Validate sim_start_time -- future timestamps mean state was reconstructed
@@ -3136,6 +3202,7 @@ def sim_startup() -> None:
         "boost_expiry":         {},
         "pause_expiry":         {},
         "last_entry_time":      now,
+        "15m_reliability":      {},
     })
 
     print(f"[{_ts()}] \U0001f9ea SIM: Eligible instruments: {sorted(_sim_eligible)}", flush=True)
