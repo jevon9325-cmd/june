@@ -1987,7 +1987,12 @@ _SIM_LOSS_STOP       = -30.0   # 60% loss from start
 # ── Entry / exit parameters ───────────────────────────────────────────────────
 _SIM_ENTRY_VOL_MIN   = 0.15    # |change_5m| >= 0.15% to consider entry
 _SIM_STOP_PCT        = 0.02    # 2% adverse -> stop loss
-_SIM_TP_PCT          = 0.03    # 3% favourable -> take profit
+_SIM_TP_PCT          = 0.03    # retained as fallback; see _SIM_TP_COLD_START
+_SIM_TP_FLOOR        = 0.005   # 0.50% minimum take-profit
+_SIM_TP_CAP          = 0.050   # 5.00% maximum take-profit
+_SIM_TP_COLD_START   = 0.015   # 1.50% cold-start default (<3 winning samples)
+_SIM_TP_WIN_WINDOW   = 10      # rolling win-move window per combo
+_SIM_TP_MIN_SAMPLES  = 3       # wins required before dynamic TP activates
 _SIM_MAX_HOLD_SECS   = 4 * 3600
 
 # ── Phase timing ──────────────────────────────────────────────────────────────
@@ -2047,6 +2052,7 @@ _SIM_APPROX_USDJPY   = 162.0
 _sim_eligible:     set  = set()
 _sim_min_notional: dict = {}
 _sim:              dict = {}    # empty = not started; truthy = running (used by poll_cycle)
+_sim_regime_three_way: list = []  # three-way confirmations, updated each poll cycle
 
 
 # ── Logging ───────────────────────────────────────────────────────────────────
@@ -2094,6 +2100,8 @@ def _sim_save_state() -> None:
         "pause_expiry":         _sim.get("pause_expiry", {}),
         "last_entry_time":      _sim.get("last_entry_time", 0.0),
         "15m_reliability":      _sim.get("15m_reliability", {}),
+        "win_moves":            _sim.get("win_moves", {}),
+        "loss_moves":           _sim.get("loss_moves", {}),
     }
     try:
         _redis().set("june_sim_state", json.dumps(payload), ex=72 * 3600)
@@ -2409,6 +2417,46 @@ def _sim_15m_gate_mode(sym, direction):
 
 
 # ── Instrument selection ──────────────────────────────────────────────────────
+def _sim_get_tp(sym: str, direction: str) -> float:
+    """Return dynamic take-profit fraction. Cold-starts at _SIM_TP_COLD_START
+    until _SIM_TP_MIN_SAMPLES winning moves are recorded for this combo."""
+    combo = f"{sym}_{direction}"
+    wins = (_sim.get("win_moves") or {}).get(combo, [])
+    if len(wins) < _SIM_TP_MIN_SAMPLES:
+        return _SIM_TP_COLD_START
+    avg_win = sum(wins) / len(wins)
+    tp = max(_SIM_TP_FLOOR, avg_win * 1.5)
+    return round(min(tp, _SIM_TP_CAP), 6)
+
+
+def _sim_regime_weight(sym: str, direction: str) -> float:
+    """Return signal-strength multiplier based on active macro three-way confirmations.
+    Returns 1.0 when no matching regime is active or instrument not specifically weighted."""
+    if not _sim_regime_three_way:
+        return 1.0
+    for conf in _sim_regime_three_way:
+        note = conf.get("note", "").lower()
+        dirn = conf.get("direction", "")
+        if dirn == "dollar_strength" or "dollar strength" in note:
+            if sym == "USDJPY":                                       return 1.25
+            if sym == "SILVER" and direction == "short":             return 1.20
+            if sym in ("EURUSD", "GBPUSD") and direction == "long": return 0.70
+        elif "commodity bull" in note:
+            if sym == "SILVER":                                       return 1.30
+            if sym in ("EURUSD", "GBPUSD"):                          return 0.85
+            if sym == "USDJPY":                                       return 0.80
+        elif "risk-on" in note:
+            if sym in ("EURUSD", "GBPUSD"):                          return 1.20
+            if sym == "USDJPY" and direction == "long":              return 1.15
+            if sym == "SILVER":                                       return 0.90
+        elif "safe-haven" in note:
+            if sym == "SILVER" and direction == "long":              return 1.25
+            if sym == "USDJPY" and direction == "long":              return 1.20
+            if sym in ("EURUSD", "GBPUSD") and direction == "long": return 0.75
+        return 1.0
+    return 1.0
+
+
 def _sim_select_instrument(signals: dict, regime: str):
     best_sym, best_vol = None, 0.0
     for sym in _sim_eligible:
@@ -2442,8 +2490,14 @@ def _sim_select_instrument(signals: dict, regime: str):
             continue
         if regime in ("volatile", "neutral") and dirn == "neutral":
             continue
-        if vol > best_vol:
-            best_vol = vol
+        weight        = _sim_regime_weight(sym, direction_str)
+        effective_vol = vol * weight
+        if weight != 1.0:
+            _rw_note = next((c.get("note", "")[:22] for c in _sim_regime_three_way), "?")
+            _sim_log(f"\U0001f30d {sym} {direction_str.upper()} weight x{weight:.2f}"
+                     f" ({_rw_note}...) effective {effective_vol:.3f}%")
+        if effective_vol > best_vol:
+            best_vol = effective_vol
             best_sym = sym
     return best_sym
 
@@ -2485,6 +2539,21 @@ def _sim_close_position(prices: dict, exit_reason: str) -> None:
 
     dollar_pnl = size * lev * pnl_pct
     won        = dollar_pnl > 0
+
+    # Dynamic TP calibration: record absolute move size per combo
+    _dtp_combo = pos["instrument"] + "_" + dirn
+    if won:
+        _wm = _sim.setdefault("win_moves", {})
+        _wb = _wm.setdefault(_dtp_combo, [])
+        _wb.append(round(abs(pnl_pct), 6))
+        if len(_wb) > _SIM_TP_WIN_WINDOW:
+            _wm[_dtp_combo] = _wb[-_SIM_TP_WIN_WINDOW:]
+    else:
+        _lm = _sim.setdefault("loss_moves", {})
+        _lb = _lm.setdefault(_dtp_combo, [])
+        _lb.append(round(abs(pnl_pct), 6))
+        if len(_lb) > _SIM_TP_WIN_WINDOW:
+            _lm[_dtp_combo] = _lb[-_SIM_TP_WIN_WINDOW:]
 
     _sim["balance"]       += dollar_pnl
     _sim["stage_trades"]  += 1
@@ -2662,7 +2731,13 @@ def _sim_try_entry(signals: dict, regime: str, leverage: int, approach: str) -> 
         return
 
     stop_px = fill * (1 - _SIM_STOP_PCT) if direction == "long" else fill * (1 + _SIM_STOP_PCT)
-    tp_px   = fill * (1 + _SIM_TP_PCT)   if direction == "long" else fill * (1 - _SIM_TP_PCT)
+    tp_pct  = _sim_get_tp(sym, direction)
+    tp_px   = fill * (1 + tp_pct)         if direction == "long" else fill * (1 - tp_pct)
+    if abs(tp_pct - _SIM_TP_COLD_START) > 0.0005:
+        _tp_wins = (_sim.get("win_moves") or {}).get(sym + "_" + direction, [])
+        _tp_avg  = sum(_tp_wins) / len(_tp_wins)
+        _sim_log(f"\U0001f4c8 {sym} {direction.upper()} dynamic TP {tp_pct*100:.2f}%"
+                 f" (avg win {_tp_avg*100:.2f}% x1.5, {len(_tp_wins)} samples)")
     vbkt    = _sim_vol_bucket(vol)
     notl    = round(pos_size * leverage, 2)
 
@@ -2672,7 +2747,7 @@ def _sim_try_entry(signals: dict, regime: str, leverage: int, approach: str) -> 
         "size": pos_size, "leverage": leverage,
         "entry_time": time.time(), "entry_vol": vol,
         "vol_bucket": vbkt, "approach": approach, "regime": regime,
-        "entry_change_15m": change_15m,
+        "entry_change_15m": change_15m, "tp_pct": tp_pct,
     }
 
     action = "BUY" if direction == "long" else "SELL"
@@ -2699,7 +2774,7 @@ def _sim_check_exit(signals: dict, regime: str) -> None:
 
     if pnl_pct <= -_SIM_STOP_PCT:
         _sim_close_position(prices, "stop_loss"); return
-    if pnl_pct >= _SIM_TP_PCT:
+    if pnl_pct >= pos.get("tp_pct", _SIM_TP_COLD_START):
         _sim_close_position(prices, "take_profit"); return
     if hold_sec >= _SIM_MAX_HOLD_SECS:
         _sim_close_position(prices, "max_hold"); return
@@ -2962,13 +3037,17 @@ def run_simulation_step(signals: dict) -> None:
     approach = (_SIM_SIZING_ORDER[_sim.get("sizing_idx", 0)]
                 if stage == "sprout" else _SIM_STAGE_APPROACH.get(stage, "pct_5"))
 
-    # Read macro regime
+    # Read macro regime (full payload for regime-weighted selection)
+    global _sim_regime_three_way
     regime = "neutral"
     try:
         raw = _redis().get("june_macro_regime")
         if raw:
-            regime = json.loads(raw).get("regime", "neutral")
+            _mpayload             = json.loads(raw)
+            regime                = _mpayload.get("regime", "neutral")
+            _sim_regime_three_way = _mpayload.get("three_way_confirmations", [])
     except Exception:
+        _sim_regime_three_way = []
         pass
 
     # Handle open position -- exit check first
@@ -3054,6 +3133,8 @@ def sim_startup() -> None:
             "pause_expiry":         saved.get("pause_expiry", {}),
             "last_entry_time":      saved.get("last_entry_time", 0.0),
             "15m_reliability":      saved.get("15m_reliability", {}),
+            "win_moves":            saved.get("win_moves", {}),
+            "loss_moves":           saved.get("loss_moves", {}),
         })
 
         # Validate sim_start_time -- future timestamps mean state was reconstructed
@@ -3210,6 +3291,8 @@ def sim_startup() -> None:
         "pause_expiry":         {},
         "last_entry_time":      now,
         "15m_reliability":      {},
+        "win_moves":            {},
+        "loss_moves":           {},
     })
 
     print(f"[{_ts()}] \U0001f9ea SIM: Eligible instruments: {sorted(_sim_eligible)}", flush=True)
