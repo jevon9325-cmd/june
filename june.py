@@ -39,7 +39,7 @@ import os
 import sys
 import time
 from collections import deque
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Optional
 
 import requests
@@ -56,7 +56,8 @@ IG_ACCOUNT = os.environ.get("IG_ACCOUNT_ID", "Z6CPCQ")
 IG_LIVE_BASE = os.environ.get("IG_LIVE_BASE_URL", "")
 IG_LIVE_KEY  = os.environ.get("IG_LIVE_API_KEY", "")
 IG_LIVE_USER = os.environ.get("IG_LIVE_USERNAME", "")
-IG_LIVE_PASS = os.environ.get("IG_LIVE_PASSWORD", "")
+IG_LIVE_PASS     = os.environ.get("IG_LIVE_PASSWORD", "")
+MARKETAUX_API_KEY = os.environ.get("MARKETAUX_API_KEY", "")
 
 REDIS_HOST  = os.environ.get("REDIS_HOST", "")
 REDIS_PORT  = int(os.environ.get("REDIS_PORT", 15074))
@@ -298,6 +299,10 @@ _flags: dict = {
 
 # Maintenance backoff state
 _maint: dict = {"consec": 0, "since": 0.0}
+
+# Overnight news cache — populated by fetch_overnight_news() once per hour during 21:00-07:00 UTC
+_overnight_news_cache:      dict  = {}   # {instrument.lower(): {sentiment, headline}} + optional notable_risk
+_last_overnight_news_fetch: float = 0.0  # epoch of last successful fetch
 
 # ── Direct CFD discovery state ────────────────────────────────────────────────
 _direct_cfd_map: dict      = {}    # {t212_base: epic}  e.g. {"NVDA": "UC.D.NVDA.CASH.IP"}
@@ -734,6 +739,107 @@ def _publish_morning_baseline():
 
 
 # ── Overnight context publish ─────────────────────────────────────────────────
+# ── Overnight news intelligence ───────────────────────────────────────────────
+# Marketaux equity proxies for June's macro instruments.
+# Forex pairs queried directly; commodities/indices via ETF proxies.
+_JUNE_TO_MARKETAUX: dict = {
+    "GOLD":   "GLD",     "SILVER": "SLV",    "OIL":    "USO",
+    "EURUSD": "EURUSD",  "GBPUSD": "GBPUSD", "USDJPY": "USDJPY",
+    "SPX500": "SPY",     "UK100":  "EWU",    "GER40":  "EWG",
+}
+_MARKETAUX_TO_JUNE: dict = {v: k for k, v in _JUNE_TO_MARKETAUX.items()}
+
+_KEY_EARNINGS_SYMS = {
+    "NVDA","AAPL","MSFT","AMD","AMZN","GOOGL","META","TSLA",
+    "XOM","CVX","BA","LMT","RTX","NEM","GDX","XLF","AMGN",
+}
+
+
+def fetch_overnight_news() -> dict:
+    """
+    Fetch overnight news from Marketaux for June's macro instruments.
+    Returns {instrument.lower(): {sentiment, headline}} + optional notable_risk.
+    Respects shared marketaux_daily_calls Redis counter (also incremented by Claudia).
+    """
+    if not MARKETAUX_API_KEY:
+        return {}
+    try:
+        r = _redis()
+        _mx_count = int(r.get("marketaux_daily_calls") or 0)
+        if _mx_count >= 90:
+            print(f"[{_ts()}] ⚠️ Marketaux daily limit ({_mx_count}/90) — skipping overnight news", flush=True)
+            return {}
+
+        _now_utc = datetime.now(timezone.utc)
+        _tmr_utc = (_now_utc + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+        _ttl     = max(60, int((_tmr_utc - _now_utc).total_seconds()))
+        _since   = (_now_utc - timedelta(hours=4)).strftime("%Y-%m-%dT%H:%M")
+
+        resp = requests.get(
+            "https://api.marketaux.com/v1/news/all",
+            params={"symbols": ",".join(_JUNE_TO_MARKETAUX.values()), "filter_entities": "true",
+                    "language": "en", "published_after": _since, "limit": 10,
+                    "api_token": MARKETAUX_API_KEY},
+            timeout=12,
+        )
+        if resp.status_code != 200:
+            print(f"[{_ts()}] ⚠️ Marketaux overnight: HTTP {resp.status_code}", flush=True)
+            return {}
+
+        _new_count = r.incr("marketaux_daily_calls")
+        r.expire("marketaux_daily_calls", _ttl)
+        print(f"[{_ts()}] 📰 Marketaux overnight news: {_new_count}/90 daily calls used", flush=True)
+
+        news_by_instrument: dict = {}
+        for article in resp.json().get("data", []):
+            title = article.get("title", "")
+            for entity in article.get("entities", []):
+                sym   = entity.get("symbol", "")
+                score = entity.get("sentiment_score")
+                if sym not in _MARKETAUX_TO_JUNE or score is None or abs(score) < 0.4:
+                    continue
+                june_instr = _MARKETAUX_TO_JUNE[sym].lower()
+                if june_instr not in news_by_instrument or abs(score) > abs(news_by_instrument[june_instr]["sentiment"]):
+                    news_by_instrument[june_instr] = {"sentiment": round(score, 3), "headline": title[:120]}
+
+        # Add earnings risk from Redis cache (written by Claudia's morning Finnhub call)
+        try:
+            _er = r.get("finnhub_earnings")
+            if _er:
+                _e_list = json.loads(_er)
+                _today  = _now_utc.strftime("%Y-%m-%d")
+                _tmr_s  = (_now_utc + timedelta(days=1)).strftime("%Y-%m-%d")
+                _risky  = [e["symbol"] for e in _e_list
+                           if e.get("symbol") in _KEY_EARNINGS_SYMS and e.get("date") in (_today, _tmr_s)]
+                if _risky:
+                    news_by_instrument["notable_risk"] = (
+                        f"Earnings: {', '.join(_risky[:3])} report today/tomorrow — monitor sector exposure"
+                    )
+        except Exception:
+            pass
+
+        if news_by_instrument:
+            print(f"[{_ts()}] 📰 Overnight news: {len(news_by_instrument)} instrument signals", flush=True)
+        return news_by_instrument
+
+    except Exception as exc:
+        print(f"[{_ts()}] ⚠️ fetch_overnight_news failed: {exc}", flush=True)
+        return {}
+
+
+def maybe_fetch_overnight_news():
+    """Once per hour during overnight (21:00-07:00 UTC), refresh Marketaux news cache."""
+    global _last_overnight_news_fetch, _overnight_news_cache
+    if not is_overnight():
+        return
+    if time.time() - _last_overnight_news_fetch < 3600:
+        return
+    news = fetch_overnight_news()
+    if news:
+        _overnight_news_cache = news
+    _last_overnight_news_fetch = time.time()
+
+
 def _publish_overnight_context():
     """Publish june_overnight_context: volatility regime and correlation notes."""
     overnight_moves = {}
@@ -758,6 +864,7 @@ def _publish_overnight_context():
         "volatile_instruments":     volatile_syms,
         "overnight_moves":          overnight_moves,
         "correlation_note":         corr_note,
+        "news_summary":             _overnight_news_cache,
     }
     try:
         r = _redis()
@@ -3378,6 +3485,7 @@ def main():
 
             # Overnight / morning orchestration (no-ops outside their time windows)
             maybe_capture_ny_close()
+            maybe_fetch_overnight_news()
             maybe_capture_premarket_baseline()
             maybe_publish_morning()
 
