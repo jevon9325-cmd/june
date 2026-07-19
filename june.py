@@ -2088,7 +2088,7 @@ def poll_cycle() -> bool:
 
 # ── Global stops ──────────────────────────────────────────────────────────────
 _SIM_START_BALANCE   = 50.0
-_SIM_RESET_AFTER     = 1752796800.0  # 2026-07-18 00:00 UTC — one-time reset for new session
+_SIM_RESET_AFTER     = 1784332875.0  # 2026-07-18 00:00 UTC — one-time reset for new session
 _SIM_PROFIT_STOP     = 100.0    # doubled from start
 _SIM_LOSS_STOP       = -30.0   # 60% loss from start
 
