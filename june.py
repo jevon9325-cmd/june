@@ -2088,6 +2088,7 @@ def poll_cycle() -> bool:
 
 # ── Global stops ──────────────────────────────────────────────────────────────
 _SIM_START_BALANCE   = 50.0
+_SIM_RESET_AFTER     = 1752796800.0  # 2026-07-18 00:00 UTC — one-time reset for new session
 _SIM_PROFIT_STOP     = 100.0    # doubled from start
 _SIM_LOSS_STOP       = -30.0   # 60% loss from start
 
@@ -2115,6 +2116,7 @@ _SIM_SIZING_CYCLE    = 2 * 3600
 # ── Volatility buckets ────────────────────────────────────────────────────────
 _SIM_HIGH_VOL_THRESH = 0.50
 _SIM_LOW_VOL_THRESH  = 0.20
+_SIM_DEAD_VOL_THRESH = 0.10   # dead tier: market too illiquid to trade
 
 # ── Dynamic threshold / streak parameters ────────────────────────────────────
 _SIM_THRESH_BASE     = 0.12   # minimum vol threshold (%)
@@ -2397,9 +2399,10 @@ def _sim_check_min_feasible(sym: str, pos_size: float, leverage: int) -> bool:
 
 
 def _sim_vol_bucket(vol: float) -> str:
-    if vol > _SIM_HIGH_VOL_THRESH: return "high"
-    if vol < _SIM_LOW_VOL_THRESH:  return "low"
-    return "mid"
+    if vol > _SIM_HIGH_VOL_THRESH:  return "high"
+    if vol >= _SIM_LOW_VOL_THRESH:  return "mid"
+    if vol >= _SIM_DEAD_VOL_THRESH: return "low"
+    return "dead"
 
 
 # ── Dynamic threshold / streak helpers ───────────────────────────────────────
@@ -2417,15 +2420,16 @@ def _sim_has_boost(combo: str) -> bool:
     return time.time() < exp
 
 
-def _sim_get_threshold(sym: str, direction: str = "") -> float:
+def _sim_get_threshold(sym: str, direction: str = "", low_tier: bool = False) -> float:
     hist = (_sim.get("vol_history") or {}).get(sym, [])
+    mult = 2.0 if low_tier else _SIM_THRESH_MULT
     if len(hist) < _SIM_THRESH_MIN_HIST:
         base_thresh = 0.15
     else:
         n = len(hist)
         mean = sum(hist) / n
         var = sum((x - mean) ** 2 for x in hist) / (n - 1) if n > 1 else 0.0
-        base_thresh = max(_SIM_THRESH_BASE, min(_SIM_THRESH_CAP, var ** 0.5 * _SIM_THRESH_MULT))
+        base_thresh = max(_SIM_THRESH_BASE, min(_SIM_THRESH_CAP, var ** 0.5 * mult))
     if direction:
         combo = _sim_combo_key(sym, direction)
         if _sim_has_boost(combo):
@@ -2573,8 +2577,13 @@ def _sim_select_instrument(signals: dict, regime: str):
         vol  = abs(sig.get("change_5m", 0.0))
         dirn = sig.get("direction", "neutral")
         direction_str = "long" if dirn == "bull" else ("short" if dirn == "bear" else "")
-        thresh = _sim_get_threshold(sym, direction_str)
+        vbkt   = _sim_vol_bucket(vol)
+        thresh = _sim_get_threshold(sym, direction_str, low_tier=(vbkt == "low"))
         if vol < thresh:
+            continue
+        # Dead-vol block — fires before exceptional pause override
+        if vbkt == "dead":
+            _sim_log(f"⛔ SIM: {sym} dead vol ({vol:.4f}%) — market too quiet")
             continue
         if direction_str and _sim_is_paused(_sim_combo_key(sym, direction_str)):
             exp = (_sim.get("pause_expiry") or {}).get(_sim_combo_key(sym, direction_str), 0.0)
@@ -3200,6 +3209,59 @@ def sim_startup() -> None:
         _sim_min_notional = saved.get("min_notionals", {})
 
         now = time.time()
+
+        # One-time fresh reset: wipe state if saved before _SIM_RESET_AFTER, preserve vol/move data
+        if saved.get("sim_start_time", 0) < _SIM_RESET_AFTER:
+            print(
+                f"[{_ts()}] 🔄 SIM FRESH START: resetting for new session "
+                f"(saved state predates {datetime.fromtimestamp(_SIM_RESET_AFTER, tz=timezone.utc).strftime('%Y-%m-%d')} cutoff) "
+                f"— preserving vol_history, win_moves, loss_moves",
+                flush=True,
+            )
+            _sim.update({
+                "active":               True,
+                "balance":              _SIM_START_BALANCE,
+                "stage":                "sprout",
+                "stage_entry_balance":  _SIM_START_BALANCE,
+                "stage_trades":         0,
+                "stage_wins":           0,
+                "stage_losses":         0,
+                "total_wins":           0,
+                "total_losses":         0,
+                "phase":                1,
+                "phase_start_time":     now,
+                "sim_start_time":       now,
+                "sizing_idx":           0,
+                "sizing_rotation_time": now,
+                "open_position":        None,
+                "trade_history":        [],
+                "stage_history":        [],
+                "hourly_next":          now + 3600,
+                "stopped":              False,
+                "stop_reason":          "",
+                "long_pnl":             0.0,
+                "long_trades":          0,
+                "long_wins":            0,
+                "short_pnl":            0.0,
+                "short_trades":         0,
+                "short_wins":           0,
+                "approach_stats":       {k: {"pnl": 0.0, "trades": 0, "wins": 0}
+                                         for k in _SIM_SIZING_ORDER},
+                "vol_stats":            {b: {"pnl": 0.0, "trades": 0, "wins": 0}
+                                         for b in ("high", "mid", "low", "dead")},
+                "reset_count":          0,
+                "streak_state":         {},
+                "boost_expiry":         {},
+                "pause_expiry":         {},
+                "last_entry_time":      now,
+                "15m_reliability":      {},
+                "vol_history":          saved.get("vol_history", {}),
+                "win_moves":            saved.get("win_moves", {}),
+                "loss_moves":           saved.get("loss_moves", {}),
+            })
+            _sim_save_state()
+            return
+
         _sim.update({
             "active":               True,
             "balance":              saved["balance"],
