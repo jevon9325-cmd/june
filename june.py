@@ -63,6 +63,13 @@ REDIS_HOST  = os.environ.get("REDIS_HOST", "")
 REDIS_PORT  = int(os.environ.get("REDIS_PORT", 15074))
 REDIS_PASS  = os.environ.get("REDIS_PASSWORD", "")
 
+# ── LLM providers (future AI P&L monitor) ─────────────────────────────────
+OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
+GEMINI_API_KEY     = os.environ.get("GEMINI_API_KEY", "")
+OPENROUTER_DAILY_CAP = 180   # shared with Miss Secretary and Claudia via Redis
+GEMINI_DAILY_CAP     = 950   # Gemini Flash free tier
+
+
 # ── Poll timing ──────────────────────────────────────────────────────────────
 POLL_ACTIVE = int(os.environ.get("JUNE_POLL_ACTIVE", 60))  # weekday normal cadence
 POLL_MAINT  = 5 * 60    # 5-min cadence during detected maintenance window
@@ -326,6 +333,66 @@ def _redis() -> redis_lib.Redis:
         socket_connect_timeout=5,
         socket_timeout=5,
     )
+
+
+# ── LLM helper (foundation for AI P&L monitor — not yet wired) ──────────────
+def _call_llm(provider: str, prompt: str, max_tokens: int = 200) -> str:
+    """Generic LLM caller. Raises on failure. Not wired into any active path yet.
+    Providers: openrouter | anthropic | groq | gemini
+    """
+    if provider == "openrouter":
+        if not OPENROUTER_API_KEY:
+            raise RuntimeError("OPENROUTER_API_KEY not set")
+        r = requests.post(
+            "https://openrouter.ai/api/v1/chat/completions",
+            headers={"Authorization": f"Bearer {OPENROUTER_API_KEY}", "Content-Type": "application/json"},
+            json={"model": "openrouter/free", "messages": [{"role": "user", "content": prompt}], "max_tokens": max_tokens},
+            timeout=12,
+        )
+        r.raise_for_status()
+        return r.json()["choices"][0]["message"]["content"]
+
+    elif provider == "anthropic":
+        api_key = os.environ.get("ANTHROPIC_API_KEY", "")
+        if not api_key:
+            raise RuntimeError("ANTHROPIC_API_KEY not set")
+        r = requests.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={"x-api-key": api_key, "anthropic-version": "2023-06-01", "Content-Type": "application/json"},
+            json={"model": "claude-haiku-4-5-20251001", "max_tokens": max_tokens, "messages": [{"role": "user", "content": prompt}]},
+            timeout=10,
+        )
+        r.raise_for_status()
+        blocks = [b["text"] for b in r.json()["content"] if b.get("type") == "text"]
+        return " ".join(blocks)
+
+    elif provider == "groq":
+        groq_key = os.environ.get("GROQ_API_KEY", "")
+        if not groq_key:
+            raise RuntimeError("GROQ_API_KEY not set")
+        r = requests.post(
+            "https://api.groq.com/openai/v1/chat/completions",
+            headers={"Authorization": f"Bearer {groq_key}", "Content-Type": "application/json"},
+            json={"model": "openai/gpt-oss-120b", "messages": [{"role": "user", "content": prompt}], "max_tokens": max_tokens, "temperature": 0},
+            timeout=8,
+        )
+        r.raise_for_status()
+        return r.json()["choices"][0]["message"]["content"]
+
+    elif provider == "gemini":
+        if not GEMINI_API_KEY:
+            raise RuntimeError("GEMINI_API_KEY not set")
+        r = requests.post(
+            f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={GEMINI_API_KEY}",
+            headers={"Content-Type": "application/json"},
+            json={"contents": [{"parts": [{"text": prompt}]}]},
+            timeout=8,
+        )
+        r.raise_for_status()
+        return r.json()["candidates"][0]["content"]["parts"][0]["text"]
+
+    else:
+        raise ValueError(f"Unknown LLM provider: {provider!r}")
 
 
 # ── IG session management ────────────────────────────────────────────────────
