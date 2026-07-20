@@ -3170,8 +3170,14 @@ def _sim_stop(reason: str, signals=None) -> None:
     try:
         r = _redis()
         r.set("june_sim_results", json.dumps(result_payload), ex=48 * 3600)
+        _cal = {
+            "vol_history": _sim.get("vol_history", {}),
+            "win_moves":   _sim.get("win_moves", {}),
+            "loss_moves":  _sim.get("loss_moves", {}),
+        }
+        r.set("june_sim_calibration", json.dumps(_cal), ex=7 * 24 * 3600)
         r.delete("june_sim_state")
-        _sim_log("Results published -> Redis june_sim_results (TTL 48h)")
+        _sim_log("Results published -> Redis june_sim_results | calibration preserved (7d TTL)")
     except Exception as exc:
         _sim_log(f"Redis results write failed: {exc}")
 
@@ -3590,6 +3596,23 @@ def sim_startup() -> None:
         "win_moves":            {},
         "loss_moves":           {},
     })
+
+    # Restore calibration data from previous session if available
+    try:
+        _cal_raw = _redis().get("june_sim_calibration")
+        if _cal_raw:
+            _cal = json.loads(_cal_raw)
+            _sim["vol_history"] = _cal.get("vol_history", {})
+            _sim["win_moves"]   = _cal.get("win_moves", {})
+            _sim["loss_moves"]  = _cal.get("loss_moves", {})
+            print(
+                f"[{_ts()}] \U0001f9ea SIM: Restored calibration — "
+                f"vol_history={list(_cal.get('vol_history', {}).keys())} "
+                f"win_combos={list(_cal.get('win_moves', {}).keys())}",
+                flush=True,
+            )
+    except Exception:
+        pass
 
     print(f"[{_ts()}] \U0001f9ea SIM: Eligible instruments: {sorted(_sim_eligible)}", flush=True)
     print(
