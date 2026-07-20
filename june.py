@@ -2161,14 +2161,25 @@ _SIM_LOSS_STOP       = -30.0   # 60% loss from start
 
 # ── Entry / exit parameters ───────────────────────────────────────────────────
 _SIM_ENTRY_VOL_MIN   = 0.15    # |change_5m| >= 0.15% to consider entry
-_SIM_STOP_PCT        = 0.02    # 2% adverse -> stop loss
-_SIM_TP_PCT          = 0.03    # retained as fallback; see _SIM_TP_COLD_START
-_SIM_TP_FLOOR        = 0.005   # 0.50% minimum take-profit
-_SIM_TP_CAP          = 0.050   # 5.00% maximum take-profit
-_SIM_TP_COLD_START   = 0.015   # 1.50% cold-start default (<3 winning samples)
-_SIM_TP_WIN_WINDOW   = 10      # rolling win-move window per combo
-_SIM_TP_MIN_SAMPLES  = 3       # wins required before dynamic TP activates
 _SIM_MAX_HOLD_SECS   = 4 * 3600
+_SIM_TP_WIN_WINDOW   = 10      # rolling win-move window per combo
+_SIM_TP_MIN_SAMPLES  = 3       # wins before full-confidence TP fraction applies
+
+# Dynamic TP (all fractions — same units as pnl_pct; vol_history is in %, divided /100)
+_SIM_TP_WIN_FRACTION = 0.70    # TP from win history: 70% of avg winning move
+_SIM_TP_VOL_FRACTION = 0.30    # TP from vol_history: 30% of vol_mean (converted /100)
+_SIM_TP_FLOOR        = 0.0002  # 0.02% absolute floor (~2 pips GBPUSD, $0.011 Silver)
+_SIM_TP_CAP          = 0.010   # 1.00% max TP per trade
+
+# Dynamic stop (fractions; vol_history in % — divided /100 inside function)
+_SIM_STOP_VOL_MULT   = 2.0     # stop = vol_mean + MULT * vol_std
+_SIM_STOP_FLOOR      = 0.0008  # 0.08% floor (covers spread+noise for all instruments)
+_SIM_STOP_CAP        = 0.005   # 0.50% max stop (at 10x = 5% leveraged)
+_SIM_STOP_COLD       = 0.0020  # 0.20% cold-start when no vol_history available
+
+# Asymmetric reversal: losing positions exit faster than winning ones
+_SIM_REV_PATIENCE_WIN  = 2     # consecutive opposing cycles before cutting a winner
+_SIM_REV_PATIENCE_LOSS = 1     # exit loser on first opposing cycle
 
 # ── Phase timing ──────────────────────────────────────────────────────────────
 _SIM_CONSERVATIVE_LEV    = 3
@@ -2595,15 +2606,51 @@ def _sim_15m_gate_mode(sym, direction):
 
 # ── Instrument selection ──────────────────────────────────────────────────────
 def _sim_get_tp(sym: str, direction: str) -> float:
-    """Return dynamic take-profit fraction. Cold-starts at _SIM_TP_COLD_START
-    until _SIM_TP_MIN_SAMPLES winning moves are recorded for this combo."""
-    combo = f"{sym}_{direction}"
-    wins = (_sim.get("win_moves") or {}).get(combo, [])
-    if len(wins) < _SIM_TP_MIN_SAMPLES:
-        return _SIM_TP_COLD_START
-    avg_win = sum(wins) / len(wins)
-    tp = max(_SIM_TP_FLOOR, avg_win * 1.5)
-    return round(min(tp, _SIM_TP_CAP), 6)
+    """Dynamic TP from actual instrument move history — no global cold-start constant.
+    Vol_history values are in percent; win/loss_moves are fractions (pnl_pct scale).
+    Takes the minimum across all available estimates to stay within achievable range."""
+    combo  = f"{sym}_{direction}"
+    wins   = (_sim.get("win_moves")  or {}).get(combo, [])
+    losses = (_sim.get("loss_moves") or {}).get(combo, [])
+    hist   = (_sim.get("vol_history") or {}).get(sym, [])
+
+    estimates = []
+
+    # Primary: winning trade history — 70% of avg win (80% when <3 samples)
+    if wins:
+        fraction = _SIM_TP_WIN_FRACTION if len(wins) >= _SIM_TP_MIN_SAMPLES else 0.80
+        estimates.append((sum(wins) / len(wins)) * fraction)
+
+    # Secondary: 25% of avg losing move — achievable target within the adverse range
+    if len(losses) >= 3:
+        estimates.append((sum(losses) / len(losses)) * 0.25)
+
+    # Tertiary: 30% of vol_mean (vol_history in % — divide /100 to get fraction)
+    if len(hist) >= 5:
+        estimates.append((sum(hist) / len(hist)) / 100.0 * _SIM_TP_VOL_FRACTION)
+
+    if estimates:
+        return round(max(_SIM_TP_FLOOR, min(_SIM_TP_CAP, min(estimates))), 6)
+
+    # True cold-start (zero history): instrument-type micro-defaults
+    if "JPY" in sym:
+        return 0.0003
+    if sym in ("GBPUSD", "EURUSD"):
+        return 0.0002
+    return 0.0004   # SILVER and other commodities
+
+
+def _sim_get_dynamic_stop(sym: str) -> float:
+    """Vol-based stop-loss per instrument. Returns fraction (0.002 = 0.2%).
+    Vol_history values are in percent — divided /100 to convert to fraction."""
+    hist = (_sim.get("vol_history") or {}).get(sym, [])
+    if len(hist) < 5:
+        return _SIM_STOP_COLD
+    n      = len(hist)
+    mean_p = sum(hist) / n
+    var_p  = sum((x - mean_p) ** 2 for x in hist) / (n - 1) if n > 1 else 0.0
+    stop_p = mean_p + _SIM_STOP_VOL_MULT * (var_p ** 0.5)   # still in percent
+    return round(max(_SIM_STOP_FLOOR, min(_SIM_STOP_CAP, stop_p / 100.0)), 6)
 
 
 def _sim_regime_weight(sym: str, direction: str) -> float:
@@ -2908,14 +2955,15 @@ def _sim_try_entry(signals: dict, regime: str, leverage: int, approach: str) -> 
     if fill <= 0:
         return
 
-    stop_px = fill * (1 - _SIM_STOP_PCT) if direction == "long" else fill * (1 + _SIM_STOP_PCT)
-    tp_pct  = _sim_get_tp(sym, direction)
-    tp_px   = fill * (1 + tp_pct)         if direction == "long" else fill * (1 - tp_pct)
-    if abs(tp_pct - _SIM_TP_COLD_START) > 0.0005:
-        _tp_wins = (_sim.get("win_moves") or {}).get(sym + "_" + direction, [])
-        _tp_avg  = sum(_tp_wins) / len(_tp_wins)
-        _sim_log(f"\U0001f4c8 {sym} {direction.upper()} dynamic TP {tp_pct*100:.2f}%"
-                 f" (avg win {_tp_avg*100:.2f}% x1.5, {len(_tp_wins)} samples)")
+    stop_pct = _sim_get_dynamic_stop(sym)
+    stop_px  = fill * (1 - stop_pct) if direction == "long" else fill * (1 + stop_pct)
+    tp_pct   = _sim_get_tp(sym, direction)
+    tp_px    = fill * (1 + tp_pct)   if direction == "long" else fill * (1 - tp_pct)
+    _tp_wins = (_sim.get("win_moves") or {}).get(sym + "_" + direction, [])
+    _tp_src  = (f"avg_win {(sum(_tp_wins)/len(_tp_wins))*100:.3f}%×{int(_SIM_TP_WIN_FRACTION*100)}%"
+                if _tp_wins else "vol/loss-history")
+    _sim_log(f"\U0001f4ca {sym} {direction.upper()} TP {tp_pct*100:.3f}% ({_tp_src}) | "
+             f"stop {stop_pct*100:.3f}% (vol-dynamic)")
     vbkt    = _sim_vol_bucket(vol)
     notl    = round(pos_size * leverage, 2)
 
@@ -2925,7 +2973,7 @@ def _sim_try_entry(signals: dict, regime: str, leverage: int, approach: str) -> 
         "size": pos_size, "leverage": leverage,
         "entry_time": time.time(), "entry_vol": vol,
         "vol_bucket": vbkt, "approach": approach, "regime": regime,
-        "entry_change_15m": change_15m, "tp_pct": tp_pct,
+        "entry_change_15m": change_15m, "tp_pct": tp_pct, "stop_pct": stop_pct,
     }
 
     action = "BUY" if direction == "long" else "SELL"
@@ -2950,16 +2998,26 @@ def _sim_check_exit(signals: dict, regime: str) -> None:
     dirn     = pos["direction"]
     sig_dir  = signals[sym].get("direction", "neutral")
 
-    if pnl_pct <= -_SIM_STOP_PCT:
+    # Hard exits — instrument-calibrated thresholds (stored at entry, fallback to live calc)
+    stop_pct = pos.get("stop_pct", _sim_get_dynamic_stop(sym))
+    if pnl_pct <= -stop_pct:
         _sim_close_position(prices, "stop_loss"); return
-    if pnl_pct >= pos.get("tp_pct", _SIM_TP_COLD_START):
+    if pnl_pct >= pos.get("tp_pct", _sim_get_tp(sym, dirn)):
         _sim_close_position(prices, "take_profit"); return
     if hold_sec >= _SIM_MAX_HOLD_SECS:
         _sim_close_position(prices, "max_hold"); return
-    if dirn == "long"  and (regime == "bear" or sig_dir == "bear"):
-        _sim_close_position(prices, "reversal"); return
-    if dirn == "short" and (regime == "bull" or sig_dir == "bull"):
-        _sim_close_position(prices, "reversal"); return
+
+    # Asymmetric reversal: losers cut on first opposing cycle, winners need confirmation
+    opposing = (dirn == "long"  and (regime == "bear" or sig_dir == "bear")) or \
+               (dirn == "short" and (regime == "bull"  or sig_dir == "bull"))
+    if opposing:
+        patience  = _SIM_REV_PATIENCE_WIN if pnl_pct > 0 else _SIM_REV_PATIENCE_LOSS
+        rev_count = pos.get("reversal_count", 0) + 1
+        _sim["open_position"]["reversal_count"] = rev_count
+        if rev_count >= patience:
+            _sim_close_position(prices, "reversal"); return
+    elif pos.get("reversal_count", 0):
+        _sim["open_position"]["reversal_count"] = 0   # signal re-aligned, reset counter
 
 
 # ── Hourly summary ────────────────────────────────────────────────────────────
