@@ -2116,10 +2116,9 @@ _SIM_SIZING_CYCLE    = 2 * 3600
 # ── Volatility buckets ────────────────────────────────────────────────────────
 _SIM_HIGH_VOL_THRESH = 0.50
 _SIM_LOW_VOL_THRESH  = 0.20
-_SIM_DEAD_VOL_THRESH = 0.10   # dead tier: market too illiquid to trade
 
 # ── Dynamic threshold / streak parameters ────────────────────────────────────
-_SIM_THRESH_BASE     = 0.12   # minimum vol threshold (%)
+_SIM_THRESH_BASE     = 0.05   # minimum vol threshold (%) — safety floor only
 _SIM_THRESH_CAP      = 0.50   # maximum vol threshold (%)
 _SIM_THRESH_MULT     = 1.5    # std-dev multiplier for threshold calc
 _SIM_THRESH_MIN_HIST = 10     # min vol history samples before dynamic thresh
@@ -2158,10 +2157,11 @@ _SIM_APPROX_EURUSD   = 1.14
 _SIM_APPROX_USDJPY   = 162.0
 
 # ── Module-level state ────────────────────────────────────────────────────────
-_sim_eligible:     set  = set()
-_sim_min_notional: dict = {}
-_sim:              dict = {}    # empty = not started; truthy = running (used by poll_cycle)
-_sim_regime_three_way: list = []  # three-way confirmations, updated each poll cycle
+_sim_eligible:          set   = set()
+_sim_min_notional:      dict  = {}
+_sim:                   dict  = {}    # empty = not started; truthy = running (used by poll_cycle)
+_sim_regime_three_way:  list  = []   # three-way confirmations, updated each poll cycle
+_sim_weekend_log_next:  float = 0.0  # rate-limits weekend closure log to once per hour
 
 
 # ── Logging ───────────────────────────────────────────────────────────────────
@@ -2399,10 +2399,9 @@ def _sim_check_min_feasible(sym: str, pos_size: float, leverage: int) -> bool:
 
 
 def _sim_vol_bucket(vol: float) -> str:
-    if vol > _SIM_HIGH_VOL_THRESH:  return "high"
-    if vol >= _SIM_LOW_VOL_THRESH:  return "mid"
-    if vol >= _SIM_DEAD_VOL_THRESH: return "low"
-    return "dead"
+    if vol > _SIM_HIGH_VOL_THRESH: return "high"
+    if vol >= _SIM_LOW_VOL_THRESH: return "mid"
+    return "low"
 
 
 # ── Dynamic threshold / streak helpers ───────────────────────────────────────
@@ -2580,10 +2579,6 @@ def _sim_select_instrument(signals: dict, regime: str):
         vbkt   = _sim_vol_bucket(vol)
         thresh = _sim_get_threshold(sym, direction_str, low_tier=(vbkt == "low"))
         if vol < thresh:
-            continue
-        # Dead-vol block — fires before exceptional pause override
-        if vbkt == "dead":
-            _sim_log(f"⛔ SIM: {sym} dead vol ({vol:.4f}%) — market too quiet")
             continue
         if direction_str and _sim_is_paused(_sim_combo_key(sym, direction_str)):
             exp = (_sim.get("pause_expiry") or {}).get(_sim_combo_key(sym, direction_str), 0.0)
@@ -3136,12 +3131,10 @@ def run_simulation_step(signals: dict) -> None:
     if pnl <= _SIM_LOSS_STOP:
         _sim_stop(f"loss boundary (${pnl:.2f})", signals); return
 
-    # Hourly log (fires even during overnight so the sim stays visible)
+    # Hourly log (fires even during weekend/overnight so the sim stays visible)
     if now >= _sim["hourly_next"]:
         _sim_hourly_log()
         _sim["hourly_next"] = now + 3600
-
-    _sim_update_vol_history(signals)
 
     # Compute stage / leverage / approach for this cycle
     stage    = _sim.get("stage", "sprout")
@@ -3162,7 +3155,7 @@ def run_simulation_step(signals: dict) -> None:
         _sim_regime_three_way = []
         pass
 
-    # Handle open position -- exit check first
+    # Handle open position -- exit check fires even during weekend closure
     if _sim.get("open_position"):
         _sim_check_exit(signals, regime)
         if _sim.get("open_position"):
@@ -3189,6 +3182,19 @@ def run_simulation_step(signals: dict) -> None:
         leverage = _SIM_CONSERVATIVE_LEV if _sim["phase"] == 1 else _SIM_AGGRESSIVE_LEV
         approach = (_SIM_SIZING_ORDER[_sim.get("sizing_idx", 0)]
                     if stage == "sprout" else _SIM_STAGE_APPROACH.get(stage, "pct_5"))
+
+    # Weekend block: IG CFD markets close Fri 21:15 UTC → Sun 21:00 UTC.
+    # Uses is_weekend_closure() which is UTC-based and DST-safe.
+    # Open-position exits have already been handled above; only new entries are blocked.
+    if is_weekend_closure():
+        global _sim_weekend_log_next
+        if now >= _sim_weekend_log_next:
+            _sim_log("💤 Weekend market closure — entries blocked until Sunday 21:00 UTC")
+            _sim_weekend_log_next = now + 3600
+        return
+
+    # Vol history: weekdays only — weekend synthetic prices contaminate the signal
+    _sim_update_vol_history(signals)
 
     # No open position -- look for entry
     _sim_try_entry(signals, regime, leverage, approach)
@@ -3244,7 +3250,7 @@ def sim_startup() -> None:
                 "approach_stats":       {k: {"pnl": 0.0, "trades": 0, "wins": 0}
                                          for k in _SIM_SIZING_ORDER},
                 "vol_stats":            {b: {"pnl": 0.0, "trades": 0, "wins": 0}
-                                         for b in ("high", "mid", "low", "dead")},
+                                         for b in ("high", "mid", "low")},
                 "reset_count":          0,
                 "streak_state":         {},
                 "boost_expiry":         {},
