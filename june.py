@@ -3141,10 +3141,6 @@ def run_simulation_step(signals: dict) -> None:
         _sim_hourly_log()
         _sim["hourly_next"] = now + 3600
 
-    # Pause entries and exits while both sessions are closed
-    if is_overnight():
-        return
-
     _sim_update_vol_history(signals)
 
     # Compute stage / leverage / approach for this cycle
