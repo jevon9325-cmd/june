@@ -2177,15 +2177,31 @@ _SIM_STOP_FLOOR      = 0.0008  # 0.08% floor (covers spread+noise for all instru
 _SIM_STOP_CAP        = 0.005   # 0.50% max stop (at 10x = 5% leveraged)
 _SIM_STOP_COLD       = 0.0020  # 0.20% cold-start when no vol_history available
 
+# Spread-aware stop floors — fallback when june_spread_baselines unavailable (fractions)
+_SIM_SPREAD_FLOORS = {
+    "SILVER": 0.0015,   # 0.15%
+    "GBPUSD": 0.0005,   # 0.05%
+    "EURUSD": 0.0004,   # 0.04%
+    "USDJPY": 0.0004,   # 0.04%
+}
+
 # Asymmetric reversal: losing positions exit faster than winning ones
 _SIM_REV_PATIENCE_WIN  = 2     # consecutive opposing cycles before cutting a winner
 _SIM_REV_PATIENCE_LOSS = 1     # exit loser on first opposing cycle
 
 # ── Phase timing ──────────────────────────────────────────────────────────────
-_SIM_CONSERVATIVE_LEV    = 3
-_SIM_AGGRESSIVE_LEV      = 10
-_SIM_PHASE_SWITCH_TRADES = 10     # >= 10 completed trades triggers phase 2
-_SIM_PHASE_SWITCH_SECS   = 12 * 3600  # OR 12h elapsed, whichever first
+_SIM_CONSERVATIVE_LEV  = 3
+_SIM_PHASE2_LEV        = 5
+_SIM_AGGRESSIVE_LEV    = 10
+# Phase advancement: performance-based (replaces time-based system)
+_SIM_P1_TO_P2_TRADES   = 10
+_SIM_P1_TO_P2_WR       = 0.50
+_SIM_P2_TO_P3_TRADES   = 20
+_SIM_P2_TO_P3_WR       = 0.55
+_SIM_P2_TO_P3_PNL      = 0.05   # +5% from phase entry balance required
+# Phase drop-back: 5 consecutive losses OR -5% from phase entry
+_SIM_PHASE_DROP_LOSSES = 5
+_SIM_PHASE_DROP_PNL    = -0.05
 
 # ── Sprout sizing rotation ─────────────────────────────────────────────────────
 _SIM_SIZING_ORDER    = ["fixed_5", "fixed_10", "pct_5", "pct_10"]
@@ -2264,6 +2280,8 @@ def _sim_save_state() -> None:
         "total_losses":         _sim["total_losses"],
         "phase":                _sim["phase"],
         "phase_start_time":     _sim["phase_start_time"],
+        "phase_entry_balance":  _sim.get("phase_entry_balance", _sim.get("stage_entry_balance", _SIM_START_BALANCE)),
+        "phase_consec_losses":  _sim.get("phase_consec_losses", 0),
         "sim_start_time":       _sim["sim_start_time"],
         "sizing_idx":           _sim["sizing_idx"],
         "sizing_rotation_time": _sim["sizing_rotation_time"],
@@ -2364,6 +2382,10 @@ def _sim_do_graduate(signals, via_rolling: bool = False) -> bool:
     _sim["stage_trades"]        = 0
     _sim["stage_wins"]          = 0
     _sim["stage_losses"]        = 0
+    _sim["phase"]               = 1
+    _sim["phase_start_time"]    = time.time()
+    _sim["phase_entry_balance"] = _sim["balance"]
+    _sim["phase_consec_losses"] = 0
 
     if via_rolling:
         recent = [t for t in _sim.get("trade_history", []) if t.get("stage") == stage][-10:]
@@ -2433,17 +2455,60 @@ def _sim_unlock_seedling_instruments() -> None:
 
 
 # ── Phase management ──────────────────────────────────────────────────────────
+def _sim_phase_leverage(phase: int) -> int:
+    """Return leverage multiplier for the given phase number."""
+    if phase == 1: return _SIM_CONSERVATIVE_LEV
+    if phase == 2: return _SIM_PHASE2_LEV
+    return _SIM_AGGRESSIVE_LEV
+
+
 def _sim_check_phase() -> None:
-    if _sim.get("phase", 1) != 1:
-        return
-    total   = _sim.get("total_wins", 0) + _sim.get("total_losses", 0)
-    elapsed = time.time() - _sim["sim_start_time"]
-    if total >= _SIM_PHASE_SWITCH_TRADES or elapsed >= _SIM_PHASE_SWITCH_SECS:
-        _sim["phase"]            = 2
-        _sim["phase_start_time"] = time.time()
+    """Performance-based phase advancement and drop-back."""
+    phase   = _sim.get("phase", 1)
+    n       = _sim.get("stage_trades", 0)
+    wins    = _sim.get("stage_wins", 0)
+    wr      = wins / n if n else 0.0
+    entry_b = _sim.get("phase_entry_balance", _sim.get("stage_entry_balance", _SIM_START_BALANCE))
+    pnl_pct = (_sim["balance"] - entry_b) / entry_b if entry_b > 0 else 0.0
+    consec  = _sim.get("phase_consec_losses", 0)
+
+    # Drop-back runs first — catches losing runs before considering advancement
+    if phase > 1:
+        if consec >= _SIM_PHASE_DROP_LOSSES or pnl_pct <= _SIM_PHASE_DROP_PNL:
+            new_phase = phase - 1
+            reason    = (f"{consec} consecutive losses"
+                         if consec >= _SIM_PHASE_DROP_LOSSES
+                         else f"P&L {pnl_pct:+.1%} from phase entry")
+            _sim["phase"]               = new_phase
+            _sim["phase_entry_balance"] = _sim["balance"]
+            _sim["phase_consec_losses"] = 0
+            _sim["phase_start_time"]    = time.time()
+            _sim_log(
+                f"📉 SIM: Phase {phase} → Phase {new_phase} ({_sim_phase_leverage(new_phase)}:1) "
+                f"— {reason} — dropping back to conservative leverage"
+            )
+            _sim_save_state()
+            return
+
+    # Advancement
+    if phase == 1 and n >= _SIM_P1_TO_P2_TRADES and wr >= _SIM_P1_TO_P2_WR and pnl_pct > 0:
+        _sim["phase"]               = 2
+        _sim["phase_entry_balance"] = _sim["balance"]
+        _sim["phase_consec_losses"] = 0
+        _sim["phase_start_time"]    = time.time()
         _sim_log(
-            f"Phase switch -> AGGRESSIVE (10:1 leverage) "
-            f"[trades={total}, elapsed={elapsed/3600:.1f}h]"
+            f"📈 SIM: Phase 1 → Phase 2 (5:1) "
+            f"— {n} trades, {wr:.0%} WR, +${_sim['balance'] - entry_b:.2f} P&L — criteria met"
+        )
+        _sim_save_state()
+    elif phase == 2 and n >= _SIM_P2_TO_P3_TRADES and wr >= _SIM_P2_TO_P3_WR and pnl_pct >= _SIM_P2_TO_P3_PNL:
+        _sim["phase"]               = 3
+        _sim["phase_entry_balance"] = _sim["balance"]
+        _sim["phase_consec_losses"] = 0
+        _sim["phase_start_time"]    = time.time()
+        _sim_log(
+            f"📈 SIM: Phase 2 → Phase 3 (10:1) "
+            f"— {n} trades, {wr:.0%} WR, +${_sim['balance'] - entry_b:.2f} P&L — criteria met"
         )
         _sim_save_state()
 
@@ -2653,6 +2718,21 @@ def _sim_get_dynamic_stop(sym: str) -> float:
     return round(max(_SIM_STOP_FLOOR, min(_SIM_STOP_CAP, stop_p / 100.0)), 6)
 
 
+def _sim_get_spread_floor(sym: str) -> float:
+    """Minimum stop = 2× baseline spread. Returns fraction (0.0015 = 0.15%).
+    Reads june_spread_baselines (values already in % units e.g. 0.0638 = 0.0638%).
+    Falls back to hardcoded _SIM_SPREAD_FLOORS on Redis miss."""
+    try:
+        raw = _redis().get("june_spread_baselines")
+        if raw:
+            spread_pct = json.loads(raw).get("baselines", {}).get(sym)
+            if spread_pct is not None:
+                return round(2.0 * spread_pct / 100.0, 6)
+    except Exception:
+        pass
+    return _SIM_SPREAD_FLOORS.get(sym, _SIM_STOP_FLOOR)
+
+
 def _sim_regime_weight(sym: str, direction: str) -> float:
     """Return signal-strength multiplier based on active macro three-way confirmations.
     Returns 1.0 when no matching regime is active or instrument not specifically weighted."""
@@ -2663,10 +2743,10 @@ def _sim_regime_weight(sym: str, direction: str) -> float:
         dirn = conf.get("direction", "")
         if dirn == "dollar_strength" or "dollar strength" in note:
             if sym == "USDJPY":                                       return 1.25
-            if sym == "SILVER" and direction == "short":             return 1.20
+            if sym == "SILVER" and direction == "short":             return 1.35
             if sym in ("EURUSD", "GBPUSD") and direction == "long": return 0.70
         elif "commodity bull" in note:
-            if sym == "SILVER":                                       return 1.30
+            if sym == "SILVER":                                       return 1.50
             if sym in ("EURUSD", "GBPUSD"):                          return 0.85
             if sym == "USDJPY":                                       return 0.80
         elif "risk-on" in note:
@@ -2674,7 +2754,7 @@ def _sim_regime_weight(sym: str, direction: str) -> float:
             if sym == "USDJPY" and direction == "long":              return 1.15
             if sym == "SILVER":                                       return 0.90
         elif "safe-haven" in note:
-            if sym == "SILVER" and direction == "long":              return 1.25
+            if sym == "SILVER" and direction == "long":              return 1.40
             if sym == "USDJPY" and direction == "long":              return 1.20
             if sym in ("EURUSD", "GBPUSD") and direction == "long": return 0.75
         return 1.0
@@ -2784,6 +2864,10 @@ def _sim_close_position(prices: dict, exit_reason: str) -> None:
     _sim["stage_trades"]  += 1
     _sim["stage_wins"]    += int(won)
     _sim["stage_losses"]  += int(not won)
+    if won:
+        _sim["phase_consec_losses"] = 0
+    else:
+        _sim["phase_consec_losses"] = _sim.get("phase_consec_losses", 0) + 1
     _sim["total_wins"]    += int(won)
     _sim["total_losses"]  += int(not won)
 
@@ -2955,15 +3039,23 @@ def _sim_try_entry(signals: dict, regime: str, leverage: int, approach: str) -> 
     if fill <= 0:
         return
 
-    stop_pct = _sim_get_dynamic_stop(sym)
+    _stop_vol    = _sim_get_dynamic_stop(sym)
+    _spread_flr  = _sim_get_spread_floor(sym)
+    stop_pct     = max(_stop_vol, _spread_flr)
+    if stop_pct > _stop_vol:
+        _sim_log(
+            f"📊 SIM: {sym} stop raised {_stop_vol*100:.2f}% → {stop_pct*100:.2f}% "
+            f"(spread floor: baseline spread {_spread_flr / 2 * 100:.2f}%)"
+        )
     stop_px  = fill * (1 - stop_pct) if direction == "long" else fill * (1 + stop_pct)
     tp_pct   = _sim_get_tp(sym, direction)
     tp_px    = fill * (1 + tp_pct)   if direction == "long" else fill * (1 - tp_pct)
     _tp_wins = (_sim.get("win_moves") or {}).get(sym + "_" + direction, [])
     _tp_src  = (f"avg_win {(sum(_tp_wins)/len(_tp_wins))*100:.3f}%×{int(_SIM_TP_WIN_FRACTION*100)}%"
                 if _tp_wins else "vol/loss-history")
+    _stop_tag = "spread-adj" if stop_pct > _stop_vol else "vol-dynamic"
     _sim_log(f"\U0001f4ca {sym} {direction.upper()} TP {tp_pct*100:.3f}% ({_tp_src}) | "
-             f"stop {stop_pct*100:.3f}% (vol-dynamic)")
+             f"stop {stop_pct*100:.3f}% ({_stop_tag})")
     vbkt    = _sim_vol_bucket(vol)
     notl    = round(pos_size * leverage, 2)
 
@@ -3241,6 +3333,8 @@ def run_simulation_step(signals: dict) -> None:
             "stage_losses":         0,
             "phase":                1,
             "phase_start_time":     now_r,
+            "phase_entry_balance":  _SIM_START_BALANCE,
+            "phase_consec_losses":  0,
             "sizing_idx":           0,
             "sizing_rotation_time": now_r,
             "open_position":        None,
@@ -3269,7 +3363,7 @@ def run_simulation_step(signals: dict) -> None:
 
     # Compute stage / leverage / approach for this cycle
     stage    = _sim.get("stage", "sprout")
-    leverage = _SIM_CONSERVATIVE_LEV if _sim["phase"] == 1 else _SIM_AGGRESSIVE_LEV
+    leverage = _sim_phase_leverage(_sim.get("phase", 1))
     approach = (_SIM_SIZING_ORDER[_sim.get("sizing_idx", 0)]
                 if stage == "sprout" else _SIM_STAGE_APPROACH.get(stage, "pct_5"))
 
@@ -3310,7 +3404,7 @@ def run_simulation_step(signals: dict) -> None:
         # "continue" -- fall through to entry in same cycle
         # Recompute in case stage changed
         stage    = _sim.get("stage", "sprout")
-        leverage = _SIM_CONSERVATIVE_LEV if _sim["phase"] == 1 else _SIM_AGGRESSIVE_LEV
+        leverage = _sim_phase_leverage(_sim.get("phase", 1))
         approach = (_SIM_SIZING_ORDER[_sim.get("sizing_idx", 0)]
                     if stage == "sprout" else _SIM_STAGE_APPROACH.get(stage, "pct_5"))
 
@@ -3363,6 +3457,8 @@ def sim_startup() -> None:
                 "total_losses":         0,
                 "phase":                1,
                 "phase_start_time":     now,
+                "phase_entry_balance":  _SIM_START_BALANCE,
+                "phase_consec_losses":  0,
                 "sim_start_time":       now,
                 "sizing_idx":           0,
                 "sizing_rotation_time": now,
@@ -3407,6 +3503,8 @@ def sim_startup() -> None:
             "total_losses":         saved.get("total_losses", 0),
             "phase":                saved.get("phase", 1),
             "phase_start_time":     saved.get("phase_start_time", now),
+            "phase_entry_balance":  saved.get("phase_entry_balance", saved.get("stage_entry_balance", _SIM_START_BALANCE)),
+            "phase_consec_losses":  saved.get("phase_consec_losses", 0),
             "sim_start_time":       saved.get("sim_start_time", now),
             "sizing_idx":           saved.get("sizing_idx", 0),
             "sizing_rotation_time": saved.get("sizing_rotation_time", now),
@@ -3485,26 +3583,6 @@ def sim_startup() -> None:
                 flush=True,
             )
 
-        # Sanity check: if phase=2 is saved but criteria not yet met, revert to phase 1
-        if _sim["phase"] == 2 and total_trades < _SIM_PHASE_SWITCH_TRADES and elapsed_s < _SIM_PHASE_SWITCH_SECS:
-            _sim["phase"] = 1
-            print(
-                f"[{_ts()}] \u26a0\ufe0f SIM: Phase 2 in saved state but criteria not met "
-                f"[trades={total_trades}, elapsed={elapsed_h:.1f}h] -- reverting to Phase 1",
-                flush=True,
-            )
-
-        # Transition to Phase 2 immediately if criteria already met on resume
-        if _sim["phase"] == 1 and (total_trades >= _SIM_PHASE_SWITCH_TRADES or elapsed_s >= _SIM_PHASE_SWITCH_SECS):
-            _sim["phase"]            = 2
-            _sim["phase_start_time"] = now
-            print(
-                f"[{_ts()}] \U0001f9ea SIM: Phase 1 criteria met on resume "
-                f"[trades={total_trades}, elapsed={elapsed_h:.1f}h] -- "
-                f"transitioning to Phase 2 (10:1 leverage) immediately",
-                flush=True,
-            )
-            _sim_save_state()
         return
 
     # ── Fresh start ───────────────────────────────────────────────────────────
@@ -3569,6 +3647,8 @@ def sim_startup() -> None:
         "total_losses":         0,
         "phase":                1,
         "phase_start_time":     now,
+        "phase_entry_balance":  _SIM_START_BALANCE,
+        "phase_consec_losses":  0,
         "sim_start_time":       now,
         "sizing_idx":           0,
         "sizing_rotation_time": now,
@@ -3598,6 +3678,7 @@ def sim_startup() -> None:
     })
 
     # Restore calibration data from previous session if available
+    _cal_loaded = False
     try:
         _cal_raw = _redis().get("june_sim_calibration")
         if _cal_raw:
@@ -3605,6 +3686,7 @@ def sim_startup() -> None:
             _sim["vol_history"] = _cal.get("vol_history", {})
             _sim["win_moves"]   = _cal.get("win_moves", {})
             _sim["loss_moves"]  = _cal.get("loss_moves", {})
+            _cal_loaded = True
             print(
                 f"[{_ts()}] \U0001f9ea SIM: Restored calibration — "
                 f"vol_history={list(_cal.get('vol_history', {}).keys())} "
@@ -3615,9 +3697,10 @@ def sim_startup() -> None:
         pass
 
     print(f"[{_ts()}] \U0001f9ea SIM: Eligible instruments: {sorted(_sim_eligible)}", flush=True)
+    _cal_note = "Calibration loaded from prior session." if _cal_loaded else "No prior calibration."
     print(
-        f"[{_ts()}] \U0001f9ea SIM: Phase 1 (conservative, 3:1 leverage) -- "
-        f"running alongside normal intelligence",
+        f"[{_ts()}] 🔄 SIM: Fresh start — spread-aware stops, performance-based phases, "
+        f"Silver prioritized. {_cal_note}",
         flush=True,
     )
     _sim_save_state()
