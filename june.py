@@ -2206,6 +2206,8 @@ _SIM_PHASE_DROP_PNL    = -0.05
 # ── Sprout sizing rotation ─────────────────────────────────────────────────────
 _SIM_SIZING_ORDER        = ["fixed_5", "fixed_10", "pct_5", "pct_10"]
 _SIM_MIN_APPROACH_TRADES = 5    # min per-instrument trades before approach is trusted
+_SIM_SKIP_THRESHOLD      = 3    # notional-miss skips before approach excluded for this instrument
+_SIM_SKIP_BALANCE_TOL    = 1.20 # re-enable skipped approach once balance grows >20%
 
 # ── Volatility buckets ────────────────────────────────────────────────────────
 _SIM_HIGH_VOL_THRESH = 0.50
@@ -2307,6 +2309,7 @@ def _sim_save_state() -> None:
         "loss_moves":           _sim.get("loss_moves", {}),
         "failure_snapshot":     _sim.get("failure_snapshot"),
         "failure_context_checked": _sim.get("failure_context_checked", True),
+        "approach_skip_counts": _sim.get("approach_skip_counts", {}),
     }
     try:
         _redis().set("june_sim_state", json.dumps(payload), ex=72 * 3600)
@@ -2930,6 +2933,12 @@ def _sim_try_entry(signals: dict, regime: str, leverage: int) -> None:
 
     stage    = _sim.get("stage", "sprout")
     approach = _sim_select_approach(stage, sym)
+    if approach == "__all_infeasible__":
+        _sim_log(
+            f"Skip {sym}: all sizing approaches excluded at balance ${balance:.2f} -- "
+            f"waiting for balance growth to clear IG min ${_sim_min_notional.get(sym, 0):.2f}"
+        )
+        return
 
     sig       = signals[sym]
     chg       = sig.get("change_5m", 0.0)
@@ -3019,6 +3028,11 @@ def _sim_try_entry(signals: dict, regime: str, leverage: int) -> None:
         if chosen_approach is None:
             min_n   = _sim_min_notional.get(sym, 0)
             max_eff = min(_sim_position_size(balance, _SIM_SIZING_ORDER[-1]), balance) * leverage
+            _sc_sp = _sim.setdefault("approach_skip_counts", {}).setdefault(sym, {})
+            for _a_sp in _SIM_SIZING_ORDER:
+                _sd_sp = _sc_sp.setdefault(_a_sp, {"count": 0, "balance": 0.0})
+                _sd_sp["count"] += 1
+                _sd_sp["balance"] = balance
             _sim_log(
                 f"Skip {sym}: no sizing approach meets IG min ${min_n:.2f} "
                 f"(max effective ${max_eff:.2f} with {_SIM_SIZING_ORDER[-1]})"
@@ -3035,6 +3049,11 @@ def _sim_try_entry(signals: dict, regime: str, leverage: int) -> None:
             return
         if not _sim_check_min_feasible(sym, pos_size, leverage):
             min_n = _sim_min_notional.get(sym, 0)
+            _sc_ns = _sim.setdefault("approach_skip_counts", {}).setdefault(sym, {})
+            for _a_ns in _SIM_SIZING_ORDER:
+                _sd_ns = _sc_ns.setdefault(_a_ns, {"count": 0, "balance": 0.0})
+                _sd_ns["count"] += 1
+                _sd_ns["balance"] = balance
             _sim_log(f"Skip {sym}: effective ${pos_size * leverage:.2f} < IG min ${min_n:.2f}")
             return
 
@@ -3194,16 +3213,29 @@ def _sim_select_approach(stage: str, sym: str) -> str:
     Exploration: iterate _SIM_SIZING_ORDER until each approach has
     _SIM_MIN_APPROACH_TRADES trades for this instrument. Approaches with
     zero trades after total_traded >= 2x the minimum are treated as infeasible
-    (IG notional minimum always forces escalation past them).
+    (IG notional minimum always forces escalation past them). Approaches that
+    repeatedly fail the IG minimum notional check (_SIM_SKIP_THRESHOLD skips)
+    are excluded until balance grows by _SIM_SKIP_BALANCE_TOL.
 
-    Exploitation: highest win rate; P&L as tiebreaker.
+    Returns "__all_infeasible__" if every approach is currently excluded by
+    skip counts -- caller should skip this instrument for the cycle.
+
+    Exploitation: highest win rate among non-excluded approaches; P&L tiebreaker.
 
     Non-sprout stages explore their _SIM_STAGE_APPROACH default first so they
     begin with their intended conservative sizing.
     """
     instr_stats  = _sim.get("approach_stats", {}).get(sym, {})
+    skip_counts  = _sim.get("approach_skip_counts", {}).get(sym, {})
+    balance      = _sim.get("balance", 0.0)
     total_traded = sum(s.get("trades", 0) for s in instr_stats.values())
     infeas_floor = _SIM_MIN_APPROACH_TRADES * 2
+
+    def _skip_excluded(a: str) -> bool:
+        sd = skip_counts.get(a, {})
+        if sd.get("count", 0) < _SIM_SKIP_THRESHOLD:
+            return False
+        return balance <= sd.get("balance", 0.0) * _SIM_SKIP_BALANCE_TOL
 
     stage_default = _SIM_STAGE_APPROACH.get(stage)
     explore_order = (
@@ -3212,6 +3244,8 @@ def _sim_select_approach(stage: str, sym: str) -> str:
     )
 
     for a in explore_order:
+        if _skip_excluded(a):
+            continue
         t = instr_stats.get(a, {}).get("trades", 0)
         if t >= _SIM_MIN_APPROACH_TRADES:
             continue
@@ -3219,12 +3253,16 @@ def _sim_select_approach(stage: str, sym: str) -> str:
             continue  # likely infeasible -- IG minimum always escalates past it
         return a
 
+    viable = [a for a in _SIM_SIZING_ORDER if not _skip_excluded(a)]
+    if not viable:
+        return "__all_infeasible__"
+
     def _score(a):
         s = instr_stats.get(a, {})
         t = s.get("trades", 0)
         return (s.get("wins", 0) / t, s.get("pnl", 0.0)) if t > 0 else (0.0, 0.0)
 
-    return max(_SIM_SIZING_ORDER, key=_score)
+    return max(viable, key=_score)
 
 
 # ── Simulation stop ───────────────────────────────────────────────────────────
@@ -3410,6 +3448,7 @@ def run_simulation_step(signals: dict) -> None:
             "15m_reliability":      {},
             "failure_snapshot":     None,
             "failure_context_checked": True,
+            "approach_skip_counts": {},
         })
         _sim_save_state()
         return
@@ -3530,6 +3569,7 @@ def run_simulation_step(signals: dict) -> None:
                 "loss_moves":           _fail_cal_los,
                 "failure_snapshot":     _fail_snapshot,
                 "failure_context_checked": False,
+                "approach_skip_counts": {},
             })
             _sim_save_state()
             return
@@ -3655,6 +3695,7 @@ def sim_startup() -> None:
                 "loss_moves":           saved.get("loss_moves", {}),
                 "failure_snapshot":     None,
                 "failure_context_checked": True,
+                "approach_skip_counts": {},
             })
             _sim_save_state()
             return
@@ -3701,6 +3742,7 @@ def sim_startup() -> None:
             "loss_moves":           saved.get("loss_moves", {}),
             "failure_snapshot":     saved.get("failure_snapshot"),
             "failure_context_checked": saved.get("failure_context_checked", True),
+            "approach_skip_counts": saved.get("approach_skip_counts", {}),
         })
 
         # Validate sim_start_time -- future timestamps mean state was reconstructed
@@ -3841,6 +3883,7 @@ def sim_startup() -> None:
         "loss_moves":           {},
         "failure_snapshot":     None,
         "failure_context_checked": True,
+        "approach_skip_counts": {},
     })
 
     # Restore calibration data from previous session if available
