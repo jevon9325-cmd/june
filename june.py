@@ -3399,7 +3399,57 @@ def run_simulation_step(signals: dict) -> None:
                 f"{lbl} STAGE: {n} trades, {wr:.0%} WR -- "
                 f"graduation criteria not met after {n} attempts"
             )
-            _sim_stop(f"{stage}_stage_fail", signals)
+            # Capture calibration before _sim_stop modifies stopped flag.
+            # _sim_stop reads (not writes) vol_history/win_moves/loss_moves.
+            _fail_cal_vol = dict(_sim.get("vol_history", {}))
+            _fail_cal_win = dict(_sim.get("win_moves", {}))
+            _fail_cal_los = dict(_sim.get("loss_moves", {}))
+            _fail_rc      = _sim.get("reset_count", 0) + 1
+            _sim_stop(f"{stage}_stage_fail", signals)  # logs STOPPED+RECOMMENDATION, publishes results
+            # Auto-restart: reset to Sprout Stage P1 without manual intervention.
+            # vol_history / win_moves / loss_moves carry forward so each retry
+            # starts with better-tuned stop/TP values rather than relearning blind.
+            _now_r = time.time()
+            _sim_log(f"AUTO-RESTART #{_fail_rc}: resetting to Sprout Stage P1 — calibration preserved")
+            _sim.update({
+                "active":               True,
+                "stopped":              False,
+                "stop_reason":          "",
+                "balance":              _SIM_START_BALANCE,
+                "stage":                "sprout",
+                "stage_entry_balance":  _SIM_START_BALANCE,
+                "stage_trades":         0,
+                "stage_wins":           0,
+                "stage_losses":         0,
+                "total_wins":           0,
+                "total_losses":         0,
+                "phase":                1,
+                "phase_start_time":     _now_r,
+                "phase_entry_balance":  _SIM_START_BALANCE,
+                "phase_consec_losses":  0,
+                "sim_start_time":       _now_r,
+                "sizing_idx":           0,
+                "sizing_rotation_time": _now_r,
+                "open_position":        None,
+                "long_pnl":             0.0,
+                "long_trades":          0,
+                "long_wins":            0,
+                "short_pnl":            0.0,
+                "short_trades":         0,
+                "short_wins":           0,
+                "approach_stats":       {k: {"pnl": 0.0, "trades": 0, "wins": 0} for k in _SIM_SIZING_ORDER},
+                "vol_stats":            {b: {"pnl": 0.0, "trades": 0, "wins": 0} for b in ("high", "mid", "low")},
+                "reset_count":          _fail_rc,
+                "streak_state":         {},
+                "boost_expiry":         {},
+                "pause_expiry":         {},
+                "last_entry_time":      _now_r,
+                "15m_reliability":      {},
+                "vol_history":          _fail_cal_vol,
+                "win_moves":            _fail_cal_win,
+                "loss_moves":           _fail_cal_los,
+            })
+            _sim_save_state()
             return
         # "continue" -- fall through to entry in same cycle
         # Recompute in case stage changed
