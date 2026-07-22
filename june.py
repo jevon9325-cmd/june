@@ -3342,7 +3342,6 @@ def run_simulation_step(signals: dict) -> None:
             "streak_state":         {},
             "boost_expiry":         {},
             "pause_expiry":         {},
-            "vol_history":          {},
             "last_entry_time":      now_r,
             "15m_reliability":      {},
         })
