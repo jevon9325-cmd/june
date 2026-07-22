@@ -2204,8 +2204,8 @@ _SIM_PHASE_DROP_LOSSES = 5
 _SIM_PHASE_DROP_PNL    = -0.05
 
 # ── Sprout sizing rotation ─────────────────────────────────────────────────────
-_SIM_SIZING_ORDER    = ["fixed_5", "fixed_10", "pct_5", "pct_10"]
-_SIM_SIZING_CYCLE    = 2 * 3600
+_SIM_SIZING_ORDER        = ["fixed_5", "fixed_10", "pct_5", "pct_10"]
+_SIM_MIN_APPROACH_TRADES = 5    # min per-instrument trades before approach is trusted
 
 # ── Volatility buckets ────────────────────────────────────────────────────────
 _SIM_HIGH_VOL_THRESH = 0.50
@@ -2283,8 +2283,6 @@ def _sim_save_state() -> None:
         "phase_entry_balance":  _sim.get("phase_entry_balance", _sim.get("stage_entry_balance", _SIM_START_BALANCE)),
         "phase_consec_losses":  _sim.get("phase_consec_losses", 0),
         "sim_start_time":       _sim["sim_start_time"],
-        "sizing_idx":           _sim["sizing_idx"],
-        "sizing_rotation_time": _sim["sizing_rotation_time"],
         "eligible_instruments": sorted(_sim_eligible),
         "min_notionals":        _sim_min_notional,
         "open_position":        _sim.get("open_position"),
@@ -2307,6 +2305,8 @@ def _sim_save_state() -> None:
         "15m_reliability":      _sim.get("15m_reliability", {}),
         "win_moves":            _sim.get("win_moves", {}),
         "loss_moves":           _sim.get("loss_moves", {}),
+        "failure_snapshot":     _sim.get("failure_snapshot"),
+        "failure_context_checked": _sim.get("failure_context_checked", True),
     }
     try:
         _redis().set("june_sim_state", json.dumps(payload), ex=72 * 3600)
@@ -2895,7 +2895,8 @@ def _sim_close_position(prices: dict, exit_reason: str) -> None:
         _sim["short_trades"] += 1
         if won: _sim["short_wins"] += 1
 
-    st = _sim.setdefault("approach_stats", {}).setdefault(approach, {"pnl": 0.0, "trades": 0, "wins": 0})
+    _instr_app = _sim.setdefault("approach_stats", {}).setdefault(pos["instrument"], {})
+    st = _instr_app.setdefault(approach, {"pnl": 0.0, "trades": 0, "wins": 0})
     st["pnl"] += dollar_pnl; st["trades"] += 1
     if won: st["wins"] += 1
 
@@ -2921,11 +2922,14 @@ def _sim_close_position(prices: dict, exit_reason: str) -> None:
 
 
 # ── Entry ─────────────────────────────────────────────────────────────────────
-def _sim_try_entry(signals: dict, regime: str, leverage: int, approach: str) -> None:
+def _sim_try_entry(signals: dict, regime: str, leverage: int) -> None:
     balance = _sim["balance"]
     sym     = _sim_select_instrument(signals, regime)
     if not sym or sym not in signals:
         return
+
+    stage    = _sim.get("stage", "sprout")
+    approach = _sim_select_approach(stage, sym)
 
     sig       = signals[sym]
     chg       = sig.get("change_5m", 0.0)
@@ -3122,9 +3126,14 @@ def _sim_hourly_log() -> None:
     grad_min  = _SIM_STAGE_DEFS.get(stage, {}).get("min_trades", 0)
     wr_str    = f"{st_w/st_t:.0%}" if st_t else "n/a"
 
-    app_stats = _sim.get("approach_stats", {})
-    best_app  = (max(app_stats.items(), key=lambda x: x[1]["pnl"])[0]
-                 if any(v.get("trades", 0) for v in app_stats.values()) else "none")
+    _app_raw = _sim.get("approach_stats", {})
+    _app_agg: dict = {}
+    for _idict in _app_raw.values():
+        for _a, _s in _idict.items():
+            _agg = _app_agg.setdefault(_a, {"pnl": 0.0, "trades": 0, "wins": 0})
+            _agg["pnl"] += _s["pnl"]; _agg["trades"] += _s["trades"]; _agg["wins"] += _s["wins"]
+    best_app = (max(_app_agg.items(), key=lambda x: x[1]["pnl"])[0]
+                if any(v.get("trades", 0) for v in _app_agg.values()) else "none")
 
     lt = _sim.get("long_trades", 0);  lw = _sim.get("long_wins", 0)
     st = _sim.get("short_trades", 0); sw = _sim.get("short_wins", 0)
@@ -3179,6 +3188,45 @@ def _sim_hourly_log() -> None:
         _sim_log("SELF-ASSESSMENT:\n" + "\n".join(sa_lines))
 
 
+def _sim_select_approach(stage: str, sym: str) -> str:
+    """Select sizing approach for (stage, instrument).
+
+    Exploration: iterate _SIM_SIZING_ORDER until each approach has
+    _SIM_MIN_APPROACH_TRADES trades for this instrument. Approaches with
+    zero trades after total_traded >= 2x the minimum are treated as infeasible
+    (IG notional minimum always forces escalation past them).
+
+    Exploitation: highest win rate; P&L as tiebreaker.
+
+    Non-sprout stages explore their _SIM_STAGE_APPROACH default first so they
+    begin with their intended conservative sizing.
+    """
+    instr_stats  = _sim.get("approach_stats", {}).get(sym, {})
+    total_traded = sum(s.get("trades", 0) for s in instr_stats.values())
+    infeas_floor = _SIM_MIN_APPROACH_TRADES * 2
+
+    stage_default = _SIM_STAGE_APPROACH.get(stage)
+    explore_order = (
+        [stage_default] + [a for a in _SIM_SIZING_ORDER if a != stage_default]
+        if stage_default else list(_SIM_SIZING_ORDER)
+    )
+
+    for a in explore_order:
+        t = instr_stats.get(a, {}).get("trades", 0)
+        if t >= _SIM_MIN_APPROACH_TRADES:
+            continue
+        if t == 0 and total_traded >= infeas_floor:
+            continue  # likely infeasible -- IG minimum always escalates past it
+        return a
+
+    def _score(a):
+        s = instr_stats.get(a, {})
+        t = s.get("trades", 0)
+        return (s.get("wins", 0) / t, s.get("pnl", 0.0)) if t > 0 else (0.0, 0.0)
+
+    return max(_SIM_SIZING_ORDER, key=_score)
+
+
 # ── Simulation stop ───────────────────────────────────────────────────────────
 def _sim_stop(reason: str, signals=None) -> None:
     pos = _sim.get("open_position")
@@ -3186,6 +3234,24 @@ def _sim_stop(reason: str, signals=None) -> None:
         sym = pos.get("instrument", "")
         if sym and sym in signals:
             _sim_close_position(_sim_reconstruct_prices(sym, signals), "simulation_stop")
+
+    # Build failure context snapshot before marking stopped
+    _snap_th_s = _sim.get("trade_history", [])
+    _snap_it:  dict = {}
+    _snap_iw:  dict = {}
+    for _t in _snap_th_s:
+        _sym_t = _t["instrument"]
+        _snap_it[_sym_t] = _snap_it.get(_sym_t, 0) + 1
+        _snap_iw[_sym_t] = _snap_iw.get(_sym_t, 0) + int(_t.get("dollar_pnl", 0) > 0)
+    _snap_vh_s = _sim.get("vol_history", {})
+    _failure_snapshot = {
+        "timestamp":         int(time.time()),
+        "stop_reason":       reason,
+        "vol_regime":        {_s: round(sum(_b) / len(_b), 4) for _s, _b in _snap_vh_s.items() if _b},
+        "instrument_trades": _snap_it,
+        "instrument_wr":     {_s: round(_snap_iw.get(_s, 0) / _snap_it[_s], 3)
+                              for _s in _snap_it if _snap_it[_s] > 0},
+    }
 
     _sim["stopped"]     = True
     _sim["stop_reason"] = reason
@@ -3196,7 +3262,13 @@ def _sim_stop(reason: str, signals=None) -> None:
     total    = _sim.get("total_wins", 0) + _sim.get("total_losses", 0)
     wins     = _sim.get("total_wins", 0)
 
-    app_stats = _sim.get("approach_stats", {})
+    _app_raw_s = _sim.get("approach_stats", {})
+    _app_agg_s: dict = {}
+    for _idict_s in _app_raw_s.values():
+        for _a_s, _s_s in _idict_s.items():
+            _ag_s = _app_agg_s.setdefault(_a_s, {"pnl": 0.0, "trades": 0, "wins": 0})
+            _ag_s["pnl"] += _s_s["pnl"]; _ag_s["trades"] += _s_s["trades"]; _ag_s["wins"] += _s_s["wins"]
+    app_stats = _app_agg_s
     best_app  = (max(app_stats.items(), key=lambda x: x[1]["pnl"])
                  if any(v.get("trades", 0) for v in app_stats.values())
                  else ("no_trades", {"pnl": 0.0}))
@@ -3246,9 +3318,10 @@ def _sim_stop(reason: str, signals=None) -> None:
         "stage_history":        _sim.get("stage_history", []),
         "long_pnl":             round(_sim.get("long_pnl", 0), 4),
         "short_pnl":            round(_sim.get("short_pnl", 0), 4),
-        "approach_stats":       {k: {kk: round(vv, 4) if isinstance(vv, float) else vv
-                                     for kk, vv in v.items()}
-                                 for k, v in app_stats.items()},
+        "approach_stats":       {instr: {k: {kk: round(vv, 4) if isinstance(vv, float) else vv
+                                              for kk, vv in v.items()}
+                                          for k, v in idict.items()}
+                                  for instr, idict in _app_raw_s.items()},
         "vol_stats":            {k: {kk: round(vv, 4) if isinstance(vv, float) else vv
                                      for kk, vv in v.items()}
                                  for k, v in vs.items()},
@@ -3263,9 +3336,10 @@ def _sim_stop(reason: str, signals=None) -> None:
         r = _redis()
         r.set("june_sim_results", json.dumps(result_payload), ex=48 * 3600)
         _cal = {
-            "vol_history": _sim.get("vol_history", {}),
-            "win_moves":   _sim.get("win_moves", {}),
-            "loss_moves":  _sim.get("loss_moves", {}),
+            "vol_history":      _sim.get("vol_history", {}),
+            "win_moves":        _sim.get("win_moves", {}),
+            "loss_moves":       _sim.get("loss_moves", {}),
+            "failure_snapshot": _failure_snapshot,
         }
         r.set("june_sim_calibration", json.dumps(_cal), ex=7 * 24 * 3600)
         r.delete("june_sim_state")
@@ -3294,14 +3368,6 @@ def run_simulation_step(signals: dict) -> None:
 
     # Phase check (runs through overnight so timer stays accurate)
     _sim_check_phase()
-
-    # Sizing rotation for SPROUT only (runs through overnight)
-    if _sim.get("stage") == "sprout":
-        if now - _sim["sizing_rotation_time"] >= _SIM_SIZING_CYCLE:
-            _sim["sizing_idx"]           = (_sim["sizing_idx"] + 1) % len(_SIM_SIZING_ORDER)
-            _sim["sizing_rotation_time"] = now
-            _sim_log(f"Sizing approach -> {_SIM_SIZING_ORDER[_sim['sizing_idx']]}")
-            _sim_save_state()
 
     # Global duration stop (runs through overnight so 24h wall-clock is respected)
     if elapsed >= 24 * 3600:
@@ -3335,8 +3401,6 @@ def run_simulation_step(signals: dict) -> None:
             "phase_start_time":     now_r,
             "phase_entry_balance":  _SIM_START_BALANCE,
             "phase_consec_losses":  0,
-            "sizing_idx":           0,
-            "sizing_rotation_time": now_r,
             "open_position":        None,
             "reset_count":          reset_count_r,
             "streak_state":         {},
@@ -3344,6 +3408,8 @@ def run_simulation_step(signals: dict) -> None:
             "pause_expiry":         {},
             "last_entry_time":      now_r,
             "15m_reliability":      {},
+            "failure_snapshot":     None,
+            "failure_context_checked": True,
         })
         _sim_save_state()
         return
@@ -3360,11 +3426,10 @@ def run_simulation_step(signals: dict) -> None:
         _sim_hourly_log()
         _sim["hourly_next"] = now + 3600
 
-    # Compute stage / leverage / approach for this cycle
+    # Compute stage / leverage for this cycle
+    # Approach is selected per-instrument inside _sim_try_entry
     stage    = _sim.get("stage", "sprout")
     leverage = _sim_phase_leverage(_sim.get("phase", 1))
-    approach = (_SIM_SIZING_ORDER[_sim.get("sizing_idx", 0)]
-                if stage == "sprout" else _SIM_STAGE_APPROACH.get(stage, "pct_5"))
 
     # Read macro regime (full payload for regime-weighted selection)
     global _sim_regime_three_way
@@ -3404,10 +3469,28 @@ def run_simulation_step(signals: dict) -> None:
             _fail_cal_win = dict(_sim.get("win_moves", {}))
             _fail_cal_los = dict(_sim.get("loss_moves", {}))
             _fail_rc      = _sim.get("reset_count", 0) + 1
+            # Capture failure snapshot before _sim_stop publishes calibration
+            _snap_th_f = _sim.get("trade_history", [])
+            _snap_it_f:  dict = {}
+            _snap_iw_f:  dict = {}
+            for _t_f in _snap_th_f:
+                _sym_f = _t_f["instrument"]
+                _snap_it_f[_sym_f] = _snap_it_f.get(_sym_f, 0) + 1
+                _snap_iw_f[_sym_f] = _snap_iw_f.get(_sym_f, 0) + int(_t_f.get("dollar_pnl", 0) > 0)
+            _fail_snapshot = {
+                "timestamp":         int(time.time()),
+                "stop_reason":       f"{stage}_stage_fail",
+                "vol_regime":        {_s: round(sum(_b) / len(_b), 4) for _s, _b in _fail_cal_vol.items() if _b},
+                "instrument_trades": _snap_it_f,
+                "instrument_wr":     {_s: round(_snap_iw_f.get(_s, 0) / _snap_it_f[_s], 3)
+                                      for _s in _snap_it_f if _snap_it_f[_s] > 0},
+            }
             _sim_stop(f"{stage}_stage_fail", signals)  # logs STOPPED+RECOMMENDATION, publishes results
             # Auto-restart: reset to Sprout Stage P1 without manual intervention.
             # vol_history / win_moves / loss_moves carry forward so each retry
             # starts with better-tuned stop/TP values rather than relearning blind.
+            # approach_stats resets so new trial re-explores all approaches per instrument.
+            # failure_snapshot persists so failure-context comparison fires after vol warmup.
             _now_r = time.time()
             _sim_log(f"AUTO-RESTART #{_fail_rc}: resetting to Sprout Stage P1 — calibration preserved")
             _sim.update({
@@ -3427,8 +3510,6 @@ def run_simulation_step(signals: dict) -> None:
                 "phase_entry_balance":  _SIM_START_BALANCE,
                 "phase_consec_losses":  0,
                 "sim_start_time":       _now_r,
-                "sizing_idx":           0,
-                "sizing_rotation_time": _now_r,
                 "open_position":        None,
                 "long_pnl":             0.0,
                 "long_trades":          0,
@@ -3436,7 +3517,7 @@ def run_simulation_step(signals: dict) -> None:
                 "short_pnl":            0.0,
                 "short_trades":         0,
                 "short_wins":           0,
-                "approach_stats":       {k: {"pnl": 0.0, "trades": 0, "wins": 0} for k in _SIM_SIZING_ORDER},
+                "approach_stats":       {},
                 "vol_stats":            {b: {"pnl": 0.0, "trades": 0, "wins": 0} for b in ("high", "mid", "low")},
                 "reset_count":          _fail_rc,
                 "streak_state":         {},
@@ -3447,6 +3528,8 @@ def run_simulation_step(signals: dict) -> None:
                 "vol_history":          _fail_cal_vol,
                 "win_moves":            _fail_cal_win,
                 "loss_moves":           _fail_cal_los,
+                "failure_snapshot":     _fail_snapshot,
+                "failure_context_checked": False,
             })
             _sim_save_state()
             return
@@ -3454,8 +3537,6 @@ def run_simulation_step(signals: dict) -> None:
         # Recompute in case stage changed
         stage    = _sim.get("stage", "sprout")
         leverage = _sim_phase_leverage(_sim.get("phase", 1))
-        approach = (_SIM_SIZING_ORDER[_sim.get("sizing_idx", 0)]
-                    if stage == "sprout" else _SIM_STAGE_APPROACH.get(stage, "pct_5"))
 
     # Weekend block: IG CFD markets close Fri 21:15 UTC → Sun 21:00 UTC.
     # Uses is_weekend_closure() which is UTC-based and DST-safe.
@@ -3470,8 +3551,47 @@ def run_simulation_step(signals: dict) -> None:
     # Vol history: weekdays only — weekend synthetic prices contaminate the signal
     _sim_update_vol_history(signals)
 
+    # One-time failure-context comparison: fires once after vol_history warms up
+    if not _sim.get("failure_context_checked", True):
+        _snap_fc    = _sim.get("failure_snapshot") or {}
+        _cur_vh_f   = _sim.get("vol_history", {})
+        _snap_reg_f = _snap_fc.get("vol_regime", {})
+        if _snap_fc and any(len(_b) >= _SIM_THRESH_MIN_HIST for _b in _cur_vh_f.values()):
+            _sim_log(
+                f"FAILURE-CONTEXT: Prior stop: {_snap_fc.get('stop_reason', '?')}"
+                f" at {datetime.fromtimestamp(_snap_fc.get('timestamp', 0), tz=timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}"
+            )
+            _sim_log(
+                f"FAILURE-CONTEXT: Instrument trades: {_snap_fc.get('instrument_trades', {})}"
+                f" | WR: {_snap_fc.get('instrument_wr', {})}"
+            )
+            for _sym_fc, _cur_hist_fc in _cur_vh_f.items():
+                if not _cur_hist_fc or _sym_fc not in _snap_reg_f:
+                    continue
+                _cur_mean_fc  = sum(_cur_hist_fc) / len(_cur_hist_fc)
+                _fail_mean_fc = _snap_reg_f[_sym_fc]
+                _ratio_fc     = _cur_mean_fc / _fail_mean_fc if _fail_mean_fc > 0 else float("inf")
+                if _ratio_fc > 1.5:
+                    _note_fc = (
+                        f"vol HIGHER now ({_cur_mean_fc:.3f}% vs {_fail_mean_fc:.3f}% at failure)"
+                        " -- conditions shifted, treat calibration as prior"
+                    )
+                elif _ratio_fc < 0.67:
+                    _note_fc = (
+                        f"vol LOWER now ({_cur_mean_fc:.3f}% vs {_fail_mean_fc:.3f}% at failure)"
+                        " -- conditions shifted, treat calibration as prior"
+                    )
+                else:
+                    _note_fc = (
+                        f"vol SIMILAR now ({_cur_mean_fc:.3f}% vs {_fail_mean_fc:.3f}% at failure)"
+                        " -- similar conditions, treat calibration with caution"
+                    )
+                _sim_log(f"FAILURE-CONTEXT: {_sym_fc}: {_note_fc}")
+            _sim["failure_context_checked"] = True
+            _sim_save_state()
+
     # No open position -- look for entry
-    _sim_try_entry(signals, regime, leverage, approach)
+    _sim_try_entry(signals, regime, leverage)
 
 
 # ── Startup / resume ──────────────────────────────────────────────────────────
@@ -3509,8 +3629,6 @@ def sim_startup() -> None:
                 "phase_entry_balance":  _SIM_START_BALANCE,
                 "phase_consec_losses":  0,
                 "sim_start_time":       now,
-                "sizing_idx":           0,
-                "sizing_rotation_time": now,
                 "open_position":        None,
                 "trade_history":        [],
                 "stage_history":        [],
@@ -3523,8 +3641,7 @@ def sim_startup() -> None:
                 "short_pnl":            0.0,
                 "short_trades":         0,
                 "short_wins":           0,
-                "approach_stats":       {k: {"pnl": 0.0, "trades": 0, "wins": 0}
-                                         for k in _SIM_SIZING_ORDER},
+                "approach_stats":       {},
                 "vol_stats":            {b: {"pnl": 0.0, "trades": 0, "wins": 0}
                                          for b in ("high", "mid", "low")},
                 "reset_count":          0,
@@ -3536,6 +3653,8 @@ def sim_startup() -> None:
                 "vol_history":          saved.get("vol_history", {}),
                 "win_moves":            saved.get("win_moves", {}),
                 "loss_moves":           saved.get("loss_moves", {}),
+                "failure_snapshot":     None,
+                "failure_context_checked": True,
             })
             _sim_save_state()
             return
@@ -3555,8 +3674,6 @@ def sim_startup() -> None:
             "phase_entry_balance":  saved.get("phase_entry_balance", saved.get("stage_entry_balance", _SIM_START_BALANCE)),
             "phase_consec_losses":  saved.get("phase_consec_losses", 0),
             "sim_start_time":       saved.get("sim_start_time", now),
-            "sizing_idx":           saved.get("sizing_idx", 0),
-            "sizing_rotation_time": saved.get("sizing_rotation_time", now),
             "open_position":        saved.get("open_position"),
             "trade_history":        saved.get("trade_history", []),
             "stage_history":        saved.get("stage_history", []),
@@ -3569,9 +3686,7 @@ def sim_startup() -> None:
             "short_pnl":            saved.get("short_pnl", 0.0),
             "short_trades":         saved.get("short_trades", 0),
             "short_wins":           saved.get("short_wins", 0),
-            "approach_stats":       saved.get("approach_stats",
-                                              {k: {"pnl": 0.0, "trades": 0, "wins": 0}
-                                               for k in _SIM_SIZING_ORDER}),
+            "approach_stats":       {},
             "vol_stats":            saved.get("vol_stats",
                                               {b: {"pnl": 0.0, "trades": 0, "wins": 0}
                                                for b in ("high", "mid", "low")}),
@@ -3584,6 +3699,8 @@ def sim_startup() -> None:
             "15m_reliability":      saved.get("15m_reliability", {}),
             "win_moves":            saved.get("win_moves", {}),
             "loss_moves":           saved.get("loss_moves", {}),
+            "failure_snapshot":     saved.get("failure_snapshot"),
+            "failure_context_checked": saved.get("failure_context_checked", True),
         })
 
         # Validate sim_start_time -- future timestamps mean state was reconstructed
@@ -3699,8 +3816,6 @@ def sim_startup() -> None:
         "phase_entry_balance":  _SIM_START_BALANCE,
         "phase_consec_losses":  0,
         "sim_start_time":       now,
-        "sizing_idx":           0,
-        "sizing_rotation_time": now,
         "open_position":        None,
         "trade_history":        [],
         "stage_history":        [],
@@ -3713,7 +3828,7 @@ def sim_startup() -> None:
         "short_pnl":            0.0,
         "short_trades":         0,
         "short_wins":           0,
-        "approach_stats":       {k: {"pnl": 0.0, "trades": 0, "wins": 0} for k in _SIM_SIZING_ORDER},
+        "approach_stats":       {},
         "vol_stats":            {b: {"pnl": 0.0, "trades": 0, "wins": 0} for b in ("high", "mid", "low")},
         "reset_count":          0,
         "vol_history":          {},
@@ -3724,6 +3839,8 @@ def sim_startup() -> None:
         "15m_reliability":      {},
         "win_moves":            {},
         "loss_moves":           {},
+        "failure_snapshot":     None,
+        "failure_context_checked": True,
     })
 
     # Restore calibration data from previous session if available
@@ -3732,9 +3849,12 @@ def sim_startup() -> None:
         _cal_raw = _redis().get("june_sim_calibration")
         if _cal_raw:
             _cal = json.loads(_cal_raw)
-            _sim["vol_history"] = _cal.get("vol_history", {})
-            _sim["win_moves"]   = _cal.get("win_moves", {})
-            _sim["loss_moves"]  = _cal.get("loss_moves", {})
+            _sim["vol_history"]  = _cal.get("vol_history", {})
+            _sim["win_moves"]    = _cal.get("win_moves", {})
+            _sim["loss_moves"]   = _cal.get("loss_moves", {})
+            _snap_from_cal       = _cal.get("failure_snapshot")
+            _sim["failure_snapshot"]        = _snap_from_cal
+            _sim["failure_context_checked"] = _snap_from_cal is None
             _cal_loaded = True
             print(
                 f"[{_ts()}] \U0001f9ea SIM: Restored calibration — "
