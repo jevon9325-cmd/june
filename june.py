@@ -3421,7 +3421,96 @@ def run_simulation_step(signals: dict) -> None:
 
     # Global duration stop (runs through overnight so 24h wall-clock is respected)
     if elapsed >= 24 * 3600:
-        _sim_stop("24h duration", signals)
+        # Capture state before _sim_stop() marks stopped=True (does not clear other fields)
+        _24h_stage   = _sim.get("stage", "sprout")
+        _24h_phase   = _sim.get("phase", 1)
+        _24h_bal     = _sim.get("balance", _SIM_START_BALANCE)
+        _24h_st_eb   = _sim.get("stage_entry_balance", _SIM_START_BALANCE)
+        _24h_st_t    = _sim.get("stage_trades", 0)
+        _24h_st_w    = _sim.get("stage_wins", 0)
+        _24h_st_l    = _sim.get("stage_losses", 0)
+        _24h_tot_w   = _sim.get("total_wins", 0)
+        _24h_tot_l   = _sim.get("total_losses", 0)
+        _24h_lpnl    = _sim.get("long_pnl", 0.0)
+        _24h_lt      = _sim.get("long_trades", 0)
+        _24h_lw      = _sim.get("long_wins", 0)
+        _24h_spnl    = _sim.get("short_pnl", 0.0)
+        _24h_strd    = _sim.get("short_trades", 0)
+        _24h_sw      = _sim.get("short_wins", 0)
+        _24h_rc      = _sim.get("reset_count", 0) + 1
+        _24h_vh      = dict(_sim.get("vol_history", {}))
+        _24h_wm      = dict(_sim.get("win_moves", {}))
+        _24h_lm      = dict(_sim.get("loss_moves", {}))
+        _24h_ast     = dict(_sim.get("approach_stats", {}))
+        _24h_vs      = dict(_sim.get("vol_stats", {}))
+        _24h_th      = list(_sim.get("trade_history", []))
+        _24h_sh      = list(_sim.get("stage_history", []))
+        _24h_snap_it: dict = {}
+        _24h_snap_iw: dict = {}
+        for _t24 in _24h_th:
+            _s24 = _t24["instrument"]
+            _24h_snap_it[_s24] = _24h_snap_it.get(_s24, 0) + 1
+            _24h_snap_iw[_s24] = _24h_snap_iw.get(_s24, 0) + int(_t24.get("dollar_pnl", 0) > 0)
+        _24h_fail_snap = {
+            "timestamp":         int(time.time()),
+            "stop_reason":       "24h duration",
+            "vol_regime":        {_s: round(sum(_b) / len(_b), 4) for _s, _b in _24h_vh.items() if _b},
+            "instrument_trades": _24h_snap_it,
+            "instrument_wr":     {_s: round(_24h_snap_iw.get(_s, 0) / _24h_snap_it[_s], 3)
+                                  for _s in _24h_snap_it if _24h_snap_it[_s] > 0},
+        }
+        _sim_stop("24h duration", signals)  # closes position, publishes results, marks stopped=True
+        # Auto-restart: same stage/phase, fresh 24h clock. A time-based stop is not a
+        # strategy failure -- graduation progress and balance carry forward.
+        _24h_now = time.time()
+        _sim_log(
+            f"AUTO-RESTART #{_24h_rc}: 24h clock expired -- resuming {_24h_stage.upper()} "
+            f"stage P{_24h_phase} (balance ${_24h_bal:.2f}, "
+            f"{_24h_st_t} stage trades) -- calibration preserved"
+        )
+        _sim.update({
+            "active":               True,
+            "stopped":              False,
+            "stop_reason":          "",
+            "balance":              _24h_bal,
+            "stage":                _24h_stage,
+            "stage_entry_balance":  _24h_st_eb,
+            "stage_trades":         _24h_st_t,
+            "stage_wins":           _24h_st_w,
+            "stage_losses":         _24h_st_l,
+            "total_wins":           _24h_tot_w,
+            "total_losses":         _24h_tot_l,
+            "phase":                _24h_phase,
+            "phase_start_time":     _24h_now,
+            "phase_entry_balance":  _24h_bal,
+            "phase_consec_losses":  0,
+            "sim_start_time":       _24h_now,
+            "open_position":        None,
+            "trade_history":        _24h_th,
+            "stage_history":        _24h_sh,
+            "hourly_next":          _24h_now + 3600,
+            "long_pnl":             _24h_lpnl,
+            "long_trades":          _24h_lt,
+            "long_wins":            _24h_lw,
+            "short_pnl":            _24h_spnl,
+            "short_trades":         _24h_strd,
+            "short_wins":           _24h_sw,
+            "approach_stats":       _24h_ast,
+            "vol_stats":            _24h_vs,
+            "reset_count":          _24h_rc,
+            "streak_state":         {},
+            "boost_expiry":         {},
+            "pause_expiry":         {},
+            "last_entry_time":      _24h_now,
+            "15m_reliability":      {},
+            "vol_history":          _24h_vh,
+            "win_moves":            _24h_wm,
+            "loss_moves":           _24h_lm,
+            "failure_snapshot":     _24h_fail_snap,
+            "failure_context_checked": False,
+            "approach_skip_counts": {},
+        })
+        _sim_save_state()
         return
 
     # Balance floor auto-reset (runs through overnight)
@@ -3440,6 +3529,35 @@ def run_simulation_step(signals: dict) -> None:
             f"${_SIM_START_BALANCE:.2f} Sprout Stage",
             flush=True,
         )
+        # Build failure snapshot so next run can compare conditions against this failure
+        _snap_th_bf: list = _sim.get("trade_history", [])
+        _snap_it_bf: dict = {}
+        _snap_iw_bf: dict = {}
+        for _t_bf in _snap_th_bf:
+            _sym_bf = _t_bf["instrument"]
+            _snap_it_bf[_sym_bf] = _snap_it_bf.get(_sym_bf, 0) + 1
+            _snap_iw_bf[_sym_bf] = _snap_iw_bf.get(_sym_bf, 0) + int(_t_bf.get("dollar_pnl", 0) > 0)
+        _snap_vh_bf = _sim.get("vol_history", {})
+        _floor_fail_snap = {
+            "timestamp":         int(now_r),
+            "stop_reason":       "balance_floor",
+            "vol_regime":        {_s: round(sum(_b) / len(_b), 4) for _s, _b in _snap_vh_bf.items() if _b},
+            "instrument_trades": _snap_it_bf,
+            "instrument_wr":     {_s: round(_snap_iw_bf.get(_s, 0) / _snap_it_bf[_s], 3)
+                                  for _s in _snap_it_bf if _snap_it_bf[_s] > 0},
+        }
+        # Write calibration so failure context survives a service restart
+        try:
+            _r_bf = _redis()
+            _cal_bf = {
+                "vol_history":      _sim.get("vol_history", {}),
+                "win_moves":        _sim.get("win_moves", {}),
+                "loss_moves":       _sim.get("loss_moves", {}),
+                "failure_snapshot": _floor_fail_snap,
+            }
+            _r_bf.set("june_sim_calibration", json.dumps(_cal_bf), ex=7 * 24 * 3600)
+        except Exception as _exc_bf:
+            _sim_log(f"Redis calibration write failed (balance_floor): {_exc_bf}")
         _sim.update({
             "balance":              _SIM_START_BALANCE,
             "stage":                "sprout",
@@ -3458,8 +3576,8 @@ def run_simulation_step(signals: dict) -> None:
             "pause_expiry":         {},
             "last_entry_time":      now_r,
             "15m_reliability":      {},
-            "failure_snapshot":     None,
-            "failure_context_checked": True,
+            "failure_snapshot":     _floor_fail_snap,
+            "failure_context_checked": False,
             "approach_skip_counts": {},
         })
         _sim_save_state()
