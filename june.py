@@ -281,6 +281,7 @@ _live_available: bool = False  # True after successful live account auth
 
 # Rolling price history: {sym: deque([(epoch, mid), ...])}
 _history: dict = {sym: deque(maxlen=HISTORY_LEN) for sym in INSTRUMENTS}
+_no_history_warned: set = set()   # instruments logged no-5m-history this run
 
 # Rolling spread history: {sym: deque([spread_pct, ...])} — ~1h at 60s
 _spread_hist: dict = {sym: deque(maxlen=SPREAD_HISTORY_LEN) for sym in INSTRUMENTS}
@@ -1036,9 +1037,11 @@ def compute_signal(sym: str, price: dict, spread_alert: bool = False) -> dict:
     spread_pct = (price["spread"] / mid * 100.0) if mid > 0 else 0.0
     px5        = _price_n_minutes_ago(sym, 5)
     px15       = _price_n_minutes_ago(sym, 15)
-    change_5m  = ((mid - px5)  / px5  * 100.0) if px5  else 0.0
-    change_15m = ((mid - px15) / px15 * 100.0) if px15 else 0.0
-    if   change_5m >  0.05:
+    change_5m  = ((mid - px5)  / px5  * 100.0) if px5  is not None else None
+    change_15m = ((mid - px15) / px15 * 100.0) if px15 is not None else None
+    if change_5m is None:
+        direction = "no_history"
+    elif change_5m >  0.05:
         direction = "bull"
     elif change_5m < -0.05:
         direction = "bear"
@@ -1046,8 +1049,8 @@ def compute_signal(sym: str, price: dict, spread_alert: bool = False) -> dict:
         direction = "neutral"
     return {
         "price":        round(mid, 6),
-        "change_5m":    round(change_5m,  4),
-        "change_15m":   round(change_15m, 4),
+        "change_5m":    (round(change_5m,  4) if change_5m  is not None else None),
+        "change_15m":   (round(change_15m, 4) if change_15m is not None else None),
         "direction":    direction,
         "spread_pct":   round(spread_pct, 4),
         "spread_alert": spread_alert,
@@ -2092,6 +2095,11 @@ def poll_cycle() -> bool:
             )
 
         sig = compute_signal(sym, price, spread_alert=spread_alert)
+        if sig["change_5m"] is None:
+            if sym not in _no_history_warned:
+                print(f"[{_ts()}] {sym}: warming up -- no 5m price history yet", flush=True)
+                _no_history_warned.add(sym)
+            continue
         signals[sym] = sig
         if abs(sig["change_5m"]) >= MOMENTUM_PCT:
             alerts.append(sym)
