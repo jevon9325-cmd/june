@@ -2051,10 +2051,11 @@ def _annotate_exit_warnings_with_sync(desynced_bases: set, sync_status: dict) ->
 def poll_cycle() -> bool:
     """Fetch all instrument prices, update state, publish june_signals. Returns True if prices returned."""
     now          = time.time()
-    signals      = {}
-    alerts       = []
-    spread_avgs  = {}
-    current_mids = {}
+    signals       = {}
+    alerts        = []
+    spread_avgs   = {}
+    current_mids  = {}
+    warmup_skipped = 0
 
     for sym, epic in list(INSTRUMENTS.items()):
         price = fetch_price(epic)
@@ -2099,12 +2100,15 @@ def poll_cycle() -> bool:
             if sym not in _no_history_warned:
                 print(f"[{_ts()}] {sym}: warming up -- no 5m price history yet", flush=True)
                 _no_history_warned.add(sym)
+            warmup_skipped += 1
             continue
         signals[sym] = sig
         if abs(sig["change_5m"]) >= MOMENTUM_PCT:
             alerts.append(sym)
 
     if not signals:
+        if warmup_skipped > 0:
+            return True
         print(f"[{_ts()}] ⚠️  Poll cycle: no prices returned", flush=True)
         return False
 
