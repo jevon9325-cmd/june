@@ -3835,6 +3835,7 @@ def sim_startup() -> None:
                 else:
                     print(f"[{_ts()}] \U0001f9ea SIM:   {_sym}: EXCLUDED  -- IG min ~${_min_usd:.2f} exceeds ${_max_eff:.0f} effective max", flush=True)
                 import time as _time; _time.sleep(0.3)
+            _sim_save_state()  # persist new eligibility immediately so future restarts skip re-query
 
         now = time.time()
 
