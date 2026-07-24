@@ -2466,14 +2466,9 @@ def _sim_unlock_seedling_instruments() -> None:
         bid     = float(snap.get("bid") or 0)
         offer   = float(snap.get("offer") or 0)
         mid     = (bid + offer) / 2.0 if bid and offer else 0.0
-        ccy0    = inst.get("currencies", [{}])[0] if inst.get("currencies") else {}
-        ccy     = ccy0.get("code", "USD")
-        if ccy == "GBP":
-            min_usd = min_val * lot_sz * mid * _SIM_APPROX_GBPUSD
-        elif ccy == "JPY":
-            min_usd = (min_val * lot_sz * mid) / _SIM_APPROX_USDJPY
-        else:
-            min_usd = min_val * lot_sz * mid
+        ccy0      = inst.get("currencies", [{}])[0] if inst.get("currencies") else {}
+        fx_base   = float(ccy0.get("baseExchangeRate") or 1.0) or 1.0
+        min_usd   = (min_val * lot_sz * mid) / fx_base
         if min_usd <= max_effective:
             _sim_eligible.add(sym)
             _sim_min_notional[sym] = round(min_usd, 2)
@@ -3819,14 +3814,9 @@ def sim_startup() -> None:
                 _bid     = float(_snap.get("bid") or 0)
                 _offer   = float(_snap.get("offer") or 0)
                 _mid     = (_bid + _offer) / 2.0 if _bid and _offer else 0.0
-                _ccy0    = _inst.get("currencies", [{}])[0] if _inst.get("currencies") else {}
-                _ccy     = _ccy0.get("code", "USD")
-                if _ccy == "GBP":
-                    _min_usd = _min_val * _lot_sz * _mid * _SIM_APPROX_GBPUSD
-                elif _ccy == "JPY":
-                    _min_usd = (_min_val * _lot_sz * _mid) / _SIM_APPROX_USDJPY
-                else:
-                    _min_usd = _min_val * _lot_sz * _mid
+                _ccy0     = _inst.get("currencies", [{}])[0] if _inst.get("currencies") else {}
+                _fx_base  = float(_ccy0.get("baseExchangeRate") or 1.0) or 1.0
+                _min_usd  = (_min_val * _lot_sz * _mid) / _fx_base
                 # Store min_notional regardless of eligibility so we don't re-query on every restart
                 _sim_min_notional[_sym] = round(_min_usd, 2)
                 if _min_usd <= _max_eff:
@@ -4020,15 +4010,9 @@ def sim_startup() -> None:
         bid     = float(snap.get("bid") or 0)
         offer   = float(snap.get("offer") or 0)
         mid     = (bid + offer) / 2.0 if bid and offer else 0.0
-        ccy0    = inst.get("currencies", [{}])[0] if inst.get("currencies") else {}
-        ccy     = ccy0.get("code", "USD")
-
-        if ccy == "GBP":
-            min_usd = min_val * lot_sz * mid * _SIM_APPROX_GBPUSD
-        elif ccy == "JPY":
-            min_usd = (min_val * lot_sz * mid) / _SIM_APPROX_USDJPY
-        else:
-            min_usd = min_val * lot_sz * mid
+        ccy0     = inst.get("currencies", [{}])[0] if inst.get("currencies") else {}
+        fx_base  = float(ccy0.get("baseExchangeRate") or 1.0) or 1.0
+        min_usd  = (min_val * lot_sz * mid) / fx_base
 
         max_eff = _SIM_START_BALANCE * 0.10 * _SIM_AGGRESSIVE_LEV
         if min_usd <= max_eff:
