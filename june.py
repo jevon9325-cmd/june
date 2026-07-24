@@ -2263,8 +2263,8 @@ _SIM_1M_MIN_REVERSAL = 0.030 # 1m gate: min % price move to qualify as a real re
 
 # ── Stage definitions ─────────────────────────────────────────────────────────
 _SIM_STAGE_DEFS = {
-    "sprout":      {"label": "SPROUT",      "min_trades": 10, "min_wr": 0.50, "min_pnl_pct": 0.00, "fail_after": 30},
-    "seedling":    {"label": "SEEDLING",    "min_trades": 15, "min_wr": 0.55, "min_pnl_pct": 0.20, "fail_after": 40},
+    "sprout":      {"label": "SPROUT",      "min_trades": 7,  "min_wr": 0.50, "min_pnl_pct": 0.00, "fail_after": 30},
+    "seedling":    {"label": "SEEDLING",    "min_trades": 10, "min_wr": 0.55, "min_pnl_pct": 0.20, "fail_after": 40},
     "germination": {"label": "GERMINATION", "min_trades": 20, "min_wr": 0.55, "min_pnl_pct": 0.30, "fail_after": 50},
     "vegetative":  {"label": "VEGETATIVE",  "min_trades": 25, "min_wr": 0.60, "min_pnl_pct": 0.25, "fail_after": 60},
     "full_bloom":  {"label": "FULL BLOOM",  "min_trades":  0, "min_wr": 0.00, "min_pnl_pct": 0.00, "fail_after": None},
@@ -2273,7 +2273,7 @@ _SIM_STAGE_ORDER = ["sprout", "seedling", "germination", "vegetative", "full_blo
 
 # ── Stage approach map (non-sprout sizing) ────────────────────────────────────
 _SIM_STAGE_APPROACH = {
-    "seedling": "pct_5", "germination": "pct_3",
+    "seedling": "pct_10", "germination": "pct_3",
     "vegetative": "pct_2", "full_bloom": "pct_2",
 }
 
@@ -2559,7 +2559,7 @@ def _sim_position_size(balance: float, approach: str) -> float:
         if approach == "pct_5":    return round(balance * 0.05, 2)
         if approach == "pct_10":   return round(balance * 0.10, 2)
         return 5.0
-    if stage == "seedling":    return round(balance * 0.05, 2)
+    if stage == "seedling":    return round(balance * 0.10, 2)
     if stage == "germination": return round(balance * 0.03, 2)
     if stage == "vegetative":  return round(balance * 0.02, 2)
     return round(balance * 0.05, 2)
