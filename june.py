@@ -203,6 +203,12 @@ INSTRUMENTS: dict = {
     "GOLD":   "CS.D.IN_GOLD.MFI.IP",   # discovered: Spot Gold
     "SILVER": "CS.D.CFDSILVER.CFM.IP", # discovered: Mini Spot Silver (500oz)
     "OIL":    "CC.D.LCO.USS.IP",       # verified demo
+    # Additional forex majors/minors — eligibility checked at startup against IG min notional
+    "AUDUSD": "CS.D.AUDUSD.CFD.IP",    # AUD/USD — ~$6 min notional (similar lot structure to EURUSD)
+    "USDCAD": "CS.D.USDCAD.CFD.IP",    # USD/CAD — ~$14 min notional
+    "EURGBP": "CS.D.EURGBP.CFD.IP",    # EUR/GBP — GBP-denominated, ~$11 min notional
+    "NZDUSD": "CS.D.NZDUSD.CFD.IP",    # NZD/USD — ~$6 min notional
+    "USDCHF": "CS.D.USDCHF.CFD.IP",    # USD/CHF — ~$9 min notional
 }
 
 _SEARCH_FALLBACKS: dict = {
@@ -215,6 +221,11 @@ _SEARCH_FALLBACKS: dict = {
     "GOLD":   "Gold",
     "SILVER": "Silver",
     "OIL":    "Brent Crude",
+    "AUDUSD": "AUD/USD",
+    "USDCAD": "USD/CAD",
+    "EURGBP": "EUR/GBP",
+    "NZDUSD": "NZD/USD",
+    "USDCHF": "USD/CHF",
 }
 
 # Historically correlated pairs to watch for overnight divergence.
@@ -2195,6 +2206,11 @@ _SIM_SPREAD_FLOORS = {
     "GBPUSD": 0.0005,   # 0.05%
     "EURUSD": 0.0004,   # 0.04%
     "USDJPY": 0.0004,   # 0.04%
+    "AUDUSD": 0.0006,   # 0.06% — slightly wider than majors
+    "USDCAD": 0.0007,   # 0.07%
+    "EURGBP": 0.0006,   # 0.06%
+    "NZDUSD": 0.0009,   # 0.09% — thinner liquidity
+    "USDCHF": 0.0006,   # 0.06%
 }
 
 # Asymmetric reversal: losing positions exit faster than winning ones
@@ -2715,9 +2731,9 @@ def _sim_get_tp(sym: str, direction: str) -> float:
     # True cold-start (zero history): instrument-type micro-defaults
     if "JPY" in sym:
         return 0.0003
-    if sym in ("GBPUSD", "EURUSD"):
-        return 0.0002
-    return 0.0004   # SILVER and other commodities
+    if sym == "SILVER":
+        return 0.0004   # commodity with wide spread — needs bigger move to profit
+    return 0.0002   # all forex pairs (EURUSD, GBPUSD, AUDUSD, USDCAD, EURGBP, NZDUSD, USDCHF…)
 
 
 def _sim_get_dynamic_stop(sym: str) -> float:
@@ -2789,6 +2805,8 @@ def _sim_select_instrument(signals: dict, regime: str):
         thresh = _sim_get_threshold(sym, direction_str, low_tier=(vbkt == "low"))
         if vol < thresh:
             continue
+        if sig.get("spread_alert"):
+            continue  # spread currently elevated (>3x avg) — skip to avoid wide fill cost
         if direction_str and _sim_is_paused(_sim_combo_key(sym, direction_str)):
             exp = (_sim.get("pause_expiry") or {}).get(_sim_combo_key(sym, direction_str), 0.0)
             resume = datetime.fromtimestamp(exp, tz=timezone.utc).strftime("%H:%M UTC")
@@ -3084,6 +3102,11 @@ def _sim_try_entry(signals: dict, regime: str, leverage: int) -> None:
         )
     stop_px  = fill * (1 - stop_pct) if direction == "long" else fill * (1 + stop_pct)
     tp_pct   = _sim_get_tp(sym, direction)
+    # Ensure TP covers at least 1x baseline spread (entry fill is at offer/bid, so
+    # the price must move >= 1x spread from mid before TP becomes reachable).
+    _tp_spread_floor = _sim_get_spread_floor(sym) / 2   # spread_floor = 2x spread -> half = 1x
+    if tp_pct < _tp_spread_floor:
+        tp_pct = _tp_spread_floor
     tp_px    = fill * (1 + tp_pct)   if direction == "long" else fill * (1 - tp_pct)
     _tp_wins = (_sim.get("win_moves") or {}).get(sym + "_" + direction, [])
     _tp_src  = (f"avg_win {(sum(_tp_wins)/len(_tp_wins))*100:.3f}%×{int(_SIM_TP_WIN_FRACTION*100)}%"
