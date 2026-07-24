@@ -3835,7 +3835,18 @@ def sim_startup() -> None:
                 else:
                     print(f"[{_ts()}] \U0001f9ea SIM:   {_sym}: EXCLUDED  -- IG min ~${_min_usd:.2f} exceeds ${_max_eff:.0f} effective max", flush=True)
                 import time as _time; _time.sleep(0.3)
-            _sim_save_state()  # persist new eligibility immediately so future restarts skip re-query
+            # Persist eligibility now -- _sim is empty at this point so _sim_save_state()
+            # would be a no-op. Do a targeted Redis patch instead.
+            try:
+                _cur_raw = _redis().get("june_sim_state")
+                if _cur_raw:
+                    _cur_st = json.loads(_cur_raw)
+                    _cur_st["eligible_instruments"] = sorted(_sim_eligible)
+                    _cur_st["min_notionals"] = _sim_min_notional
+                    _redis().set("june_sim_state", json.dumps(_cur_st), ex=72 * 3600)
+                    print(f"[{_ts()}] 🧪 SIM: Eligibility backfill saved to Redis ({len(_sim_eligible)} eligible)", flush=True)
+            except Exception as _e:
+                print(f"[{_ts()}] 🧪 SIM: Eligibility backfill save failed: {_e}", flush=True)
 
         now = time.time()
 
