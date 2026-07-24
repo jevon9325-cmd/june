@@ -3797,6 +3797,45 @@ def sim_startup() -> None:
         _sim_eligible     = set(saved.get("eligible_instruments", []))
         _sim_min_notional = saved.get("min_notionals", {})
 
+        # Backfill eligibility for instruments added to INSTRUMENTS since last save.
+        # min_notionals stores all queried instruments (eligible or not) so we only
+        # query instruments that have never been seen before.
+        _missing_syms = [s for s in INSTRUMENTS
+                         if s not in _sim_min_notional and s not in _sim_eligible]
+        if _missing_syms:
+            _max_eff = _SIM_START_BALANCE * 0.10 * _SIM_AGGRESSIVE_LEV
+            print(f"[{_ts()}] \U0001f9ea SIM: Backfilling eligibility for {len(_missing_syms)} new instruments: {_missing_syms}", flush=True)
+            for _sym in _missing_syms:
+                _epic = INSTRUMENTS[_sym]
+                _data = _ig_get(f"/markets/{_epic}")
+                if not _data:
+                    print(f"[{_ts()}] \U0001f9ea SIM:   {_sym}: API query failed -- skipping", flush=True)
+                    continue
+                _inst    = _data.get("instrument", {})
+                _deal    = _data.get("dealingRules", {})
+                _snap    = _data.get("snapshot", {})
+                _min_val = float(_deal.get("minDealSize", {}).get("value", 1.0))
+                _lot_sz  = float(_inst.get("lotSize", 1.0))
+                _bid     = float(_snap.get("bid") or 0)
+                _offer   = float(_snap.get("offer") or 0)
+                _mid     = (_bid + _offer) / 2.0 if _bid and _offer else 0.0
+                _ccy0    = _inst.get("currencies", [{}])[0] if _inst.get("currencies") else {}
+                _ccy     = _ccy0.get("code", "USD")
+                if _ccy == "GBP":
+                    _min_usd = _min_val * _lot_sz * _mid * _SIM_APPROX_GBPUSD
+                elif _ccy == "JPY":
+                    _min_usd = (_min_val * _lot_sz * _mid) / _SIM_APPROX_USDJPY
+                else:
+                    _min_usd = _min_val * _lot_sz * _mid
+                # Store min_notional regardless of eligibility so we don't re-query on every restart
+                _sim_min_notional[_sym] = round(_min_usd, 2)
+                if _min_usd <= _max_eff:
+                    _sim_eligible.add(_sym)
+                    print(f"[{_ts()}] \U0001f9ea SIM:   {_sym}: ELIGIBLE  -- IG min notional ~${_min_usd:.2f}", flush=True)
+                else:
+                    print(f"[{_ts()}] \U0001f9ea SIM:   {_sym}: EXCLUDED  -- IG min ~${_min_usd:.2f} exceeds ${_max_eff:.0f} effective max", flush=True)
+                import time as _time; _time.sleep(0.3)
+
         now = time.time()
 
         # One-time fresh reset: wipe state if saved before _SIM_RESET_AFTER, preserve vol/move data
