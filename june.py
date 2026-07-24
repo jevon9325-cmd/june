@@ -197,12 +197,12 @@ INSTRUMENTS: dict = {
     "EURUSD": "CS.D.EURUSD.CFD.IP",    # verified demo
     "GBPUSD": "CS.D.GBPUSD.CFD.IP",    # verified demo
     "USDJPY": "CS.D.USDJPY.CFD.IP",    # verified demo
-    "SPX500": "IX.D.SPTRD.IFD.IP",     # discovered: US 500 Cash ($250)
+    "SPX500": "IX.D.SPTRD.IFM.IP",     # smaller variant: US 500 Cash ($50) -- $14,802 min vs $1,850,278 for .IFD.IP
     "GER40":  "IX.D.DAX.IFD.IP",       # discovered: Germany 40 Cash (E25)
     "UK100":  "IX.D.FTSE.CFD.IP",      # verified demo
-    "GOLD":   "CS.D.IN_GOLD.MFI.IP",   # discovered: Spot Gold
+    "GOLD":   "CS.D.CFDGOLD.BMU.IP",   # smaller variant: Spot Gold ($1) -- $406 min vs $4,059 for .MFI.IP
     "SILVER": "CS.D.CFDSILVER.CFM.IP", # discovered: Mini Spot Silver (500oz)
-    "OIL":    "CC.D.LCO.USS.IP",       # verified demo
+    "OIL":    "CC.D.LCO.BMU.IP",       # smaller variant: Oil - Brent Crude ($1) -- $9,244 min vs $123,197 for .USS.IP
     # Additional forex majors/minors — eligibility checked at startup against IG min notional
     "AUDUSD": "CS.D.AUDUSD.CFD.IP",    # AUD/USD — ~$6 min notional (similar lot structure to EURUSD)
     "USDCAD": "CS.D.USDCAD.CFD.IP",    # USD/CAD — ~$14 min notional
@@ -596,8 +596,10 @@ def discover_epic(sym: str) -> Optional[str]:
     if not markets:
         print(f"[{_ts()}]   🔍 No results for '{term}'", flush=True)
         return None
-    cfd  = [m for m in markets if "CFD" in m.get("instrumentType", "")]
-    pool = cfd if cfd else markets
+    # Exclude share CFDs (.CASH. epics) which pollute commodity/metal searches
+    non_stock = [m for m in markets if ".CASH." not in m.get("epic", "")]
+    cfd  = [m for m in non_stock if "CFD" in m.get("instrumentType", "")]
+    pool = cfd if cfd else (non_stock if non_stock else markets)
     best = pool[0]
     epic = best.get("epic", "")
     name = best.get("instrumentName", "?")
