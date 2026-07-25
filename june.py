@@ -58,6 +58,7 @@ IG_LIVE_KEY  = os.environ.get("IG_LIVE_API_KEY", "")
 IG_LIVE_USER = os.environ.get("IG_LIVE_USERNAME", "")
 IG_LIVE_PASS     = os.environ.get("IG_LIVE_PASSWORD", "")
 MARKETAUX_API_KEY = os.environ.get("MARKETAUX_API_KEY", "")
+FINNHUB_KEY       = os.environ.get("FINNHUB_API_KEY", "")   # equity REST quotes
 
 REDIS_HOST  = os.environ.get("REDIS_HOST", "")
 REDIS_PORT  = int(os.environ.get("REDIS_PORT", 15074))
@@ -209,7 +210,19 @@ INSTRUMENTS: dict = {
     "EURGBP": "CS.D.EURGBP.CFD.IP",    # EUR/GBP — GBP-denominated, ~$11 min notional
     "NZDUSD": "CS.D.NZDUSD.CFD.IP",    # NZD/USD — ~$6 min notional
     "USDCHF": "CS.D.USDCHF.CFD.IP",    # USD/CHF — ~$9 min notional
+    # US equity CFDs — priced via Finnhub REST (IG REST returns streamingPricesAvailable=False)
+    # Epics confirmed from direct_cfd_map on live IG account
+    "NVDA": "UC.D.NVDA.CASH.IP",       # NVIDIA Corp
+    "TSLA": "UD.D.TSLA.CASH.IP",       # Tesla Inc
+    "AAPL": "UA.D.AAPL.CASH.IP",       # Apple Inc
+    "MSFT": "UC.D.MSFT.CASH.IP",       # Microsoft Corp
+    "AMD":  "SA.D.AMD.CASH.IP",        # Advanced Micro Devices
+    "INTC": "UB.D.INTC.CASH.IP",       # Intel Corp
+    "MU":   "UC.D.MU.CASH.IP",         # Micron Technology
 }
+
+# Reverse lookup: epic → base symbol (used to route .CASH.IP epics to Finnhub)
+_INSTRUMENTS_REVERSE: dict = {v: k for k, v in INSTRUMENTS.items()}
 
 _SEARCH_FALLBACKS: dict = {
     "EURUSD": "EUR/USD",
@@ -571,8 +584,41 @@ def _ig_live_get(path: str, params: Optional[dict] = None, version: str = "1") -
         return None
 
 
+def _finnhub_price(sym: str) -> Optional[dict]:
+    """Return bid/offer/mid/spread for a US equity using Finnhub REST.
+    Used for .CASH.IP epics where IG REST returns streamingPricesAvailable=False.
+    Spread is synthetic: max(1% of day range, 0.05% of mid).
+    """
+    if not FINNHUB_KEY:
+        return None
+    try:
+        r = requests.get(
+            f"https://finnhub.io/api/v1/quote?symbol={sym}&token={FINNHUB_KEY}",
+            timeout=8,
+        )
+        if r.status_code != 200:
+            print(f"[{_ts()}] ⚠️  Finnhub {sym}: HTTP {r.status_code}", flush=True)
+            return None
+        d = r.json()
+        mid = float(d.get("c") or 0.0)
+        if mid <= 0:
+            return None
+        h      = float(d.get("h") or mid)
+        l      = float(d.get("l") or mid)
+        # Synthetic spread: 1% of day range, floored at 0.05% of mid
+        spread = max((h - l) * 0.01, mid * 0.0005)
+        half   = spread / 2.0
+        return {"bid": mid - half, "offer": mid + half, "mid": mid, "spread": spread}
+    except Exception as exc:
+        print(f"[{_ts()}] ⚠️  Finnhub {sym}: {exc}", flush=True)
+        return None
+
+
 def fetch_price(epic: str) -> Optional[dict]:
     """Return bid/offer/mid/spread for an epic, or None on any error."""
+    if ".CASH." in epic:
+        sym = _INSTRUMENTS_REVERSE.get(epic)
+        return _finnhub_price(sym) if sym else None
     data = _ig_get(f"/markets/{epic}")
     if not data:
         return None
@@ -2213,6 +2259,9 @@ _SIM_SPREAD_FLOORS = {
     "EURGBP": 0.0006,   # 0.06%
     "NZDUSD": 0.0009,   # 0.09% — thinner liquidity
     "USDCHF": 0.0006,   # 0.06%
+    # US equity CFDs — synthetic spread from Finnhub (IG bid/offer unavailable)
+    "NVDA": 0.0010, "TSLA": 0.0012, "AAPL": 0.0008,
+    "MSFT": 0.0008, "AMD":  0.0010, "INTC": 0.0012, "MU": 0.0010,
 }
 
 # Asymmetric reversal: losing positions exit faster than winning ones
@@ -2468,6 +2517,13 @@ def _sim_unlock_seedling_instruments() -> None:
         bid     = float(snap.get("bid") or 0)
         offer   = float(snap.get("offer") or 0)
         mid     = (bid + offer) / 2.0 if bid and offer else 0.0
+        # Equity CFDs: IG returns null bid/offer — fetch price via Finnhub
+        if mid == 0.0 and ".CASH." in epic:
+            fh_sym = _INSTRUMENTS_REVERSE.get(epic)
+            if fh_sym:
+                fh = _finnhub_price(fh_sym)
+                if fh:
+                    mid = fh["mid"]
         ccy0      = inst.get("currencies", [{}])[0] if inst.get("currencies") else {}
         fx_base   = float(ccy0.get("baseExchangeRate") or 1.0) or 1.0
         min_usd   = (min_val * lot_sz * mid) / fx_base
@@ -3816,6 +3872,13 @@ def sim_startup() -> None:
                 _bid     = float(_snap.get("bid") or 0)
                 _offer   = float(_snap.get("offer") or 0)
                 _mid     = (_bid + _offer) / 2.0 if _bid and _offer else 0.0
+                # Equity CFDs: IG returns null bid/offer — fetch price via Finnhub
+                if _mid == 0.0 and ".CASH." in _epic:
+                    _fh_sym = _INSTRUMENTS_REVERSE.get(_epic)
+                    if _fh_sym:
+                        _fh = _finnhub_price(_fh_sym)
+                        if _fh:
+                            _mid = _fh["mid"]
                 _ccy0     = _inst.get("currencies", [{}])[0] if _inst.get("currencies") else {}
                 _fx_base  = float(_ccy0.get("baseExchangeRate") or 1.0) or 1.0
                 _min_usd  = (_min_val * _lot_sz * _mid) / _fx_base
@@ -4012,6 +4075,13 @@ def sim_startup() -> None:
         bid     = float(snap.get("bid") or 0)
         offer   = float(snap.get("offer") or 0)
         mid     = (bid + offer) / 2.0 if bid and offer else 0.0
+        # Equity CFDs: IG returns null bid/offer — fetch price via Finnhub
+        if mid == 0.0 and ".CASH." in epic:
+            fh_sym = _INSTRUMENTS_REVERSE.get(epic)
+            if fh_sym:
+                fh = _finnhub_price(fh_sym)
+                if fh:
+                    mid = fh["mid"]
         ccy0     = inst.get("currencies", [{}])[0] if inst.get("currencies") else {}
         fx_base  = float(ccy0.get("baseExchangeRate") or 1.0) or 1.0
         min_usd  = (min_val * lot_sz * mid) / fx_base
