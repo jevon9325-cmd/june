@@ -35,6 +35,7 @@ Future Miss Secretary integration point (alert_system.py):
 """
 
 import json
+import math
 import os
 import sys
 import time
@@ -3131,14 +3132,26 @@ def _sim_try_entry(signals: dict, regime: str, leverage: int) -> None:
             _sim_log(f"Skip {sym}: position size ${pos_size:.2f} < $1 floor")
             return
         if not _sim_check_min_feasible(sym, pos_size, leverage):
-            min_n = _sim_min_notional.get(sym, 0)
-            _sc_ns = _sim.setdefault("approach_skip_counts", {}).setdefault(sym, {})
-            for _a_ns in _SIM_SIZING_ORDER:
-                _sd_ns = _sc_ns.setdefault(_a_ns, {"count": 0, "balance": 0.0})
-                _sd_ns["count"] += 1
-                _sd_ns["balance"] = balance
-            _sim_log(f"Skip {sym}: effective ${pos_size * leverage:.2f} < IG min ${min_n:.2f}")
-            return
+            min_n      = _sim_min_notional.get(sym, 0)
+            max_cap    = balance * 0.20
+            min_needed = math.ceil(min_n / leverage * 100) / 100
+            if min_needed <= max_cap:
+                _sim_log(
+                    f"Size up {sym}: {approach} ${pos_size:.2f} → ${min_needed:.2f} "
+                    f"(min notional escalation, {min_needed / balance * 100:.0f}% of balance)"
+                )
+                pos_size = min_needed
+            else:
+                _sc_ns = _sim.setdefault("approach_skip_counts", {}).setdefault(sym, {})
+                for _a_ns in _SIM_SIZING_ORDER:
+                    _sd_ns = _sc_ns.setdefault(_a_ns, {"count": 0, "balance": 0.0})
+                    _sd_ns["count"] += 1
+                    _sd_ns["balance"] = balance
+                _sim_log(
+                    f"Skip {sym}: effective ${pos_size * leverage:.2f} < IG min ${min_n:.2f} "
+                    f"(min needed ${min_needed:.2f} exceeds 20% cap ${max_cap:.2f})"
+                )
+                return
 
     prices  = _sim_reconstruct_prices(sym, signals)
     fill    = prices["ask"] if direction == "long" else prices["bid"]
