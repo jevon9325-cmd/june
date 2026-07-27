@@ -3334,6 +3334,16 @@ def _sim_select_approach(stage: str, sym: str) -> str:
     Non-sprout stages explore their _SIM_STAGE_APPROACH default first so they
     begin with their intended conservative sizing.
     """
+    if stage != "sprout":
+        stage_default = _SIM_STAGE_APPROACH.get(stage, _SIM_SIZING_ORDER[0])
+        _skip_sc      = _sim.get("approach_skip_counts", {}).get(sym, {})
+        _sd           = _skip_sc.get(stage_default, {})
+        _bal          = _sim.get("balance", 0.0)
+        if (_sd.get("count", 0) >= _SIM_SKIP_THRESHOLD
+                and _bal <= _sd.get("balance", 0.0) * _SIM_SKIP_BALANCE_TOL):
+            return "__all_infeasible__"
+        return stage_default
+
     instr_stats  = _sim.get("approach_stats", {}).get(sym, {})
     skip_counts  = _sim.get("approach_skip_counts", {}).get(sym, {})
     balance      = _sim.get("balance", 0.0)
