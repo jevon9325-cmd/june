@@ -2364,6 +2364,9 @@ def _sim_save_state() -> None:
         "phase_start_time":     _sim["phase_start_time"],
         "phase_entry_balance":  _sim.get("phase_entry_balance", _sim.get("stage_entry_balance", _SIM_START_BALANCE)),
         "phase_consec_losses":  _sim.get("phase_consec_losses", 0),
+        "phase_trades":         _sim.get("phase_trades",  0),
+        "phase_wins":           _sim.get("phase_wins",    0),
+        "phase_losses":         _sim.get("phase_losses",  0),
         "sim_start_time":       _sim["sim_start_time"],
         "eligible_instruments": sorted(_sim_eligible),
         "min_notionals":        _sim_min_notional,
@@ -2469,6 +2472,9 @@ def _sim_do_graduate(signals, via_rolling: bool = False) -> bool:
     _sim["phase_start_time"]    = time.time()
     _sim["phase_entry_balance"] = _sim["balance"]
     _sim["phase_consec_losses"] = 0
+    _sim["phase_trades"]        = 0
+    _sim["phase_wins"]          = 0
+    _sim["phase_losses"]        = 0
     _sim.pop("approach_skip_counts", None)
     _sim.pop("approach_stats",       None)
 
@@ -2558,8 +2564,8 @@ def _sim_phase_leverage(phase: int) -> int:
 def _sim_check_phase() -> None:
     """Performance-based phase advancement and drop-back."""
     phase   = _sim.get("phase", 1)
-    n       = _sim.get("stage_trades", 0)
-    wins    = _sim.get("stage_wins", 0)
+    n       = _sim.get("phase_trades", 0)
+    wins    = _sim.get("phase_wins",   0)
     wr      = wins / n if n else 0.0
     entry_b = _sim.get("phase_entry_balance", _sim.get("stage_entry_balance", _SIM_START_BALANCE))
     pnl_pct = (_sim["balance"] - entry_b) / entry_b if entry_b > 0 else 0.0
@@ -2576,6 +2582,9 @@ def _sim_check_phase() -> None:
             _sim["phase_entry_balance"] = _sim["balance"]
             _sim["phase_consec_losses"] = 0
             _sim["phase_start_time"]    = time.time()
+            _sim["phase_trades"]        = 0
+            _sim["phase_wins"]          = 0
+            _sim["phase_losses"]        = 0
             _sim_log(
                 f"📉 SIM: Phase {phase} → Phase {new_phase} ({_sim_phase_leverage(new_phase)}:1) "
                 f"— {reason} — dropping back to conservative leverage"
@@ -2589,6 +2598,9 @@ def _sim_check_phase() -> None:
         _sim["phase_entry_balance"] = _sim["balance"]
         _sim["phase_consec_losses"] = 0
         _sim["phase_start_time"]    = time.time()
+        _sim["phase_trades"]        = 0
+        _sim["phase_wins"]          = 0
+        _sim["phase_losses"]        = 0
         _sim_log(
             f"📈 SIM: Phase 1 → Phase 2 (5:1) "
             f"— {n} trades, {wr:.0%} WR, +${_sim['balance'] - entry_b:.2f} P&L — criteria met"
@@ -2599,6 +2611,9 @@ def _sim_check_phase() -> None:
         _sim["phase_entry_balance"] = _sim["balance"]
         _sim["phase_consec_losses"] = 0
         _sim["phase_start_time"]    = time.time()
+        _sim["phase_trades"]        = 0
+        _sim["phase_wins"]          = 0
+        _sim["phase_losses"]        = 0
         _sim_log(
             f"📈 SIM: Phase 2 → Phase 3 (10:1) "
             f"— {n} trades, {wr:.0%} WR, +${_sim['balance'] - entry_b:.2f} P&L — criteria met"
@@ -2959,6 +2974,9 @@ def _sim_close_position(prices: dict, exit_reason: str) -> None:
     _sim["stage_trades"]  += 1
     _sim["stage_wins"]    += int(won)
     _sim["stage_losses"]  += int(not won)
+    _sim["phase_trades"]   = _sim.get("phase_trades", 0) + 1
+    _sim["phase_wins"]     = _sim.get("phase_wins",   0) + int(won)
+    _sim["phase_losses"]   = _sim.get("phase_losses", 0) + int(not won)
     if won:
         _sim["phase_consec_losses"] = 0
     else:
