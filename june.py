@@ -2504,8 +2504,9 @@ def _sim_unlock_seedling_instruments() -> None:
     candidates = {k: v for k, v in INSTRUMENTS.items() if k in ("GOLD", "OIL", "UK100")}
     if not candidates:
         return
-    leverage      = _SIM_AGGRESSIVE_LEV
-    max_effective = _sim["balance"] * 0.10 * leverage
+    leverage  = _sim_phase_leverage(_sim.get("phase", 1))
+    pos_size  = round(_sim["balance"] * 0.10, 2)
+    max_cap   = _sim["balance"] * 0.20
     for sym, epic in candidates.items():
         if sym in _sim_eligible:
             continue
@@ -2530,12 +2531,17 @@ def _sim_unlock_seedling_instruments() -> None:
         ccy0      = inst.get("currencies", [{}])[0] if inst.get("currencies") else {}
         fx_base   = float(ccy0.get("baseExchangeRate") or 1.0) or 1.0
         min_usd   = (min_val * lot_sz * mid) / fx_base
-        if min_usd <= max_effective:
+        min_needed = math.ceil(min_usd / leverage * 100) / 100
+        feasible   = (pos_size * leverage >= min_usd) or (min_needed <= max_cap)
+        if feasible:
             _sim_eligible.add(sym)
             _sim_min_notional[sym] = round(min_usd, 2)
             _sim_log(f"SEEDLING unlock: {sym} eligible -- IG min ~${min_usd:.2f}")
         else:
-            _sim_log(f"SEEDLING: {sym} still too large -- min ${min_usd:.2f} > max ${max_effective:.0f}")
+            _sim_log(
+                f"SEEDLING: {sym} infeasible at current balance -- "
+                f"IG min ${min_usd:.2f}, min needed ${min_needed:.2f} > 20% cap ${max_cap:.2f}"
+            )
         time.sleep(0.3)
     if any(s in _sim_eligible for s in ("GOLD", "OIL", "UK100")):
         _sim_log(f"Eligible instruments now: {sorted(_sim_eligible)}")
