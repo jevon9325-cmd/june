@@ -2469,6 +2469,8 @@ def _sim_do_graduate(signals, via_rolling: bool = False) -> bool:
     _sim["phase_start_time"]    = time.time()
     _sim["phase_entry_balance"] = _sim["balance"]
     _sim["phase_consec_losses"] = 0
+    _sim.pop("approach_skip_counts", None)
+    _sim.pop("approach_stats",       None)
 
     if via_rolling:
         recent = [t for t in _sim.get("trade_history", []) if t.get("stage") == stage][-10:]
