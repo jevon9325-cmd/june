@@ -2989,8 +2989,9 @@ def _sim_close_position(prices: dict, exit_reason: str) -> None:
                   pos["tp_price"]   if exit_reason == "take_profit"   else \
                   prices["ask"]
 
-    dollar_pnl = size * lev * pnl_pct
-    won        = dollar_pnl > 0
+    dollar_pnl   = size * lev * pnl_pct
+    _partial_pnl = pos.get("partial_dollar_pnl", 0.0)
+    won          = (dollar_pnl + _partial_pnl) > 0  # combined P&L for win/loss decision
 
     # Dynamic TP calibration: record absolute move size per combo
     _dtp_combo = pos["instrument"] + "_" + dirn
@@ -3025,7 +3026,7 @@ def _sim_close_position(prices: dict, exit_reason: str) -> None:
         "instrument": pos["instrument"], "direction": dirn,
         "entry_price": entry, "exit_price": exit_px,
         "size": size, "leverage": lev,
-        "pnl_pct": round(pnl_pct, 6), "dollar_pnl": round(dollar_pnl, 4),
+        "pnl_pct": round(pnl_pct, 6), "dollar_pnl": round(dollar_pnl + _partial_pnl, 4),
         "hold_min": round(hold_min, 1), "exit_reason": exit_reason,
         "approach": approach, "vol_bucket": vol_bkt,
         "entry_vol": pos.get("entry_vol", 0),
@@ -3281,6 +3282,54 @@ def _sim_try_entry(signals: dict, regime: str, leverage: int) -> None:
 
 
 # ── Exit checks ───────────────────────────────────────────────────────────────
+def _sim_partial_tp_exit(prices: dict) -> None:
+    """Close 50% of position at TP; let remainder run with break-even stop.
+    Balance credited immediately. Stats counted only on final close."""
+    pos = (_sim.get("open_position") or {}).copy()
+    if not pos:
+        return
+    sym   = pos["instrument"]
+    dirn  = pos["direction"]
+    size  = pos["size"]
+    lev   = pos["leverage"]
+    entry = pos["fill_price"]
+
+    pnl_pct   = _sim_compute_pnl_pct(prices)
+    half_size = round(size / 2, 2)
+    if half_size < 1.0:  # too small to split -- full close
+        _sim_close_position(prices, "take_profit"); return
+
+    partial_pnl = round(half_size * lev * pnl_pct, 6)
+    _sim["balance"] += partial_pnl
+
+    # Tighten stop to break-even (entry +/- spread floor, so worst case ~flat)
+    _spread_flr  = _sim_get_spread_floor(sym)
+    new_stop_px  = entry * (1 + _spread_flr) if dirn == "long" else entry * (1 - _spread_flr)
+
+    # Record partial win for TP calibration (does not increment trade counters)
+    _dtp_combo = sym + "_" + dirn
+    if partial_pnl > 0:
+        _wm = _sim.setdefault("win_moves", {})
+        _wb = _wm.setdefault(_dtp_combo, [])
+        _wb.append(round(abs(pnl_pct), 6))
+        if len(_wb) > _SIM_TP_WIN_WINDOW:
+            _wm[_dtp_combo] = _wb[-_SIM_TP_WIN_WINDOW:]
+
+    _sim["open_position"]["size"]               = half_size
+    _sim["open_position"]["stop_price"]         = new_stop_px
+    _sim["open_position"]["stop_pct"]           = _spread_flr
+    _sim["open_position"]["partial_exit_done"]  = True
+    _sim["open_position"]["partial_dollar_pnl"] = partial_pnl
+
+    fill_exit = prices["bid"] if dirn == "long" else prices["ask"]
+    _sim_log(
+        f"✂️ SIM: {sym} PARTIAL TP -- closed ${half_size:.2f} @ {fill_exit:.6g} "
+        f"(+${partial_pnl:.4f}, {pnl_pct*100:.3f}%) | remaining ${half_size:.2f} "
+        f"| stop -> break-even {new_stop_px:.6g}"
+    )
+    _sim_save_state()
+
+
 def _sim_check_exit(signals: dict, regime: str) -> None:
     pos = _sim.get("open_position")
     if not pos:
@@ -3299,6 +3348,8 @@ def _sim_check_exit(signals: dict, regime: str) -> None:
     if pnl_pct <= -stop_pct:
         _sim_close_position(prices, "stop_loss"); return
     if pnl_pct >= pos.get("tp_pct", _sim_get_tp(sym, dirn, pos.get("conviction", 5))):
+        if not pos.get("partial_exit_done"):
+            _sim_partial_tp_exit(prices); return
         _sim_close_position(prices, "take_profit"); return
     if hold_sec >= _SIM_MAX_HOLD_SECS:
         _sim_close_position(prices, "max_hold"); return
