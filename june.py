@@ -2303,6 +2303,7 @@ _SIM_STREAK_PAUSE    = 5      # loss streak count that pauses entries
 _SIM_BOOST_DUR       = 30 * 60    # boost duration (30m)
 _SIM_PAUSE_DUR       = 45 * 60    # pause duration (45m)
 _SIM_BALANCE_FLOOR   = 40.0   # auto-reset if balance drops below this
+_SIM_CONCENTRATION_CAP = 0.20  # max (min_notional / leverage) as fraction of balance
 
 # ── Dynamic 15m reliability gate ───────────────────────────────────────────────
 _SIM_15M_MIN_SAMPLES = 5     # trades before reliability scoring activates; cold-start = relaxed
@@ -2513,59 +2514,9 @@ def _sim_do_graduate(signals, via_rolling: bool = False) -> bool:
         _sim_stop("full_bloom_reached", signals)
         return True
 
-    if next_stage == "seedling":
-        _sim_unlock_seedling_instruments()
-
     _sim_save_state()
     return False
 
-
-def _sim_unlock_seedling_instruments() -> None:
-    """On SEEDLING entry, query IG API for GOLD, OIL, UK100 at higher leverage."""
-    candidates = {k: v for k, v in INSTRUMENTS.items() if k in ("GOLD", "OIL", "UK100")}
-    if not candidates:
-        return
-    leverage  = _sim_phase_leverage(_sim.get("phase", 1))
-    pos_size  = round(_sim["balance"] * 0.10, 2)
-    max_cap   = _sim["balance"] * 0.20
-    for sym, epic in candidates.items():
-        if sym in _sim_eligible:
-            continue
-        data = _ig_get(f"/markets/{epic}")
-        if not data:
-            continue
-        inst    = data.get("instrument", {})
-        deal    = data.get("dealingRules", {})
-        snap    = data.get("snapshot", {})
-        min_val = float(deal.get("minDealSize", {}).get("value", 1.0))
-        lot_sz  = float(inst.get("lotSize", 1.0))
-        bid     = float(snap.get("bid") or 0)
-        offer   = float(snap.get("offer") or 0)
-        mid     = (bid + offer) / 2.0 if bid and offer else 0.0
-        # Equity CFDs: IG returns null bid/offer — fetch price via Finnhub
-        if mid == 0.0 and ".CASH." in epic:
-            fh_sym = _INSTRUMENTS_REVERSE.get(epic)
-            if fh_sym:
-                fh = _finnhub_price(fh_sym)
-                if fh:
-                    mid = fh["mid"]
-        ccy0      = inst.get("currencies", [{}])[0] if inst.get("currencies") else {}
-        fx_base   = float(ccy0.get("baseExchangeRate") or 1.0) or 1.0
-        min_usd   = (min_val * lot_sz * mid) / fx_base
-        min_needed = math.ceil(min_usd / leverage * 100) / 100
-        feasible   = (pos_size * leverage >= min_usd) or (min_needed <= max_cap)
-        if feasible:
-            _sim_eligible.add(sym)
-            _sim_min_notional[sym] = round(min_usd, 2)
-            _sim_log(f"SEEDLING unlock: {sym} eligible -- IG min ~${min_usd:.2f}")
-        else:
-            _sim_log(
-                f"SEEDLING: {sym} infeasible at current balance -- "
-                f"IG min ${min_usd:.2f}, min needed ${min_needed:.2f} > 20% cap ${max_cap:.2f}"
-            )
-        time.sleep(0.3)
-    if any(s in _sim_eligible for s in ("GOLD", "OIL", "UK100")):
-        _sim_log(f"Eligible instruments now: {sorted(_sim_eligible)}")
 
 
 # ── Phase management ──────────────────────────────────────────────────────────
@@ -2662,6 +2613,17 @@ def _sim_position_size(balance: float, approach: str) -> float:
 
 def _sim_check_min_feasible(sym: str, pos_size: float, leverage: int) -> bool:
     return (pos_size * leverage) >= _sim_min_notional.get(sym, 0.0)
+
+
+def _sim_is_eligible(sym: str, balance: float, leverage: int) -> bool:
+    """Concentration-cap formula: True when min_notional/leverage <= 20% of balance.
+    Replaces curated stage-specific eligible-instrument lists.
+    Any instrument with known min_notional data is evaluated automatically.
+    """
+    min_n = _sim_min_notional.get(sym)
+    if min_n is None:
+        return False
+    return (min_n / leverage) <= (_SIM_CONCENTRATION_CAP * balance)
 
 
 def _sim_vol_bucket(vol: float) -> str:
@@ -2886,7 +2848,11 @@ def _sim_regime_weight(sym: str, direction: str) -> float:
 
 def _sim_select_instrument(signals: dict, regime: str):
     best_sym, best_vol = None, 0.0
+    _sel_bal = _sim.get("balance", _SIM_START_BALANCE)
+    _sel_lev = _sim_phase_leverage(_sim.get("phase", 1))
     for sym in _sim_eligible:
+        if not _sim_is_eligible(sym, _sel_bal, _sel_lev):
+            continue
         if sym not in signals:
             continue
         sig  = signals[sym]
@@ -3913,6 +3879,10 @@ def sim_startup() -> None:
     if saved:
         _sim_eligible     = set(saved.get("eligible_instruments", []))
         _sim_min_notional = saved.get("min_notionals", {})
+        # Migration: expand _sim_eligible to all known-notional instruments;
+        # formula in _sim_is_eligible() gates actual selection per cycle.
+        for _s in _sim_min_notional:
+            _sim_eligible.add(_s)
 
         # Backfill eligibility for instruments added to INSTRUMENTS since last save.
         # min_notionals stores all queried instruments (eligible or not) so we only
@@ -3946,13 +3916,9 @@ def sim_startup() -> None:
                 _ccy0     = _inst.get("currencies", [{}])[0] if _inst.get("currencies") else {}
                 _fx_base  = float(_ccy0.get("baseExchangeRate") or 1.0) or 1.0
                 _min_usd  = (_min_val * _lot_sz * _mid) / _fx_base
-                # Store min_notional regardless of eligibility so we don't re-query on every restart
                 _sim_min_notional[_sym] = round(_min_usd, 2)
-                if _min_usd <= _max_eff:
-                    _sim_eligible.add(_sym)
-                    print(f"[{_ts()}] \U0001f9ea SIM:   {_sym}: ELIGIBLE  -- IG min notional ~${_min_usd:.2f}", flush=True)
-                else:
-                    print(f"[{_ts()}] \U0001f9ea SIM:   {_sym}: EXCLUDED  -- IG min ~${_min_usd:.2f} exceeds ${_max_eff:.0f} effective max", flush=True)
+                _sim_eligible.add(_sym)  # all queried; eligibility via formula at selection time
+                print(f"[{_ts()}] \U0001f9ea SIM:   {_sym}: queried -- IG min notional ~${_min_usd:.2f}", flush=True)
                 import time as _time; _time.sleep(0.3)
             # Persist eligibility now -- _sim is empty at this point so _sim_save_state()
             # would be a no-op. Do a targeted Redis patch instead.
@@ -4150,17 +4116,10 @@ def sim_startup() -> None:
         fx_base  = float(ccy0.get("baseExchangeRate") or 1.0) or 1.0
         min_usd  = (min_val * lot_sz * mid) / fx_base
 
-        max_eff = _SIM_START_BALANCE * 0.10 * _SIM_AGGRESSIVE_LEV
-        if min_usd <= max_eff:
-            _sim_eligible.add(sym)
-            _sim_min_notional[sym] = round(min_usd, 2)
-            print(f"[{_ts()}] \U0001f9ea SIM:   {sym}: ELIGIBLE  -- IG min notional ~${min_usd:.2f}", flush=True)
-        else:
-            print(
-                f"[{_ts()}] \U0001f9ea SIM:   {sym}: EXCLUDED  -- "
-                f"IG min ~${min_usd:.2f} exceeds ${max_eff:.0f} effective max",
-                flush=True,
-            )
+        # Store ALL instruments; eligibility determined by formula at selection time
+        _sim_eligible.add(sym)
+        _sim_min_notional[sym] = round(min_usd, 2)
+        print(f"[{_ts()}] \U0001f9ea SIM:   {sym}: queried -- IG min notional ~${min_usd:.2f}", flush=True)
         time.sleep(0.3)
 
     if not _sim_eligible:
