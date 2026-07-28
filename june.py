@@ -2671,7 +2671,7 @@ def _sim_conviction_gauge(
     + streak (0-1) + 15m reliability (-0.5 to +1). Clamped to [1, 10]."""
     clearance  = min(vol / thresh, 5.0) if thresh > 0 else 1.0
     regime_pts = max(-1.0, min(2.0, (weight - 1.0) * 4.0))
-    bucket_pts = 2.0 if vol >= 0.005 else 1.0 if vol >= 0.002 else 0.0
+    bucket_pts = 2.0 if vol > _SIM_HIGH_VOL_THRESH else 1.0 if vol >= _SIM_LOW_VOL_THRESH else 0.0
     streak_pts = 1.0 if _sim_has_boost(combo) else 0.0
     if gate_mode == "strict" and rel_score is not None and rel_score > 0.5:
         rel_pts = 1.0
@@ -3166,7 +3166,7 @@ def _sim_try_entry(signals: dict, regime: str, leverage: int) -> None:
     conviction = _sim_conviction_gauge(
         sym, direction, vol, _cv_thresh, _cv_weight, _cv_combo, gate_mode, rel_score
     )
-    _bkt_c = "H" if vol >= 0.005 else "M" if vol >= 0.002 else "L"
+    _bkt_c = "H" if vol > _SIM_HIGH_VOL_THRESH else "M" if vol >= _SIM_LOW_VOL_THRESH else "L"
     _sim_log(
         f"🎯 SIM: {sym} {direction.upper()} conviction {conviction}/10 "
         f"(clr={vol / _cv_thresh:.1f}x wt={_cv_weight:.2f} "
