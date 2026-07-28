@@ -2321,6 +2321,15 @@ _SIM_STAGE_DEFS = {
 }
 _SIM_STAGE_ORDER = ["sprout", "seedling", "germination", "vegetative", "full_bloom"]
 
+# Balance floors: on graduation, inject to max(organic_balance, floor) so the sim
+# operates at realistic dollar levels for each stage's intended leverage tier.
+_SIM_STAGE_FLOORS = {
+    "seedling":    70.0,
+    "germination": 300.0,
+    "vegetative":  1_000.0,
+    "full_bloom":  5_000.0,
+}
+
 # ── Stage approach map (non-sprout sizing) ────────────────────────────────────
 _SIM_STAGE_APPROACH = {
     "seedling": "pct_10", "germination": "pct_3",
@@ -2464,6 +2473,12 @@ def _sim_do_graduate(signals, via_rolling: bool = False) -> bool:
         "balance_exit": round(_sim["balance"], 2),
     })
     _sim["stage"]               = next_stage
+    # Balance injection: lift balance to stage floor if organic trading left it below
+    _floor = _SIM_STAGE_FLOORS.get(next_stage, 0.0)
+    if _floor > 0 and _sim["balance"] < _floor:
+        _old_b = _sim["balance"]
+        _sim["balance"] = _floor
+        _sim_log(f"💰 Balance injection: ${_old_b:.2f} → ${_floor:.2f} ({next_label} stage floor)")
     _sim["stage_entry_balance"] = _sim["balance"]
     _sim["stage_trades"]        = 0
     _sim["stage_wins"]          = 0
