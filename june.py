@@ -2805,32 +2805,37 @@ def _sim_15m_gate_mode(sym, direction):
 
 
 # ── Instrument selection ──────────────────────────────────────────────────────
-def _sim_get_tp(sym: str, direction: str) -> float:
-    """Dynamic TP from actual instrument move history — no global cold-start constant.
+def _sim_get_tp(sym: str, direction: str, conviction: int = 5) -> float:
+    """Dynamic TP — conviction-scaled fractions and cap.
     Vol_history values are in percent; win/loss_moves are fractions (pnl_pct scale).
-    Takes the minimum across all available estimates to stay within achievable range."""
+    conviction=1: 0.5% cap; conviction=10: 3.0% cap. Takes max of estimates."""
     combo  = f"{sym}_{direction}"
     wins   = (_sim.get("win_moves")  or {}).get(combo, [])
     losses = (_sim.get("loss_moves") or {}).get(combo, [])
     hist   = (_sim.get("vol_history") or {}).get(sym, [])
 
+    t        = (conviction - 1) / 9.0
+    tp_cap   = 0.005 + 0.025 * t          # 0.5% (conv=1) → 3.0% (conv=10)
+    win_frac = min(1.0, _SIM_TP_WIN_FRACTION + 0.30 * t)  # 0.70 → 1.00
+    los_frac = 0.25 + 0.25 * t            # 0.25 → 0.50
+
     estimates = []
 
-    # Primary: winning trade history — 70% of avg win (80% when <3 samples)
+    # Primary: winning trade history — fraction scales up with conviction
     if wins:
-        fraction = _SIM_TP_WIN_FRACTION if len(wins) >= _SIM_TP_MIN_SAMPLES else 0.80
+        fraction = win_frac if len(wins) >= _SIM_TP_MIN_SAMPLES else 0.80
         estimates.append((sum(wins) / len(wins)) * fraction)
 
-    # Secondary: 25% of avg losing move — achievable target within the adverse range
+    # Secondary: conviction-scaled fraction of avg losing move
     if len(losses) >= 3:
-        estimates.append((sum(losses) / len(losses)) * 0.25)
+        estimates.append((sum(losses) / len(losses)) * los_frac)
 
     # Tertiary: 30% of vol_mean (vol_history in % — divide /100 to get fraction)
     if len(hist) >= 5:
         estimates.append((sum(hist) / len(hist)) / 100.0 * _SIM_TP_VOL_FRACTION)
 
     if estimates:
-        return round(max(_SIM_TP_FLOOR, min(_SIM_TP_CAP, min(estimates))), 6)
+        return round(max(_SIM_TP_FLOOR, min(tp_cap, max(estimates))), 6)
 
     # True cold-start (zero history): instrument-type micro-defaults
     if "JPY" in sym:
@@ -3025,6 +3030,7 @@ def _sim_close_position(prices: dict, exit_reason: str) -> None:
         "approach": approach, "vol_bucket": vol_bkt,
         "entry_vol": pos.get("entry_vol", 0),
         "stage": _sim.get("stage", "sprout"), "phase": _sim.get("phase", 1),
+        "conviction": conviction,
     }
     history = _sim.setdefault("trade_history", [])
     history.append(trade_rec)
@@ -3240,7 +3246,7 @@ def _sim_try_entry(signals: dict, regime: str, leverage: int) -> None:
             f"(spread floor: baseline spread {_spread_flr / 2 * 100:.2f}%)"
         )
     stop_px  = fill * (1 - stop_pct) if direction == "long" else fill * (1 + stop_pct)
-    tp_pct   = _sim_get_tp(sym, direction)
+    tp_pct   = _sim_get_tp(sym, direction, conviction)
     # Ensure TP covers at least 1x baseline spread (entry fill is at offer/bid, so
     # the price must move >= 1x spread from mid before TP becomes reachable).
     _tp_spread_floor = _sim_get_spread_floor(sym) / 2   # spread_floor = 2x spread -> half = 1x
@@ -3248,7 +3254,7 @@ def _sim_try_entry(signals: dict, regime: str, leverage: int) -> None:
         tp_pct = _tp_spread_floor
     tp_px    = fill * (1 + tp_pct)   if direction == "long" else fill * (1 - tp_pct)
     _tp_wins = (_sim.get("win_moves") or {}).get(sym + "_" + direction, [])
-    _tp_src  = (f"avg_win {(sum(_tp_wins)/len(_tp_wins))*100:.3f}%×{int(_SIM_TP_WIN_FRACTION*100)}%"
+    _tp_src  = (f"avg_win {(sum(_tp_wins)/len(_tp_wins))*100:.3f}% (conv={conviction})"
                 if _tp_wins else "vol/loss-history")
     _stop_tag = "spread-adj" if stop_pct > _stop_vol else "vol-dynamic"
     _sim_log(f"\U0001f4ca {sym} {direction.upper()} TP {tp_pct*100:.3f}% ({_tp_src}) | "
@@ -3263,6 +3269,7 @@ def _sim_try_entry(signals: dict, regime: str, leverage: int) -> None:
         "entry_time": time.time(), "entry_vol": vol,
         "vol_bucket": vbkt, "approach": approach, "regime": regime,
         "entry_change_15m": change_15m, "tp_pct": tp_pct, "stop_pct": stop_pct,
+        "conviction": conviction,
     }
 
     action = "BUY" if direction == "long" else "SELL"
@@ -3291,7 +3298,7 @@ def _sim_check_exit(signals: dict, regime: str) -> None:
     stop_pct = pos.get("stop_pct", _sim_get_dynamic_stop(sym))
     if pnl_pct <= -stop_pct:
         _sim_close_position(prices, "stop_loss"); return
-    if pnl_pct >= pos.get("tp_pct", _sim_get_tp(sym, dirn)):
+    if pnl_pct >= pos.get("tp_pct", _sim_get_tp(sym, dirn, pos.get("conviction", 5))):
         _sim_close_position(prices, "take_profit"); return
     if hold_sec >= _SIM_MAX_HOLD_SECS:
         _sim_close_position(prices, "max_hold"); return
