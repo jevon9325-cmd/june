@@ -2305,6 +2305,14 @@ _SIM_PAUSE_DUR       = 45 * 60    # pause duration (45m)
 _SIM_BALANCE_FLOOR   = 40.0   # auto-reset if balance drops below this
 _SIM_CONCENTRATION_CAP = 0.20  # max (min_notional / leverage) as fraction of balance
 
+# Conviction-scaled sizing floors: min position % at conviction=1; ceiling=20% at conviction=10
+_SIM_SIZE_FLOORS = {
+    "seedling":    0.05,
+    "germination": 0.02,
+    "vegetative":  0.01,
+    "full_bloom":  0.01,
+}
+
 # ── Dynamic 15m reliability gate ───────────────────────────────────────────────
 _SIM_15M_MIN_SAMPLES = 5     # trades before reliability scoring activates; cold-start = relaxed
 _SIM_15M_LOOKBACK    = 20    # rolling history window per instrument+direction
@@ -2618,7 +2626,7 @@ def _sim_reconstruct_prices(sym: str, signals: dict) -> dict:
 
 
 # ── Position sizing ───────────────────────────────────────────────────────────
-def _sim_position_size(balance: float, approach: str) -> float:
+def _sim_position_size(balance: float, approach: str, conviction: int = 5) -> float:
     stage = _sim.get("stage", "sprout")
     if stage == "sprout":
         if approach == "fixed_5":  return 5.0
@@ -2626,10 +2634,10 @@ def _sim_position_size(balance: float, approach: str) -> float:
         if approach == "pct_5":    return round(balance * 0.05, 2)
         if approach == "pct_10":   return round(balance * 0.10, 2)
         return 5.0
-    if stage == "seedling":    return round(balance * 0.10, 2)
-    if stage == "germination": return round(balance * 0.03, 2)
-    if stage == "vegetative":  return round(balance * 0.02, 2)
-    return round(balance * 0.05, 2)
+    # Conviction-scaled: floor_pct (conviction=1) → 20% concentration cap (conviction=10)
+    pct_floor = _SIM_SIZE_FLOORS.get(stage, 0.05)
+    pct = pct_floor + (_SIM_CONCENTRATION_CAP - pct_floor) * (conviction - 1) / 9.0
+    return round(balance * pct, 2)
 
 
 def _sim_check_min_feasible(sym: str, pos_size: float, leverage: int) -> bool:
@@ -3192,7 +3200,7 @@ def _sim_try_entry(signals: dict, regime: str, leverage: int) -> None:
         approach = chosen_approach
     else:
         # Formula-based sizing for later stages
-        pos_size = min(_sim_position_size(balance, approach), balance)
+        pos_size = min(_sim_position_size(balance, approach, conviction), balance)
         if pos_size < 1.0:
             _sim_log(f"Skip {sym}: position size ${pos_size:.2f} < $1 floor")
             return
