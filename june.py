@@ -2637,6 +2637,27 @@ def _sim_vol_bucket(vol: float) -> str:
 
 
 # ── Dynamic threshold / streak helpers ───────────────────────────────────────
+def _sim_conviction_gauge(
+    sym: str, direction: str, vol: float, thresh: float,
+    weight: float, combo: str, gate_mode: str, rel_score
+) -> int:
+    """1-10 conviction score from already-computed signal inputs. No new indicators.
+    clearance (0-5) + regime weight (-1 to +2) + vol bucket (0-2)
+    + streak (0-1) + 15m reliability (-0.5 to +1). Clamped to [1, 10]."""
+    clearance  = min(vol / thresh, 5.0) if thresh > 0 else 1.0
+    regime_pts = max(-1.0, min(2.0, (weight - 1.0) * 4.0))
+    bucket_pts = 2.0 if vol >= 0.005 else 1.0 if vol >= 0.002 else 0.0
+    streak_pts = 1.0 if _sim_has_boost(combo) else 0.0
+    if gate_mode == "strict" and rel_score is not None and rel_score > 0.5:
+        rel_pts = 1.0
+    elif gate_mode == "relaxed":
+        rel_pts = -0.5
+    else:
+        rel_pts = 0.0
+    raw = clearance + regime_pts + bucket_pts + streak_pts + rel_pts
+    return max(1, min(10, round(raw)))
+
+
 def _sim_combo_key(sym: str, direction: str) -> str:
     return f"{sym}_{direction}"
 
@@ -3104,6 +3125,20 @@ def _sim_try_entry(signals: dict, regime: str, leverage: int) -> None:
                 f"(vol_std={vard**0.5:.2f}%, \u00d7{_SIM_THRESH_MULT:.1f}) "
                 f"\u2014 above base {_SIM_THRESH_BASE:.2f}%"
             )
+
+    # Conviction gauge (1-10): all inputs already computed above in this function
+    _cv_thresh = _sim_get_threshold(sym, direction)
+    _cv_weight = _sim_regime_weight(sym, direction)
+    _cv_combo  = sym + "_" + direction
+    conviction = _sim_conviction_gauge(
+        sym, direction, vol, _cv_thresh, _cv_weight, _cv_combo, gate_mode, rel_score
+    )
+    _bkt_c = "H" if vol >= 0.005 else "M" if vol >= 0.002 else "L"
+    _sim_log(
+        f"🎯 SIM: {sym} {direction.upper()} conviction {conviction}/10 "
+        f"(clr={vol / _cv_thresh:.1f}x wt={_cv_weight:.2f} "
+        f"bkt={_bkt_c} 15m={gate_mode[:3]})"
+    )
 
     stage     = _sim.get("stage", "sprout")
 
