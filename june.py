@@ -2335,6 +2335,16 @@ _SIM_STAGE_FLOORS = {
     "full_bloom":  5_000.0,
 }
 
+# Conviction-based leverage ranges per stage.
+# floor = current conservative base; ceiling scales with stage maturity.
+_SIM_LEV_RANGES = {
+    "sprout":      (3, 10),
+    "seedling":    (3, 10),
+    "germination": (3, 15),
+    "vegetative":  (5, 20),
+    "full_bloom":  (5, 20),
+}
+
 # ── Stage approach map (non-sprout sizing) ────────────────────────────────────
 _SIM_STAGE_APPROACH = {
     "seedling": "pct_10", "germination": "pct_3",
@@ -2529,6 +2539,13 @@ def _sim_phase_leverage(phase: int) -> int:
     if phase == 1: return _SIM_CONSERVATIVE_LEV
     if phase == 2: return _SIM_PHASE2_LEV
     return _SIM_AGGRESSIVE_LEV
+
+
+def _sim_conviction_leverage(stage: str, conviction: int) -> int:
+    """Map conviction 1–10 to leverage within the stage's floor–ceiling range."""
+    floor, ceiling = _SIM_LEV_RANGES.get(stage, (3, 10))
+    t = (conviction - 1) / 9.0
+    return max(floor, min(ceiling, floor + round(t * (ceiling - floor))))
 
 
 def _sim_check_phase() -> None:
@@ -2873,8 +2890,9 @@ def _sim_regime_weight(sym: str, direction: str) -> float:
 
 def _sim_select_instrument(signals: dict, regime: str):
     best_sym, best_vol = None, 0.0
-    _sel_bal = _sim.get("balance", _SIM_START_BALANCE)
-    _sel_lev = _sim_phase_leverage(_sim.get("phase", 1))
+    _sel_bal   = _sim.get("balance", _SIM_START_BALANCE)
+    _sel_stage = _sim.get("stage", "sprout")
+    _sel_lev   = _SIM_LEV_RANGES.get(_sel_stage, (3, 10))[1]  # ceiling: broadest eligibility
     for sym in _sim_eligible:
         if not _sim_is_eligible(sym, _sel_bal, _sel_lev):
             continue
@@ -3141,6 +3159,7 @@ def _sim_try_entry(signals: dict, regime: str, leverage: int) -> None:
     )
 
     stage     = _sim.get("stage", "sprout")
+    leverage  = _sim_conviction_leverage(stage, conviction)
 
     if stage == "sprout":
         # Rotation schedule with escalation if notional too small
