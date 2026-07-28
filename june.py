@@ -2314,10 +2314,14 @@ _SIM_1M_MIN_REVERSAL = 0.030 # 1m gate: min % price move to qualify as a real re
 
 # ── Stage definitions ─────────────────────────────────────────────────────────
 _SIM_STAGE_DEFS = {
+    # min_pnl_pct: fraction of stage_entry_balance required as net gain for graduation.
+    # With balance injection (Part 1), these now reflect real dollar thresholds:
+    # Sprout: no requirement (entry stage). Seedling: +1% of $70 = $0.70.
+    # Germination: +2% of $300 = $6. Vegetative: +2% of $1,000 = $20.
     "sprout":      {"label": "SPROUT",      "min_trades": 7,  "min_wr": 0.50, "min_pnl_pct": 0.00, "fail_after": 30},
-    "seedling":    {"label": "SEEDLING",    "min_trades": 10, "min_wr": 0.55, "min_pnl_pct": 0.005, "fail_after": 40},
-    "germination": {"label": "GERMINATION", "min_trades": 20, "min_wr": 0.55, "min_pnl_pct": 0.30, "fail_after": 50},
-    "vegetative":  {"label": "VEGETATIVE",  "min_trades": 25, "min_wr": 0.60, "min_pnl_pct": 0.25, "fail_after": 60},
+    "seedling":    {"label": "SEEDLING",    "min_trades": 10, "min_wr": 0.55, "min_pnl_pct": 0.01, "fail_after": 40},
+    "germination": {"label": "GERMINATION", "min_trades": 20, "min_wr": 0.55, "min_pnl_pct": 0.02, "fail_after": 50},
+    "vegetative":  {"label": "VEGETATIVE",  "min_trades": 25, "min_wr": 0.60, "min_pnl_pct": 0.02, "fail_after": 60},
     "full_bloom":  {"label": "FULL BLOOM",  "min_trades":  0, "min_wr": 0.00, "min_pnl_pct": 0.00, "fail_after": None},
 }
 _SIM_STAGE_ORDER = ["sprout", "seedling", "germination", "vegetative", "full_bloom"]
