@@ -3069,7 +3069,7 @@ def _sim_close_position(prices: dict, exit_reason: str) -> None:
     )
     _sim["open_position"] = None
     _sim_update_streak(pos["instrument"], dirn, won)
-    _sim_15m_record(pos["instrument"], dirn, pos.get("entry_change_15m", 0.0), won)
+    _sim_15m_record(pos["instrument"], dirn, pos.get("entry_change_15m") or 0.0, won)
     _sim_save_state()
 
 
@@ -3117,7 +3117,7 @@ def _sim_try_entry(signals: dict, regime: str, leverage: int) -> None:
     # Mode (strict/moderate/relaxed) self-calibrates per instrument+direction
     # based on observed 15m predictive accuracy. Cold-start and low-reliability
     # combos use relaxed mode so volume accumulates to build the scoring model.
-    change_15m   = sig.get("change_15m", 0.0)
+    change_15m   = sig.get("change_15m") or 0.0
     hist_sym     = _history.get(sym)
     has_15m_hist = hist_sym is not None and len(hist_sym) >= 15
     gate_mode, rel_score = _sim_15m_gate_mode(sym, direction)
