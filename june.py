@@ -3031,7 +3031,7 @@ def _sim_close_position(prices: dict, exit_reason: str) -> None:
         "approach": approach, "vol_bucket": vol_bkt,
         "entry_vol": pos.get("entry_vol", 0),
         "stage": _sim.get("stage", "sprout"), "phase": _sim.get("phase", 1),
-        "conviction": conviction,
+        "conviction": pos.get("conviction", 5),
     }
     history = _sim.setdefault("trade_history", [])
     history.append(trade_rec)
