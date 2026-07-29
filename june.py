@@ -2468,8 +2468,8 @@ def _sim_check_graduation() -> str:
     if n >= defn["min_trades"]:
         recent = [t for t in _sim.get("trade_history", []) if t.get("stage") == stage][-10:]
         if len(recent) >= 10:
-            rw = sum(1 for t in recent if t["dollar_pnl"] > 0) / 10
-            rp = sum(t["dollar_pnl"] for t in recent)
+            rw = sum(1 for t in recent if (t.get("dollar_pnl") or 0) > 0) / 10
+            rp = sum((t.get("dollar_pnl") or 0) for t in recent)
             if rw >= defn["min_wr"] and rp > 0:
                 return "graduate_rolling"
     if defn["fail_after"] and n >= defn["fail_after"]:
@@ -2518,8 +2518,8 @@ def _sim_do_graduate(signals, via_rolling: bool = False) -> bool:
 
     if via_rolling:
         recent = [t for t in _sim.get("trade_history", []) if t.get("stage") == stage][-10:]
-        rw = sum(1 for t in recent if t["dollar_pnl"] > 0) / len(recent) if recent else 0.0
-        rp = sum(t["dollar_pnl"] for t in recent)
+        rw = sum(1 for t in recent if (t.get("dollar_pnl") or 0) > 0) / len(recent) if recent else 0.0
+        rp = sum((t.get("dollar_pnl") or 0) for t in recent)
         _sim_log(
             f"🌱 {label} COMPLETE (rolling window): last 10 trades {rw:.0%} WR, "
             f"{rp:+.2f} -- cumulative {wr:.0%} WR dragged by pre-fix losses. "
@@ -4417,6 +4417,7 @@ def main():
         except Exception as exc:
             consec_errors += 1
             print(f"[{_ts()}] ❌ Main loop error #{consec_errors}: {exc}", flush=True)
+            import traceback; traceback.print_exc()
             if consec_errors >= 5:
                 print(f"[{_ts()}] 💀 5 consecutive errors — sleeping 5 min before retry", flush=True)
                 time.sleep(300)
