@@ -2532,9 +2532,9 @@ def _sim_do_graduate(signals, via_rolling: bool = False) -> bool:
         )
 
     if next_stage == "full_bloom":
-        _sim_log("\U0001f338 FULL BLOOM REACHED -- simulation complete")
-        _sim_stop("full_bloom_reached", signals)
-        return True
+        _sim_log("🌸 FULL BLOOM REACHED -- simulation continues at full bloom stage")
+        _sim_save_state()
+        return False
 
     _sim_save_state()
     return False
