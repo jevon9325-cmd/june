@@ -112,6 +112,16 @@ DIRECT_CFD_GAP_PCT  = 1.5    # daily % change to flag individual stock as gap ca
 DIRECT_CFD_SEARCH_INTERVAL = 30        # seconds between IG search API calls
 DIRECT_CFD_MISS_TTL        = 6 * 3600  # 6h before re-searching a not-found symbol
 DIRECT_CFD_CONFIRMED_MISS_TTL = 24 * 3600  # 24h after all search strategies exhausted
+
+# Minimum notional values for core instruments — confirmed from IG API 2026-07-14.
+# Pre-populated in sim_startup() so FX + Silver trade immediately without /markets/ calls.
+_KNOWN_MIN_NOTIONALS: dict = {
+    "EURUSD": 11.44, "GBPUSD":  0.54, "USDJPY":  1.23, "SILVER": 29.25,
+    "AUDUSD":  6.0,  "USDCAD": 14.0,  "EURGBP": 11.0,  "NZDUSD":  6.0,  "USDCHF": 9.0,
+}
+_NOTIONAL_REDIS_KEY = "june_min_notionals"  # separate key — survives sim resets
+_NOTIONAL_REDIS_TTL = 7 * 24 * 3600        # 7 days
+
 DIRECT_CFD_REDIS_TTL       = 24 * 3600 # Redis TTL for june_direct_cfd_map
 NAV_CACHE_TTL              = 6 * 3600  # Redis TTL for june_market_nav_cache
 US_PREMARKET_START_MIN = 10 * 60       # 10:00 UTC = 05:00 ET (US pre-market opens)
@@ -343,6 +353,8 @@ _cfd_miss_cache: dict      = {}    # {t212_base: expiry_epoch}  6h cache for not
 _cfd_last_search: float    = 0.0   # epoch of last IG search call (rate-limiter)
 _direct_cfd_signals: dict  = {}    # {t212_base: {pct, direction, ts}}  daily snapshots
 _cfd_signal_refresh: float = 0.0   # epoch of last signal refresh pass
+_cfd_signal_cursor: int    = 0     # rotating index for cursor-batched signal refresh (3/cycle)
+_notional_pending: list    = []    # queue of (sym, epic) for gradual min-notional backfill
 _gap_disc_date: str        = ""    # UTC date _gap_disc_seen was reset
 _gap_disc_seen: set        = set() # bases already published to june_gap_discoveries today
 _nav_cache: dict           = {}    # {chartCode.upper(): epic} from /marketnavigation
@@ -3997,65 +4009,40 @@ def run_simulation_step(signals: dict) -> None:
 # ── Startup / resume ──────────────────────────────────────────────────────────
 def sim_startup() -> None:
     """Try to resume from saved Redis state, otherwise start fresh."""
-    global _sim_eligible, _sim_min_notional
+    global _sim_eligible, _sim_min_notional, _notional_pending
+
+    # Pre-populate from hardcoded known values and persisted Redis key (Parts 1+4).
+    # Runs before sim_state load — FX+Silver are always immediately available.
+    _sim_min_notional.update(_KNOWN_MIN_NOTIONALS)
+    try:
+        _persist_raw = _redis().get(_NOTIONAL_REDIS_KEY)
+        if _persist_raw:
+            import json as _json
+            _sim_min_notional.update(_json.loads(_persist_raw))
+    except Exception:
+        pass
+    for _s in list(_sim_min_notional):
+        _sim_eligible.add(_s)
 
     saved = _sim_load_state()
     if saved:
-        _sim_eligible     = set(saved.get("eligible_instruments", []))
-        _sim_min_notional = saved.get("min_notionals", {})
-        # Migration: expand _sim_eligible to all known-notional instruments;
-        # formula in _sim_is_eligible() gates actual selection per cycle.
+        # Merge saved min_notionals into pre-populated dict.
+        # API-confirmed values from prior runs override hardcoded estimates.
+        _sim_min_notional.update(saved.get("min_notionals", {}))
+        _sim_eligible = set(saved.get("eligible_instruments", []))
         for _s in _sim_min_notional:
             _sim_eligible.add(_s)
 
-        # Backfill eligibility for instruments added to INSTRUMENTS since last save.
-        # min_notionals stores all queried instruments (eligible or not) so we only
-        # query instruments that have never been seen before.
-        _missing_syms = [s for s in INSTRUMENTS
-                         if s not in _sim_min_notional and s not in _sim_eligible]
-        if _missing_syms:
-            _max_eff = _SIM_START_BALANCE * 0.10 * _SIM_AGGRESSIVE_LEV
-            print(f"[{_ts()}] \U0001f9ea SIM: Backfilling eligibility for {len(_missing_syms)} new instruments: {_missing_syms}", flush=True)
-            for _sym in _missing_syms:
-                _epic = INSTRUMENTS[_sym]
-                _data = _ig_get(f"/markets/{_epic}")
-                if not _data:
-                    print(f"[{_ts()}] \U0001f9ea SIM:   {_sym}: API query failed -- skipping", flush=True)
-                    continue
-                _inst    = _data.get("instrument", {})
-                _deal    = _data.get("dealingRules", {})
-                _snap    = _data.get("snapshot", {})
-                _min_val = float(_deal.get("minDealSize", {}).get("value", 1.0))
-                _lot_sz  = float(_inst.get("lotSize", 1.0))
-                _bid     = float(_snap.get("bid") or 0)
-                _offer   = float(_snap.get("offer") or 0)
-                _mid     = (_bid + _offer) / 2.0 if _bid and _offer else 0.0
-                # Equity CFDs: IG returns null bid/offer — fetch price via Finnhub
-                if _mid == 0.0 and ".CASH." in _epic:
-                    _fh_sym = _INSTRUMENTS_REVERSE.get(_epic)
-                    if _fh_sym:
-                        _fh = _finnhub_price(_fh_sym)
-                        if _fh:
-                            _mid = _fh["mid"]
-                _ccy0     = _inst.get("currencies", [{}])[0] if _inst.get("currencies") else {}
-                _fx_base  = float(_ccy0.get("baseExchangeRate") or 1.0) or 1.0
-                _min_usd  = (_min_val * _lot_sz * _mid) / _fx_base
-                _sim_min_notional[_sym] = round(_min_usd, 2)
-                _sim_eligible.add(_sym)  # all queried; eligibility via formula at selection time
-                print(f"[{_ts()}] \U0001f9ea SIM:   {_sym}: queried -- IG min notional ~${_min_usd:.2f}", flush=True)
-                import time as _time; _time.sleep(0.3)
-            # Persist eligibility now -- _sim is empty at this point so _sim_save_state()
-            # would be a no-op. Do a targeted Redis patch instead.
-            try:
-                _cur_raw = _redis().get("june_sim_state")
-                if _cur_raw:
-                    _cur_st = json.loads(_cur_raw)
-                    _cur_st["eligible_instruments"] = sorted(_sim_eligible)
-                    _cur_st["min_notionals"] = _sim_min_notional
-                    _redis().set("june_sim_state", json.dumps(_cur_st), ex=72 * 3600)
-                    print(f"[{_ts()}] 🧪 SIM: Eligibility backfill saved to Redis ({len(_sim_eligible)} eligible)", flush=True)
-            except Exception as _e:
-                print(f"[{_ts()}] 🧪 SIM: Eligibility backfill save failed: {_e}", flush=True)
+        # Queue truly unknown instruments for gradual background backfill (Part 3).
+        # No API calls at startup — _advance_notional_backfill() drains 2/cycle.
+        _notional_pending[:] = [(s, INSTRUMENTS[s]) for s in INSTRUMENTS
+                                if s not in _sim_min_notional]
+        if _notional_pending:
+            print(
+                f"[{_ts()}] 🧪 SIM: Queued {len(_notional_pending)} instruments for "
+                f"background backfill: {[s for s, _ in _notional_pending]}",
+                flush=True,
+            )
 
         now = time.time()
 
@@ -4213,38 +4200,16 @@ def sim_startup() -> None:
         f"Stop: +${_SIM_PROFIT_STOP} (doubled) or ${_SIM_LOSS_STOP} (60% loss)",
         flush=True,
     )
-    print(f"[{_ts()}] \U0001f9ea SIM: Querying IG API for minimum deal sizes ...", flush=True)
-
-    for sym, epic in list(INSTRUMENTS.items()):
-        data = _ig_get(f"/markets/{epic}")
-        if not data:
-            print(f"[{_ts()}] \U0001f9ea SIM:   {sym}: API query failed -- excluded", flush=True)
-            continue
-
-        inst    = data.get("instrument", {})
-        deal    = data.get("dealingRules", {})
-        snap    = data.get("snapshot", {})
-        min_val = float(deal.get("minDealSize", {}).get("value", 1.0))
-        lot_sz  = float(inst.get("lotSize", 1.0))
-        bid     = float(snap.get("bid") or 0)
-        offer   = float(snap.get("offer") or 0)
-        mid     = (bid + offer) / 2.0 if bid and offer else 0.0
-        # Equity CFDs: IG returns null bid/offer — fetch price via Finnhub
-        if mid == 0.0 and ".CASH." in epic:
-            fh_sym = _INSTRUMENTS_REVERSE.get(epic)
-            if fh_sym:
-                fh = _finnhub_price(fh_sym)
-                if fh:
-                    mid = fh["mid"]
-        ccy0     = inst.get("currencies", [{}])[0] if inst.get("currencies") else {}
-        fx_base  = float(ccy0.get("baseExchangeRate") or 1.0) or 1.0
-        min_usd  = (min_val * lot_sz * mid) / fx_base
-
-        # Store ALL instruments; eligibility determined by formula at selection time
-        _sim_eligible.add(sym)
-        _sim_min_notional[sym] = round(min_usd, 2)
-        print(f"[{_ts()}] \U0001f9ea SIM:   {sym}: queried -- IG min notional ~${min_usd:.2f}", flush=True)
-        time.sleep(0.3)
+    # _KNOWN_MIN_NOTIONALS already applied at top of sim_startup(); queue the rest.
+    # No startup API burst — _advance_notional_backfill() drains 2/cycle.
+    _notional_pending[:] = [(s, INSTRUMENTS[s]) for s in INSTRUMENTS
+                            if s not in _sim_min_notional]
+    print(
+        f"[{_ts()}] 🧪 SIM: {len(_sim_min_notional)} min notionals pre-loaded "
+        f"({list(_sim_min_notional)}). "
+        f"Queued {len(_notional_pending)} remaining for background backfill.",
+        flush=True,
+    )
 
     if not _sim_eligible:
         print(f"[{_ts()}] \U0001f9ea SIM: WARNING: no eligible instruments found", flush=True)
