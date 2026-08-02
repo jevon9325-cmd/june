@@ -1514,20 +1514,30 @@ def _startup_discovery_pass() -> None:
 
 
 def _refresh_direct_cfd_signals() -> None:
-    """Fetch daily snapshot signals for all known direct CFD epics (every 5 min).
+    """Fetch daily snapshot signals for known direct CFD epics (cursor-batched, 3/cycle).
 
-    IG demo limitation: stock CFDs return null bid/offer (streamingPricesAvailable=False).
-    percentageChange reflects today's move from prior session close — directionally
-    accurate but not intraday real-time. Sync validation (Change 2) requires live
-    bid/offer and is therefore not implemented on IG demo.
+    Processes 3 epics per 5-min cycle, rotating through _direct_cfd_map via
+    _cfd_signal_cursor. A full pass takes ~20 cycles (100 min), using 36 calls/hr
+    vs the prior burst of 720+/hr that exhausted both IG rate-limit layers.
+
+    _cfd_signal_refresh is always reset after each call — the prior implementation
+    only reset inside `if updated:`, so the 5-min cooldown never applied when all
+    calls failed with 403, causing immediate re-bursting on the next cycle.
     """
-    global _cfd_signal_refresh
+    global _cfd_signal_refresh, _cfd_signal_cursor
     if not _direct_cfd_map:
         return
     if time.time() - _cfd_signal_refresh < 5 * 60:
         return
+    all_pairs = sorted(_direct_cfd_map.items())  # deterministic order for cursor rotation
+    n = len(all_pairs)
+    if n == 0:
+        _cfd_signal_refresh = time.time()
+        return
+    BATCH = 3
     updated = []
-    for base, epic in list(_direct_cfd_map.items()):
+    for i in range(BATCH):
+        base, epic = all_pairs[(_cfd_signal_cursor + i) % n]
         detail = _ig_get(f"/markets/{epic}")
         if not detail:
             continue
@@ -1537,12 +1547,73 @@ def _refresh_direct_cfd_signals() -> None:
             continue
         pct       = float(pct)
         direction = "bull" if pct > 0.1 else ("bear" if pct < -0.1 else "flat")
-        _direct_cfd_signals[base] = {"pct": round(pct, 3), "direction": direction, "ts": int(time.time())}
+        _direct_cfd_signals[base] = {"pct": round(pct, 3), "direction": direction,
+                                     "ts": int(time.time())}
         updated.append(f"{base}={pct:+.2f}%")
         time.sleep(1)
+    _cfd_signal_cursor = (_cfd_signal_cursor + BATCH) % n
+    _cfd_signal_refresh = time.time()  # always reset — prevents 403-starvation loop
     if updated:
-        _cfd_signal_refresh = time.time()
-        print(f"[{_ts()}] 📈 Direct CFD daily signals: {', '.join(updated)}", flush=True)
+        print(
+            f"[{_ts()}] 📈 Direct CFD signals (batch, cursor {_cfd_signal_cursor}/{n}): "
+            f"{', '.join(updated)}",
+            flush=True,
+        )
+
+def _advance_notional_backfill() -> None:
+    """Pop up to 2 instruments from _notional_pending and query /markets/ (Parts 2+3).
+
+    Called once per poll_cycle at 60s intervals — 2 calls/cycle = 120/hr, empirically
+    safe against IG rate limits (IG exposes no rate-limit headers; 2/cycle confirmed
+    conservative via prior session analysis).
+
+    On success, persists learned min_notionals to june_min_notionals Redis key (7-day
+    TTL) so they survive sim resets and service restarts (Part 4).
+    """
+    global _notional_pending, _sim_min_notional, _sim_eligible
+    if not _notional_pending:
+        return
+    batch, _notional_pending[:] = _notional_pending[:2], _notional_pending[2:]
+    changed = False
+    for sym, epic in batch:
+        if sym in _sim_min_notional:
+            continue
+        data = _ig_get(f"/markets/{epic}")
+        if not data:
+            _notional_pending.append((sym, epic))  # re-queue for next cycle
+            continue
+        inst    = data.get("instrument", {})
+        deal    = data.get("dealingRules", {})
+        snap    = data.get("snapshot", {})
+        min_val = float(deal.get("minDealSize", {}).get("value", 1.0))
+        lot_sz  = float(inst.get("lotSize", 1.0))
+        bid     = float(snap.get("bid") or 0)
+        offer   = float(snap.get("offer") or 0)
+        mid     = (bid + offer) / 2.0 if bid and offer else 0.0
+        if mid == 0.0 and ".CASH." in epic:
+            fh_sym = _INSTRUMENTS_REVERSE.get(epic)
+            if fh_sym:
+                fh = _finnhub_price(fh_sym)
+                if fh:
+                    mid = fh["mid"]
+        ccy0    = inst.get("currencies", [{}])[0] if inst.get("currencies") else {}
+        fx_base = float(ccy0.get("baseExchangeRate") or 1.0) or 1.0
+        min_usd = (min_val * lot_sz * mid) / fx_base
+        _sim_min_notional[sym] = round(min_usd, 2)
+        _sim_eligible.add(sym)
+        changed = True
+        remaining = len(_notional_pending)
+        print(
+            f"[{_ts()}] 🧪 SIM backfill: {sym} — IG min ~${min_usd:.2f} "
+            f"({'done' if remaining == 0 else f'{remaining} remaining'})",
+            flush=True,
+        )
+    if changed:
+        try:
+            _redis().set(_NOTIONAL_REDIS_KEY, json.dumps(_sim_min_notional),
+                         ex=_NOTIONAL_REDIS_TTL)
+        except Exception:
+            pass
 
 
 def _check_direct_cfd_gaps() -> None:
@@ -2208,6 +2279,7 @@ def poll_cycle() -> bool:
     # Direct CFD discovery and daily signal refresh (rate-limited)
     _maybe_discover_cfd(_get_needed_symbols())
     _refresh_direct_cfd_signals()
+    _advance_notional_backfill()
     _run_cfd_sync_check()
     if is_us_premarket():
         _check_direct_cfd_gaps()
