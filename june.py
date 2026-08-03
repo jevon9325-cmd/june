@@ -2967,18 +2967,14 @@ def _sim_regime_weight(sym: str, direction: str) -> float:
         dirn = conf.get("direction", "")
         if dirn == "dollar_strength" or "dollar strength" in note:
             if sym == "USDJPY":                                       return 1.25
-            if sym == "SILVER" and direction == "short":             return 1.35
             if sym in ("EURUSD", "GBPUSD") and direction == "long": return 0.70
         elif "commodity bull" in note:
-            if sym == "SILVER":                                       return 1.50
             if sym in ("EURUSD", "GBPUSD"):                          return 0.85
             if sym == "USDJPY":                                       return 0.80
         elif "risk-on" in note:
             if sym in ("EURUSD", "GBPUSD"):                          return 1.20
             if sym == "USDJPY" and direction == "long":              return 1.15
-            if sym == "SILVER":                                       return 0.90
         elif "safe-haven" in note:
-            if sym == "SILVER" and direction == "long":              return 1.40
             if sym == "USDJPY" and direction == "long":              return 1.20
             if sym in ("EURUSD", "GBPUSD") and direction == "long": return 0.75
         return 1.0
