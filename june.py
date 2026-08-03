@@ -3465,7 +3465,44 @@ def _sim_check_exit(signals: dict, regime: str) -> None:
     pos = _sim.get("open_position")
     if not pos:
         return
-    sym = pos["instrument"]
+    sym      = pos["instrument"]
+    hold_sec = time.time() - pos["entry_time"]
+
+    # ── Max-hold safety exit — unconditional, checked before signal-availability gates.
+    # A position exceeding the time limit must always be closeable, even when its
+    # streaming symbol has dropped from the signals dict (e.g. IG rate-limit at
+    # startup drops FX instruments from Lightstreamer subscription). Falls back to
+    # direct_cfd_signals (equity CFDs) then entry price (flat, zero P&L) so the
+    # sim is never frozen by a data-availability gap in a safety mechanism.
+    if hold_sec >= _SIM_MAX_HOLD_SECS:
+        _mh_sig = dict(signals)
+        if sym not in _mh_sig:
+            _mh_cfd = _direct_cfd_signals.get(sym)
+            if (_mh_cfd
+                    and time.time() - _mh_cfd.get("ts", 0) <= 20 * 60
+                    and _mh_cfd.get("mid", 0.0) > 0.0):
+                _mh_dir = _mh_cfd.get("direction", "flat")
+                _mh_sig[sym] = {
+                    "change_5m": _mh_cfd["pct"],
+                    "direction": "neutral" if _mh_dir == "flat" else _mh_dir,
+                    "spread_alert": False,
+                    "price":       _mh_cfd.get("mid", 0.0),
+                    "spread_pct":  0.1,
+                    "change_15m":  None,
+                }
+            else:
+                _entry_px = pos.get("fill_price", 1.0)
+                _sim_log(
+                    f"⏰ {sym}: max_hold exceeded ({hold_sec/3600:.1f}h) — "
+                    f"no streaming/CFD price available; closing at entry (flat P&L)"
+                )
+                _mh_sig[sym] = {
+                    "change_5m": 0.0, "direction": "neutral", "spread_alert": False,
+                    "price": _entry_px, "spread_pct": 0.0, "change_15m": None,
+                }
+        _sim_close_position(_sim_reconstruct_prices(sym, _mh_sig), "max_hold")
+        return
+
     # Extend streaming signals with equity CFD snapshots for held equity positions.
     _exit_sig = dict(signals)
     if sym not in _exit_sig:
@@ -3489,7 +3526,6 @@ def _sim_check_exit(signals: dict, regime: str) -> None:
         }
     prices   = _sim_reconstruct_prices(sym, _exit_sig)
     pnl_pct  = _sim_compute_pnl_pct(prices)
-    hold_sec = time.time() - pos["entry_time"]
     dirn     = pos["direction"]
     sig_dir  = _exit_sig[sym].get("direction", "neutral")
 
