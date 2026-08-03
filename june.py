@@ -2506,6 +2506,7 @@ def _sim_save_state() -> None:
         "15m_reliability":      _sim.get("15m_reliability", {}),
         "win_moves":            _sim.get("win_moves", {}),
         "loss_moves":           _sim.get("loss_moves", {}),
+        "combo_outcomes":       _sim.get("combo_outcomes", {}),
         "failure_snapshot":     _sim.get("failure_snapshot"),
         "failure_context_checked": _sim.get("failure_context_checked", True),
         "approach_skip_counts": _sim.get("approach_skip_counts", {}),
@@ -3022,6 +3023,18 @@ def _sim_select_instrument(signals: dict, regime: str):
             continue
         if regime in ("volatile", "neutral") and dirn == "neutral":
             continue
+        if direction_str:
+            _co_key   = sym + "_" + direction_str
+            _co_hist  = (_sim.get("combo_outcomes") or {}).get(_co_key, [])
+            _co_n     = len(_co_hist)
+            _co_wins  = sum(_co_hist)
+            if _co_n >= 8 and _co_wins / _co_n < 0.30:
+                _sim_log(
+                    f"⏭️  Skip {sym} {direction_str.upper()}: "
+                    f"combo WR {_co_wins}/{_co_n} ({_co_wins/_co_n:.0%}) "
+                    f"< 30% gate (calibration says avoid)"
+                )
+                continue
         weight        = _sim_regime_weight(sym, direction_str)
         effective_vol = vol * weight
         if weight != 1.0:
@@ -3087,6 +3100,11 @@ def _sim_close_position(prices: dict, exit_reason: str) -> None:
         _lb.append(round(abs(pnl_pct), 6))
         if len(_lb) > _SIM_TP_WIN_WINDOW:
             _lm[_dtp_combo] = _lb[-_SIM_TP_WIN_WINDOW:]
+    _co = _sim.setdefault("combo_outcomes", {})
+    _co_b = _co.setdefault(_dtp_combo, [])
+    _co_b.append(1 if won else 0)
+    if len(_co_b) > _SIM_TP_WIN_WINDOW:
+        _co[_dtp_combo] = _co_b[-_SIM_TP_WIN_WINDOW:]
 
     _sim["balance"]       += dollar_pnl
     _sim["stage_trades"]  += 1
@@ -3699,6 +3717,7 @@ def _sim_stop(reason: str, signals=None) -> None:
             "vol_history":      _sim.get("vol_history", {}),
             "win_moves":        _sim.get("win_moves", {}),
             "loss_moves":       _sim.get("loss_moves", {}),
+            "combo_outcomes":   _sim.get("combo_outcomes", {}),
             "failure_snapshot": _failure_snapshot,
         }
         r.set("june_sim_calibration", json.dumps(_cal), ex=7 * 24 * 3600)
@@ -3751,6 +3770,7 @@ def run_simulation_step(signals: dict) -> None:
         _24h_vh      = dict(_sim.get("vol_history", {}))
         _24h_wm      = dict(_sim.get("win_moves", {}))
         _24h_lm      = dict(_sim.get("loss_moves", {}))
+        _24h_co      = {k: list(v) for k, v in (_sim.get("combo_outcomes") or {}).items()}
         _24h_ast     = dict(_sim.get("approach_stats", {}))
         _24h_vs      = dict(_sim.get("vol_stats", {}))
         _24h_th      = list(_sim.get("trade_history", []))
@@ -3816,6 +3836,7 @@ def run_simulation_step(signals: dict) -> None:
             "vol_history":          _24h_vh,
             "win_moves":            _24h_wm,
             "loss_moves":           _24h_lm,
+            "combo_outcomes":       _24h_co,
             "failure_snapshot":     _24h_fail_snap,
             "failure_context_checked": False,
             "approach_skip_counts": {},
@@ -3863,6 +3884,7 @@ def run_simulation_step(signals: dict) -> None:
                 "vol_history":      _sim.get("vol_history", {}),
                 "win_moves":        _sim.get("win_moves", {}),
                 "loss_moves":       _sim.get("loss_moves", {}),
+                "combo_outcomes":   _sim.get("combo_outcomes", {}),
                 "failure_snapshot": _floor_fail_snap,
             }
             _r_bf.set("june_sim_calibration", json.dumps(_cal_bf), ex=7 * 24 * 3600)
@@ -3947,6 +3969,7 @@ def run_simulation_step(signals: dict) -> None:
             _fail_cal_vol = dict(_sim.get("vol_history", {}))
             _fail_cal_win = dict(_sim.get("win_moves", {}))
             _fail_cal_los = dict(_sim.get("loss_moves", {}))
+            _fail_cal_co  = {k: list(v) for k, v in (_sim.get("combo_outcomes") or {}).items()}
             _fail_rc      = _sim.get("reset_count", 0) + 1
             # Capture failure snapshot before _sim_stop publishes calibration
             _snap_th_f = _sim.get("trade_history", [])
@@ -4007,6 +4030,7 @@ def run_simulation_step(signals: dict) -> None:
                 "vol_history":          _fail_cal_vol,
                 "win_moves":            _fail_cal_win,
                 "loss_moves":           _fail_cal_los,
+                "combo_outcomes":       _fail_cal_co,
                 "failure_snapshot":     _fail_snapshot,
                 "failure_context_checked": False,
                 "approach_skip_counts": {},
@@ -4332,10 +4356,11 @@ def sim_startup() -> None:
         _cal_raw = _redis().get("june_sim_calibration")
         if _cal_raw:
             _cal = json.loads(_cal_raw)
-            _sim["vol_history"]  = _cal.get("vol_history", {})
-            _sim["win_moves"]    = _cal.get("win_moves", {})
-            _sim["loss_moves"]   = _cal.get("loss_moves", {})
-            _snap_from_cal       = _cal.get("failure_snapshot")
+            _sim["vol_history"]      = _cal.get("vol_history", {})
+            _sim["win_moves"]        = _cal.get("win_moves", {})
+            _sim["loss_moves"]       = _cal.get("loss_moves", {})
+            _sim["combo_outcomes"]   = _cal.get("combo_outcomes", {})
+            _snap_from_cal           = _cal.get("failure_snapshot")
             _sim["failure_snapshot"]        = _snap_from_cal
             _sim["failure_context_checked"] = _snap_from_cal is None
             _cal_loaded = True
