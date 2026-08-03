@@ -141,6 +141,7 @@ _DIRECT_CFD_KEYWORDS: dict = {
     "RTX": "raytheon",     "LMT": "lockheed",         "OXY": "occidental",
     "SLB": "schlumberger", "STNG": "scorpio",         "PBI": "pitney",
     "INOD": "innodata",    "GOOG": "alphabet",        "AMGN": "amgen",
+    "SPCX": "spacex",
 }
 
 # Alternative company-name search terms tried after ticker-symbol search fails.
@@ -175,6 +176,7 @@ _CFD_ALT_NAMES: dict = {
     "PBI":   ["Pitney Bowes"],
     "SCHD":  ["Schwab US Dividend Equity"],
     "AMGN":  ["Amgen"],
+    "SPCX":  ["SpaceX"],
 }
 
 # Known alternative epics for symbols where IG's chartCode does not match the NYSE ticker.
@@ -196,6 +198,7 @@ _CFD_PROACTIVE_BASES: frozenset = frozenset({
     "XOM", "CVX", "BA", "NEM", "RTX", "LMT", "DAL", "UAL",
     "OXY", "SLB", "AMZN", "GOOGL", "TSLA", "META",
     "STNG", "AKAM", "AEIS", "RKLB", "INOD", "PBI",
+    "SPCX",
 })
 
 OVERNIGHT_VOL_THRESH = 1.0   # % overnight move to count an instrument as volatile
@@ -230,6 +233,7 @@ INSTRUMENTS: dict = {
     "AMD":  "SA.D.AMD.CASH.IP",        # Advanced Micro Devices
     "INTC": "UB.D.INTC.CASH.IP",       # Intel Corp
     "MU":   "UC.D.MU.CASH.IP",         # Micron Technology
+    "SPCX": "UD.D.SPCXUS.CASH.IP",     # SpaceX — IPO June 12 2026, Nasdaq
 }
 
 # Reverse lookup: epic → base symbol (used to route .CASH.IP epics to Finnhub)
@@ -2358,6 +2362,7 @@ _SIM_SPREAD_FLOORS = {
     # US equity CFDs — synthetic spread from Finnhub (IG bid/offer unavailable)
     "NVDA": 0.0010, "TSLA": 0.0012, "AAPL": 0.0008,
     "MSFT": 0.0008, "AMD":  0.0010, "INTC": 0.0012, "MU": 0.0010,
+    "SPCX": 0.0012,  # synthetic spread — high-vol equity, similar to TSLA
 }
 
 # Asymmetric reversal: losing positions exit faster than winning ones
