@@ -4191,6 +4191,11 @@ def sim_startup() -> None:
     """Try to resume from saved Redis state, otherwise start fresh."""
     global _sim_eligible, _sim_min_notional, _notional_pending
 
+    # Extend reverse map to cover direct_cfd_map epics (Finnhub fallback in backfill).
+    # _load_direct_cfd_cache() runs before sim_startup(), so _direct_cfd_map is ready.
+    _INSTRUMENTS_REVERSE.update({epic: sym for sym, epic in _direct_cfd_map.items()
+                                 if sym not in INSTRUMENTS})
+
     # Pre-populate from hardcoded known values and persisted Redis key (Parts 1+4).
     # Runs before sim_state load — FX+Silver are always immediately available.
     _sim_min_notional.update(_KNOWN_MIN_NOTIONALS)
@@ -4215,8 +4220,12 @@ def sim_startup() -> None:
 
         # Queue truly unknown instruments for gradual background backfill (Part 3).
         # No API calls at startup — _advance_notional_backfill() drains 2/cycle.
-        _notional_pending[:] = [(s, INSTRUMENTS[s]) for s in INSTRUMENTS
-                                if s not in _sim_min_notional]
+        # Includes direct_cfd_map entries (Option A) to grow pool beyond INSTRUMENTS.
+        _notional_pending[:] = (
+            [(s, INSTRUMENTS[s]) for s in INSTRUMENTS if s not in _sim_min_notional]
+            + [(s, _direct_cfd_map[s]) for s in _direct_cfd_map
+               if s not in INSTRUMENTS and s not in _sim_min_notional]
+        )
         if _notional_pending:
             print(
                 f"[{_ts()}] 🧪 SIM: Queued {len(_notional_pending)} instruments for "
@@ -4382,8 +4391,12 @@ def sim_startup() -> None:
     )
     # _KNOWN_MIN_NOTIONALS already applied at top of sim_startup(); queue the rest.
     # No startup API burst — _advance_notional_backfill() drains 2/cycle.
-    _notional_pending[:] = [(s, INSTRUMENTS[s]) for s in INSTRUMENTS
-                            if s not in _sim_min_notional]
+    # Includes direct_cfd_map entries (Option A) to grow pool beyond INSTRUMENTS.
+    _notional_pending[:] = (
+        [(s, INSTRUMENTS[s]) for s in INSTRUMENTS if s not in _sim_min_notional]
+        + [(s, _direct_cfd_map[s]) for s in _direct_cfd_map
+           if s not in INSTRUMENTS and s not in _sim_min_notional]
+    )
     print(
         f"[{_ts()}] 🧪 SIM: {len(_sim_min_notional)} min notionals pre-loaded "
         f"({list(_sim_min_notional)}). "
