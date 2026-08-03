@@ -1547,8 +1547,19 @@ def _refresh_direct_cfd_signals() -> None:
             continue
         pct       = float(pct)
         direction = "bull" if pct > 0.1 else ("bear" if pct < -0.1 else "flat")
-        _direct_cfd_signals[base] = {"pct": round(pct, 3), "direction": direction,
-                                     "ts": int(time.time())}
+        _bid_raw  = snap.get("bid")
+        _off_raw  = snap.get("offer")  # IG uses "offer" for ask
+        _bid_f    = float(_bid_raw) if _bid_raw is not None else 0.0
+        _off_f    = float(_off_raw) if _off_raw is not None else 0.0
+        _mid_f    = round((_bid_f + _off_f) / 2.0, 6) if _bid_f > 0 and _off_f > 0 else 0.0
+        _direct_cfd_signals[base] = {
+            "pct":       round(pct, 3),
+            "direction": direction,
+            "ts":        int(time.time()),
+            "bid":       _bid_f,
+            "offer":     _off_f,
+            "mid":       _mid_f,
+        }
         updated.append(f"{base}={pct:+.2f}%")
         time.sleep(1)
     _cfd_signal_cursor = (_cfd_signal_cursor + BATCH) % n
@@ -3174,8 +3185,30 @@ def _sim_close_position(prices: dict, exit_reason: str) -> None:
 # ── Entry ─────────────────────────────────────────────────────────────────────
 def _sim_try_entry(signals: dict, regime: str, leverage: int) -> None:
     balance = _sim["balance"]
-    sym     = _sim_select_instrument(signals, regime)
-    if not sym or sym not in signals:
+    # Build extended signals: merge fresh equity CFD snapshots (bid/offer known, <20min)
+    # into the streaming dict so equity candidates enter the same selection loop.
+    # Streaming prices take priority; equity CFDs only added when not already present.
+    _ext = dict(signals)
+    _now_ext = time.time()
+    for _eq_b, _eq_d in _direct_cfd_signals.items():
+        if _eq_b in _ext:
+            continue
+        if _now_ext - _eq_d.get("ts", 0) > 20 * 60:
+            continue  # stale snapshot
+        _eq_mid = _eq_d.get("mid", 0.0)
+        if _eq_mid <= 0.0:
+            continue  # no usable price yet from IG snapshot
+        _eq_dir_raw = _eq_d.get("direction", "flat")
+        _ext[_eq_b] = {
+            "change_5m":    _eq_d["pct"],
+            "direction":    "neutral" if _eq_dir_raw == "flat" else _eq_dir_raw,
+            "spread_alert": False,
+            "price":        _eq_mid,
+            "spread_pct":   0.1,  # conservative placeholder; equity CFD spreads ~0.1%
+            "change_15m":   None,
+        }
+    sym     = _sim_select_instrument(_ext, regime)
+    if not sym or sym not in _ext:
         return
 
     stage    = _sim.get("stage", "sprout")
@@ -3187,7 +3220,7 @@ def _sim_try_entry(signals: dict, regime: str, leverage: int) -> None:
         )
         return
 
-    sig       = signals[sym]
+    sig       = _ext[sym]
     chg       = sig.get("change_5m", 0.0)
     vol       = abs(chg)
     direction = "long" if chg > 0 else "short"
@@ -3331,7 +3364,7 @@ def _sim_try_entry(signals: dict, regime: str, leverage: int) -> None:
                 )
                 return
 
-    prices  = _sim_reconstruct_prices(sym, signals)
+    prices  = _sim_reconstruct_prices(sym, _ext)
     fill    = prices["ask"] if direction == "long" else prices["bid"]
     if fill <= 0:
         return
@@ -3433,13 +3466,32 @@ def _sim_check_exit(signals: dict, regime: str) -> None:
     if not pos:
         return
     sym = pos["instrument"]
-    if sym not in signals:
-        return
-    prices   = _sim_reconstruct_prices(sym, signals)
+    # Extend streaming signals with equity CFD snapshots for held equity positions.
+    _exit_sig = dict(signals)
+    if sym not in _exit_sig:
+        _eq_cx = _direct_cfd_signals.get(sym)
+        if not _eq_cx:
+            return
+        if time.time() - _eq_cx.get("ts", 0) > 20 * 60:
+            _sim_log(f"⏸ {sym}: equity CFD price stale (>20min) — deferring exit check")
+            return
+        _eq_mid_cx = _eq_cx.get("mid", 0.0)
+        if _eq_mid_cx <= 0.0:
+            return
+        _eq_dir_cx = _eq_cx.get("direction", "flat")
+        _exit_sig[sym] = {
+            "change_5m":    _eq_cx["pct"],
+            "direction":    "neutral" if _eq_dir_cx == "flat" else _eq_dir_cx,
+            "spread_alert": False,
+            "price":        _eq_mid_cx,
+            "spread_pct":   0.1,
+            "change_15m":   None,
+        }
+    prices   = _sim_reconstruct_prices(sym, _exit_sig)
     pnl_pct  = _sim_compute_pnl_pct(prices)
     hold_sec = time.time() - pos["entry_time"]
     dirn     = pos["direction"]
-    sig_dir  = signals[sym].get("direction", "neutral")
+    sig_dir  = _exit_sig[sym].get("direction", "neutral")
 
     # Hard exits — instrument-calibrated thresholds (stored at entry, fallback to live calc)
     stop_pct = pos.get("stop_pct", _sim_get_dynamic_stop(sym))
