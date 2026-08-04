@@ -1000,14 +1000,13 @@ def _publish_overnight_context():
     if high_vol:
         print(f"[{_ts()}] ⚡ High overnight volatility detected: {volatile_syms}", flush=True)
 
-    corr_note = _detect_correlation_shifts(overnight_moves)
 
     payload = {
         "timestamp":                int(time.time()),
         "high_overnight_volatility": high_vol,
         "volatile_instruments":     volatile_syms,
         "overnight_moves":          overnight_moves,
-        "correlation_note":         corr_note,
+        "correlation_note":         "",   # deprecated; see june_correlation_map
         "news_summary":             _overnight_news_cache,
     }
     try:
@@ -1018,33 +1017,12 @@ def _publish_overnight_context():
             f"(high_vol={high_vol}, volatile={volatile_syms})",
             flush=True,
         )
-        if corr_note:
-            print(f"[{_ts()}]    correlation_note: \"{corr_note}\"", flush=True)
     except Exception as exc:
         print(f"[{_ts()}] ❌ Redis error (overnight_context): {exc}", flush=True)
 
 
-# ── Correlation shift detection ───────────────────────────────────────────────
-def _detect_correlation_shifts(overnight_moves: dict) -> str:
-    """Return a plain-English note about unusual overnight pair divergences."""
-    notes = []
-    for sym_a, sym_b, description in CORR_PAIRS:
-        move_a = overnight_moves.get(sym_a)
-        move_b = overnight_moves.get(sym_b)
-        if move_a is None or move_b is None:
-            continue
-        divergence = abs(move_a - move_b)
-        if divergence < CORR_DIVERGENCE_PCT:
-            continue
-        dir_a = f"{'up' if move_a >= 0 else 'down'} {abs(move_a):.2f}%"
-        dir_b = f"{'up' if move_b >= 0 else 'down'} {abs(move_b):.2f}%"
-        if (move_a >= 0) != (move_b >= 0):
-            note = f"{sym_a} {dir_a} while {sym_b} {dir_b} — {description.lower()}, unusual decoupling"
-        else:
-            note = f"{sym_a} {dir_a} vs {sym_b} {dir_b} — {description.lower()}, unusual magnitude divergence"
-        notes.append(note)
-        print(f"[{_ts()}] 🔗 Correlation shift: {note}", flush=True)
-    return "; ".join(notes)
+# _detect_correlation_shifts() removed — replaced by june_correlation_map
+# (real Pearson correlation across 24 instruments, published by Claudia every 15 min)
 
 
 # ── Pre-London gap detection ──────────────────────────────────────────────────
@@ -2471,6 +2449,21 @@ _sim:                   dict  = {}    # empty = not started; truthy = running (u
 _sim_regime_three_way:  list  = []   # three-way confirmations, updated each poll cycle
 _sim_weekend_log_next:  float = 0.0  # rate-limits weekend closure log to once per hour
 
+# ── Correlation signal from Claudia ──────────────────────────────────────────
+_correlation_map: dict = {}   # loaded from june_correlation_map each sim cycle
+
+# Maps June instrument name → FMP ticker used in june_corr_history_cache
+_JUNE_TO_FMP: dict = {
+    "SILVER":  "XAGUSD",  "GOLD":    "XAUUSD",  "OIL":     "USO",
+    "SPX500":  "SPY",     "NVDA":    "NVDA",     "TSLA":    "TSLA",
+    "AAPL":    "AAPL",    "MSFT":    "MSFT",     "AMD":     "AMD",
+    "INTC":    "INTC",    "MU":      "MU",       "SPCX":    "SPCX",
+    "EURUSD":  "EURUSD",  "GBPUSD":  "GBPUSD",  "USDJPY":  "USDJPY",
+    "AUDUSD":  "AUDUSD",  "USDCAD":  "USDCAD",  "NZDUSD":  "NZDUSD",
+    "USDCHF":  "USDCHF",  "GLD":     "GLD",      "SLV":     "SLV",
+    "QQQ":     "QQQ",     "TLT":     "TLT",      "XLF":     "XLF",
+}
+
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 def _sim_log(msg: str) -> None:
@@ -2998,6 +2991,71 @@ def _sim_regime_weight(sym: str, direction: str) -> float:
     return 1.0
 
 
+def _load_correlation_map() -> None:
+    """Read june_correlation_map from Redis into _correlation_map.
+    Graceful degradation: leaves map empty if key missing/stale (no weight adjustment).
+    """
+    global _correlation_map
+    try:
+        raw = _redis().get("june_correlation_map")
+        if raw:
+            _correlation_map = json.loads(raw)
+            n_pairs = len(_correlation_map.get("pairs", {}))
+            if n_pairs:
+                print(
+                    f"[{_ts()}] 🔗 Correlation map loaded: {n_pairs} pairs "
+                    f"(min_r={_correlation_map.get('min_r', '?')})",
+                    flush=True,
+                )
+        else:
+            _correlation_map = {}
+    except Exception:
+        _correlation_map = {}
+
+
+def _sim_corr_weight(sym: str, direction_str: str, signals: dict) -> float:
+    """Return a correlation-based weight multiplier for a sim candidate.
+
+    For each discovered pair involving this instrument:
+    - confirming (both moving as historical correlation predicts): 1.1x boost
+    - diverging (moving against historical correlation): 0.7x penalty
+    Penalty wins over boost when both apply. Falls back to 1.0x if no map/signal.
+    """
+    if not _correlation_map or not direction_str:
+        return 1.0
+    my_fmp    = _JUNE_TO_FMP.get(sym, sym)
+    pairs     = _correlation_map.get("pairs", {})
+    _fmp_to_j = {v: k for k, v in _JUNE_TO_FMP.items()}
+    has_conf  = False
+    has_div   = False
+    for pair_data in pairs.values():
+        sym_a = pair_data.get("sym_a", "")
+        sym_b = pair_data.get("sym_b", "")
+        if my_fmp not in (sym_a, sym_b):
+            continue
+        other_fmp  = sym_b if my_fmp == sym_a else sym_a
+        other_june = _fmp_to_j.get(other_fmp, other_fmp)
+        if other_june not in signals:
+            continue
+        other_dirn = signals[other_june].get("direction", "neutral")
+        if other_dirn not in ("bull", "bear"):
+            continue
+        r_val         = pair_data.get("r", 0.0)
+        my_is_bull    = (direction_str == "long")
+        other_is_bull = (other_dirn == "bull")
+        # Positive r: same direction = confirming; Negative r: opposite = confirming
+        is_confirming = (r_val > 0) == (my_is_bull == other_is_bull)
+        if is_confirming:
+            has_conf = True
+        else:
+            has_div = True
+    if has_div:
+        return 0.7   # penalty wins over any boost
+    if has_conf:
+        return 1.1
+    return 1.0
+
+
 def _sim_select_instrument(signals: dict, regime: str):
     best_sym, best_vol = None, 0.0
     _sel_bal   = _sim.get("balance", _SIM_START_BALANCE)
@@ -3052,11 +3110,15 @@ def _sim_select_instrument(signals: dict, regime: str):
                 )
                 continue
         weight        = _sim_regime_weight(sym, direction_str)
-        effective_vol = vol * weight
+        corr_adj      = _sim_corr_weight(sym, direction_str, signals)
+        effective_vol = vol * weight * corr_adj
         if weight != 1.0:
             _rw_note = next((c.get("note", "")[:22] for c in _sim_regime_three_way), "?")
             _sim_log(f"\U0001f30d {sym} {direction_str.upper()} weight x{weight:.2f}"
                      f" ({_rw_note}...) effective {effective_vol:.3f}%")
+        if corr_adj != 1.0:
+            _sim_log(f"\U0001f517 {sym} {direction_str.upper()} corr x{corr_adj:.1f}"
+                     f" → effective {effective_vol:.3f}%")
         if effective_vol > best_vol:
             best_vol = effective_vol
             best_sym = sym
@@ -4037,6 +4099,7 @@ def run_simulation_step(signals: dict) -> None:
     except Exception:
         _sim_regime_three_way = []
         pass
+    _load_correlation_map()
 
     # Handle open position -- exit check fires even during weekend closure
     if _sim.get("open_position"):
