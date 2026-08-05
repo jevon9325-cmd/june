@@ -2464,6 +2464,11 @@ _JUNE_TO_FMP: dict = {
     "QQQ":     "QQQ",     "TLT":     "TLT",      "XLF":     "XLF",
 }
 
+# ── Barbie override signal ───────────────────────────────────────────────────
+_barbie_overrides:         dict = {}  # loaded from barbie_june_overrides each sim cycle
+_BARBIE_OVERRIDE_MIN_SECS: int  = 60  # hard floor: 1 cycle minimum
+_BARBIE_OVERRIDE_MAX_SECS: int  = 600 # hard ceiling: 10 cycles maximum
+
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 def _sim_log(msg: str) -> None:
@@ -3011,6 +3016,27 @@ def _load_correlation_map() -> None:
             _correlation_map = {}
     except Exception:
         _correlation_map = {}
+
+
+def _load_barbie_overrides() -> None:
+    """Read barbie_june_overrides from Redis into _barbie_overrides.
+    Graceful degradation: leaves dict empty if key missing or Redis unavailable
+    (no crash, no weight adjustment, no log spam on empty key).
+    """
+    global _barbie_overrides
+    try:
+        raw = _redis().get("barbie_june_overrides")
+        if raw:
+            _barbie_overrides = json.loads(raw)
+            if _barbie_overrides:
+                print(
+                    f"[{_ts()}] 🎀 Barbie overrides loaded: {list(_barbie_overrides)}",
+                    flush=True,
+                )
+        else:
+            _barbie_overrides = {}
+    except Exception:
+        _barbie_overrides = {}
 
 
 def _sim_corr_weight(sym: str, direction_str: str, signals: dict) -> float:
@@ -3611,7 +3637,21 @@ def _sim_check_exit(signals: dict, regime: str) -> None:
     opposing = (dirn == "long"  and (regime == "bear" or sig_dir == "bear")) or \
                (dirn == "short" and (regime == "bull"  or sig_dir == "bull"))
     if opposing:
-        patience  = _SIM_REV_PATIENCE_WIN if pnl_pct > 0 else _SIM_REV_PATIENCE_LOSS
+        _brb = _barbie_overrides.get(sym, {}).get("reversal_confirm_secs")
+        if _brb is not None:
+            _raw = int(_brb)
+            _clamped = max(_BARBIE_OVERRIDE_MIN_SECS,
+                           min(_BARBIE_OVERRIDE_MAX_SECS, _raw))
+            if _clamped != _raw:
+                print(
+                    f"[{_ts()}] ⚠️  Barbie override clamped for {sym}: "
+                    f"reversal_confirm_secs {_raw} → {_clamped} "
+                    f"(bounds [{_BARBIE_OVERRIDE_MIN_SECS}, {_BARBIE_OVERRIDE_MAX_SECS}])",
+                    flush=True,
+                )
+            patience = max(1, round(_clamped / POLL_ACTIVE))
+        else:
+            patience = _SIM_REV_PATIENCE_WIN if pnl_pct > 0 else _SIM_REV_PATIENCE_LOSS
         rev_count = pos.get("reversal_count", 0) + 1
         _sim["open_position"]["reversal_count"] = rev_count
         if rev_count >= patience:
@@ -4100,6 +4140,7 @@ def run_simulation_step(signals: dict) -> None:
         _sim_regime_three_way = []
         pass
     _load_correlation_map()
+    _load_barbie_overrides()
 
     # Handle open position -- exit check fires even during weekend closure
     if _sim.get("open_position"):
