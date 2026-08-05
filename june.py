@@ -3229,7 +3229,7 @@ def _sim_close_position(prices: dict, exit_reason: str) -> None:
         "entry_price": entry, "exit_price": exit_px,
         "size": size, "leverage": lev,
         "pnl_pct": round(pnl_pct, 6), "dollar_pnl": round(dollar_pnl + _partial_pnl, 4),
-        "hold_min": round(hold_min, 1), "exit_reason": exit_reason,
+        "hold_min": round(hold_min, 1), "exit_epoch": int(time.time()), "exit_reason": exit_reason,
         "approach": approach, "vol_bucket": vol_bkt,
         "entry_vol": pos.get("entry_vol", 0),
         "stage": _sim.get("stage", "sprout"), "phase": _sim.get("phase", 1),
