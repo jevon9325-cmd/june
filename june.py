@@ -2468,6 +2468,17 @@ _JUNE_TO_FMP: dict = {
 _barbie_overrides:         dict = {}  # loaded from barbie_june_overrides each sim cycle
 _BARBIE_OVERRIDE_MIN_SECS: int  = 60  # hard floor: 1 cycle minimum
 _BARBIE_OVERRIDE_MAX_SECS: int  = 600 # hard ceiling: 10 cycles maximum
+# Stop/TP multiplier safety bounds (Barbie-settable via barbie_june_overrides)
+_BARBIE_STOP_MULT_MIN:  float = 1.0   # floor: 1σ stop — inside noise below this
+_BARBIE_STOP_MULT_MAX:  float = 4.0   # ceiling: 4σ stop — extreme-event-only above
+_BARBIE_TP_FRAC_MIN:    float = 0.50  # floor: half avg-win (sub-breakeven below)
+_BARBIE_TP_FRAC_MAX:    float = 1.50  # ceiling: 1.5x avg-win (unreachable above)
+# Alarm-clock escalation (June writes, Barbie polls)
+_BARBIE_ALARM_KEY:     str   = "barbie_alarm"
+_BARBIE_ALARM_TTL:     int   = 3600   # 1-hour expiry; Barbie deletes on read
+_BARBIE_ALARM_DEFAULT_THRESHOLD: float = 0.50  # 50% vol deviation triggers alarm
+# Open-position adjustment (Barbie writes, June applies; separate from entry baseline)
+_BARBIE_POS_ADJUST_KEY: str  = "barbie_june_pos_adjust"
 
 
 # ── Logging ───────────────────────────────────────────────────────────────────
@@ -2915,7 +2926,13 @@ def _sim_get_tp(sym: str, direction: str, conviction: int = 5) -> float:
 
     t        = (conviction - 1) / 9.0
     tp_cap   = 0.005 + 0.025 * t          # 0.5% (conv=1) → 3.0% (conv=10)
-    win_frac = min(1.0, _SIM_TP_WIN_FRACTION + 0.30 * t)  # 0.70 → 1.00
+    # Barbie may set per-instrument tp_win_fraction via barbie_june_overrides (entry-baseline path)
+    _brb_tp_frac = _barbie_overrides.get(sym, {}).get("tp_win_fraction")
+    if _brb_tp_frac is not None:
+        _brb_tp_frac = max(_BARBIE_TP_FRAC_MIN, min(_BARBIE_TP_FRAC_MAX, float(_brb_tp_frac)))
+    else:
+        _brb_tp_frac = _SIM_TP_WIN_FRACTION
+    win_frac = min(_BARBIE_TP_FRAC_MAX, _brb_tp_frac + 0.30 * t)  # scales with conviction
     los_frac = 0.25 + 0.25 * t            # 0.25 → 0.50
 
     estimates = []
@@ -2953,7 +2970,13 @@ def _sim_get_dynamic_stop(sym: str) -> float:
     n      = len(hist)
     mean_p = sum(hist) / n
     var_p  = sum((x - mean_p) ** 2 for x in hist) / (n - 1) if n > 1 else 0.0
-    stop_p = mean_p + _SIM_STOP_VOL_MULT * (var_p ** 0.5)   # still in percent
+    # Barbie may set per-instrument stop_vol_mult via barbie_june_overrides (entry-baseline path)
+    _brb_mult = _barbie_overrides.get(sym, {}).get("stop_vol_mult")
+    if _brb_mult is not None:
+        _brb_mult = max(_BARBIE_STOP_MULT_MIN, min(_BARBIE_STOP_MULT_MAX, float(_brb_mult)))
+    else:
+        _brb_mult = _SIM_STOP_VOL_MULT
+    stop_p = mean_p + _brb_mult * (var_p ** 0.5)   # still in percent
     return round(max(_SIM_STOP_FLOOR, min(_SIM_STOP_CAP, stop_p / 100.0)), 6)
 
 
@@ -3037,6 +3060,131 @@ def _load_barbie_overrides() -> None:
             _barbie_overrides = {}
     except Exception:
         _barbie_overrides = {}
+
+
+def _sim_check_barbie_alarm(signals: dict) -> None:
+    """Compare live vol against what Barbie assumed when she set stop_vol_mult overrides.
+    Writes barbie_alarm to Redis if deviation exceeds threshold. Pure flag — never blocks
+    or modifies any trade decision. Called every 60-second cycle from run_simulation_step().
+    """
+    try:
+        for sym in list(_sim_eligible):
+            override  = _barbie_overrides.get(sym, {})
+            assumed   = override.get("vol_assumed_pct")    # recorded at Barbie reasoning time
+            mult      = override.get("stop_vol_mult")      # alarm only meaningful if override active
+            if assumed is None or mult is None or assumed <= 0:
+                continue
+            threshold = float(override.get("vol_alarm_threshold", _BARBIE_ALARM_DEFAULT_THRESHOLD))
+            hist = (_sim.get("vol_history") or {}).get(sym, [])
+            if len(hist) < 5:
+                continue
+            current_vol = sum(hist) / len(hist)
+            deviation   = abs(current_vol - assumed) / assumed
+            if deviation > threshold:
+                alarm_payload = {
+                    "instrument":       sym,
+                    "reason":           (
+                        f"vol_mean deviated {deviation:+.0%} from assumed "
+                        f"({assumed:.4f}% -> {current_vol:.4f}%)"
+                    ),
+                    "vol_current_pct":  round(current_vol, 6),
+                    "vol_assumed_pct":  round(assumed, 6),
+                    "stop_mult_active": mult,
+                    "set_at":           int(time.time()),
+                }
+                _redis().set(_BARBIE_ALARM_KEY, json.dumps(alarm_payload), ex=_BARBIE_ALARM_TTL)
+                print(
+                    f"[{_ts()}] \U0001f514 Barbie alarm: {sym} vol deviated {deviation:.0%} "
+                    f"from assumed ({assumed:.4f}% -> {current_vol:.4f}%) -- Barbie notified",
+                    flush=True,
+                )
+                break   # one alarm at a time; Barbie re-evaluates all on wake
+    except Exception:
+        pass   # alarm is informational; never crash the cycle
+
+
+def _sim_apply_pos_adjust() -> None:
+    """Apply Barbie's barbie_june_pos_adjust to the currently-open position.
+
+    TWO STRUCTURALLY SEPARATE PATHS -- this is the LIVE-POSITION path only:
+      - Reads: barbie_june_pos_adjust  (distinct Redis key from entry-baseline)
+      - Writes: _sim["open_position"]["stop_pct"] / ["tp_pct"] (live position dict)
+      - Called from: _sim_check_exit() -- exit evaluation time only
+
+    The ENTRY-BASELINE path is entirely separate and does not share any code:
+      - Reads: barbie_june_overrides -> _barbie_overrides global
+      - Applied in: _sim_get_dynamic_stop() / _sim_get_tp() at entry time
+      - Called from: _sim_try_entry() only
+      - The tighten-only restriction on this function cannot physically affect
+        that path because this function is never called from _sim_try_entry().
+
+    Stop-loss: TIGHTEN ONLY for open position (new_stop_pct < curr_stop_pct required).
+    TP: either direction within [_SIM_TP_FLOOR, _SIM_TP_CAP].
+    """
+    try:
+        raw = _redis().get(_BARBIE_POS_ADJUST_KEY)
+        if not raw:
+            return
+        adj = json.loads(raw)
+        pos = _sim.get("open_position")
+        if not pos:
+            _redis().delete(_BARBIE_POS_ADJUST_KEY)   # stale -- no open position
+            return
+        sym  = pos.get("instrument")
+        dirn = pos.get("direction")
+        if adj.get("instrument") != sym:
+            return   # adjust targets a different instrument -- stale, ignore
+
+        fill          = pos.get("fill_price", 0)
+        curr_stop_pct = pos.get("stop_pct", 0.0)
+        curr_tp_pct   = pos.get("tp_pct", 0.0)
+        changed       = False
+
+        # ── Stop: TIGHTEN ONLY (smaller pct = closer to fill price = more protective) ──
+        new_stop_pct = adj.get("stop_pct")
+        if new_stop_pct is not None:
+            new_stop_pct = max(_SIM_STOP_FLOOR, min(_SIM_STOP_CAP, float(new_stop_pct)))
+            if new_stop_pct < curr_stop_pct:
+                _sim["open_position"]["stop_pct"]   = new_stop_pct
+                _sim["open_position"]["stop_price"] = (
+                    fill * (1 - new_stop_pct) if dirn == "long"
+                    else fill * (1 + new_stop_pct)
+                )
+                print(
+                    f"[{_ts()}] \U0001f380 Barbie pos-adjust: {sym} stop "
+                    f"{curr_stop_pct*100:.3f}% -> {new_stop_pct*100:.3f}% (tightened)",
+                    flush=True,
+                )
+                changed = True
+            else:
+                print(
+                    f"[{_ts()}] ⚠️  Barbie pos-adjust REJECTED loose stop for {sym}: "
+                    f"{new_stop_pct*100:.3f}% >= current {curr_stop_pct*100:.3f}% "
+                    f"-- live-position stop may only tighten (baseline mult still free)",
+                    flush=True,
+                )
+
+        # ── TP: either direction, within absolute safety bounds ──
+        new_tp_pct = adj.get("tp_pct")
+        if new_tp_pct is not None:
+            new_tp_pct = max(_SIM_TP_FLOOR, min(_SIM_TP_CAP, float(new_tp_pct)))
+            _sim["open_position"]["tp_pct"]   = new_tp_pct
+            _sim["open_position"]["tp_price"] = (
+                fill * (1 + new_tp_pct) if dirn == "long"
+                else fill * (1 - new_tp_pct)
+            )
+            print(
+                f"[{_ts()}] \U0001f380 Barbie pos-adjust: {sym} TP "
+                f"{curr_tp_pct*100:.3f}% -> {new_tp_pct*100:.3f}%",
+                flush=True,
+            )
+            changed = True
+
+        _redis().delete(_BARBIE_POS_ADJUST_KEY)   # consumed -- remove regardless
+        if changed:
+            _sim_save_state()
+    except Exception:
+        pass   # never crash the exit cycle
 
 
 def _sim_corr_weight(sym: str, direction_str: str, signals: dict) -> float:
@@ -3560,6 +3708,9 @@ def _sim_check_exit(signals: dict, regime: str) -> None:
         return
     sym      = pos["instrument"]
     hold_sec = time.time() - pos["entry_time"]
+
+    # Apply Barbie live-position adjustments (LIVE-POSITION path -- separate from entry-baseline).
+    _sim_apply_pos_adjust()
 
     # ── Max-hold safety exit — unconditional, checked before signal-availability gates.
     # A position exceeding the time limit must always be closeable, even when its
@@ -4141,6 +4292,7 @@ def run_simulation_step(signals: dict) -> None:
         pass
     _load_correlation_map()
     _load_barbie_overrides()
+    _sim_check_barbie_alarm(signals)   # flag-only; never blocks trade logic
 
     # Handle open position -- exit check fires even during weekend closure
     if _sim.get("open_position"):
