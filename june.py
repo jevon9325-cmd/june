@@ -2311,8 +2311,16 @@ _SIM_LOSS_STOP       = -30.0   # 60% loss from start
 # ── Entry / exit parameters ───────────────────────────────────────────────────
 _SIM_ENTRY_VOL_MIN   = 0.15    # |change_5m| >= 0.15% to consider entry
 _SIM_MAX_HOLD_SECS   = 4 * 3600
-_SIM_TP_WIN_WINDOW   = 10      # rolling win-move window per combo
+_SIM_TP_WIN_WINDOW   = 10      # rolling win-move window per combo (TP/stop sizing)
 _SIM_TP_MIN_SAMPLES  = 3       # wins before full-confidence TP fraction applies
+
+# ── Per-combo breakeven gate ──────────────────────────────────────────────────
+_SIM_COMBO_MIN_SAMPLES   = 15   # min outcomes before gate applies (8 too small: ±34% CI)
+_SIM_COMBO_DECAY         = 0.90  # exp decay (newest trade weight=1.0, 10 back=0.35)
+_SIM_COMBO_WINDOW        = 50   # rolling storage for combo_outcomes (separate from TP window)
+_BARBIE_COMBO_THRESH_KEY = "barbie_june_combo_thresholds"
+_BARBIE_COMBO_THRESH_MIN = 0.10  # safety floor for Barbie override (~10% = floor meaningful)
+_BARBIE_COMBO_THRESH_MAX = 0.55  # safety ceiling (~55% = stricter than any real breakeven)
 
 # Dynamic TP (all fractions — same units as pnl_pct; vol_history is in %, divided /100)
 _SIM_TP_WIN_FRACTION = 0.70    # TP from win history: 70% of avg winning move
@@ -2466,6 +2474,7 @@ _JUNE_TO_FMP: dict = {
 
 # ── Barbie override signal ───────────────────────────────────────────────────
 _barbie_overrides:         dict = {}  # loaded from barbie_june_overrides each sim cycle
+_barbie_combo_thresholds:  dict = {}  # loaded from barbie_june_combo_thresholds each cycle
 _BARBIE_OVERRIDE_MIN_SECS: int  = 60  # hard floor: 1 cycle minimum
 _BARBIE_OVERRIDE_MAX_SECS: int  = 600 # hard ceiling: 10 cycles maximum
 # Stop/TP multiplier safety bounds (Barbie-settable via barbie_june_overrides)
@@ -2797,6 +2806,64 @@ def _sim_combo_key(sym: str, direction: str) -> str:
     return f"{sym}_{direction}"
 
 
+def _sim_combo_wr_gate(sym: str, direction: str) -> tuple:
+    """Per-combo breakeven gate using exponentially-weighted win rate.
+
+    Returns (should_skip: bool, log_line: str).
+    Gate only fires when combo has >= _SIM_COMBO_MIN_SAMPLES outcomes.
+
+    Threshold priority:
+      1. Barbie override from barbie_june_combo_thresholds (clamped to safety bounds)
+      2. Formula: avg_loss / (avg_win + avg_loss) from win/loss move sizes (>= 5 each)
+      3. Fallback 0.30 when size data insufficient
+
+    WR uses exponential decay (alpha=_SIM_COMBO_DECAY) so recent outcomes dominate
+    without the cliff-edge eviction problem of a hard rolling window.
+    """
+    combo    = f"{sym}_{direction}"
+    outcomes = (_sim.get("combo_outcomes") or {}).get(combo, [])
+    n        = len(outcomes)
+    if n < _SIM_COMBO_MIN_SAMPLES:
+        return False, ""
+
+    # Exponentially weighted win rate (i=0 oldest, i=n-1 newest → weight 1.0)
+    alpha   = _SIM_COMBO_DECAY
+    w_sum   = w_wins = 0.0
+    for i, outcome in enumerate(outcomes):
+        w       = alpha ** (n - 1 - i)
+        w_sum  += w
+        w_wins += w * outcome
+    weighted_wr = w_wins / w_sum if w_sum > 0 else 0.0
+
+    # Threshold: Barbie override → formula → fallback
+    thresh_src = "fallback"
+    threshold  = None
+    brb_t = (_barbie_combo_thresholds or {}).get(combo)
+    if brb_t is not None:
+        threshold  = max(_BARBIE_COMBO_THRESH_MIN, min(_BARBIE_COMBO_THRESH_MAX, float(brb_t)))
+        thresh_src = "barbie"
+    if threshold is None:
+        wins_l   = (_sim.get("win_moves")  or {}).get(combo, [])
+        losses_l = (_sim.get("loss_moves") or {}).get(combo, [])
+        if len(wins_l) >= 5 and len(losses_l) >= 5:
+            avg_win  = sum(wins_l)  / len(wins_l)
+            avg_loss = sum(losses_l) / len(losses_l)
+            denom    = avg_win + avg_loss
+            threshold  = round(avg_loss / denom, 4) if denom > 0 else 0.30
+            thresh_src = "formula"
+        else:
+            threshold  = 0.30
+            thresh_src = "fallback"
+
+    if weighted_wr < threshold:
+        return True, (
+            f"⏭️  Skip {sym} {direction.upper()}: "
+            f"weighted WR {weighted_wr:.0%} (n={n}) "
+            f"< {threshold:.0%} breakeven [{thresh_src}]"
+        )
+    return False, ""
+
+
 def _sim_is_paused(combo: str) -> bool:
     exp = (_sim.get("pause_expiry") or {}).get(combo, 0.0)
     return time.time() < exp
@@ -3042,11 +3109,10 @@ def _load_correlation_map() -> None:
 
 
 def _load_barbie_overrides() -> None:
-    """Read barbie_june_overrides from Redis into _barbie_overrides.
-    Graceful degradation: leaves dict empty if key missing or Redis unavailable
-    (no crash, no weight adjustment, no log spam on empty key).
+    """Read barbie_june_overrides and barbie_june_combo_thresholds into globals.
+    Graceful degradation: leaves dicts empty if key missing or Redis unavailable.
     """
-    global _barbie_overrides
+    global _barbie_overrides, _barbie_combo_thresholds
     try:
         raw = _redis().get("barbie_june_overrides")
         if raw:
@@ -3060,6 +3126,19 @@ def _load_barbie_overrides() -> None:
             _barbie_overrides = {}
     except Exception:
         _barbie_overrides = {}
+    try:
+        raw_ct = _redis().get(_BARBIE_COMBO_THRESH_KEY)
+        if raw_ct:
+            _barbie_combo_thresholds = json.loads(raw_ct)
+            if _barbie_combo_thresholds:
+                print(
+                    f"[{_ts()}] 🎀 Barbie combo thresholds loaded: {list(_barbie_combo_thresholds)}",
+                    flush=True,
+                )
+        else:
+            _barbie_combo_thresholds = {}
+    except Exception:
+        _barbie_combo_thresholds = {}
 
 
 def _sim_check_barbie_alarm(signals: dict) -> None:
@@ -3272,16 +3351,9 @@ def _sim_select_instrument(signals: dict, regime: str):
         if regime in ("volatile", "neutral") and dirn == "neutral":
             continue
         if direction_str:
-            _co_key   = sym + "_" + direction_str
-            _co_hist  = (_sim.get("combo_outcomes") or {}).get(_co_key, [])
-            _co_n     = len(_co_hist)
-            _co_wins  = sum(_co_hist)
-            if _co_n >= 8 and _co_wins / _co_n < 0.30:
-                _sim_log(
-                    f"⏭️  Skip {sym} {direction_str.upper()}: "
-                    f"combo WR {_co_wins}/{_co_n} ({_co_wins/_co_n:.0%}) "
-                    f"< 30% gate (calibration says avoid)"
-                )
+            _co_skip, _co_reason = _sim_combo_wr_gate(sym, direction_str)
+            if _co_skip:
+                _sim_log(_co_reason)
                 continue
         weight        = _sim_regime_weight(sym, direction_str)
         corr_adj      = _sim_corr_weight(sym, direction_str, signals)
@@ -3355,8 +3427,8 @@ def _sim_close_position(prices: dict, exit_reason: str) -> None:
     _co = _sim.setdefault("combo_outcomes", {})
     _co_b = _co.setdefault(_dtp_combo, [])
     _co_b.append(1 if won else 0)
-    if len(_co_b) > _SIM_TP_WIN_WINDOW:
-        _co[_dtp_combo] = _co_b[-_SIM_TP_WIN_WINDOW:]
+    if len(_co_b) > _SIM_COMBO_WINDOW:
+        _co[_dtp_combo] = _co_b[-_SIM_COMBO_WINDOW:]
 
     _sim["balance"]       += dollar_pnl
     _sim["stage_trades"]  += 1
