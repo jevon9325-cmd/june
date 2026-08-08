@@ -2379,6 +2379,17 @@ _SIM_SKIP_BALANCE_TOL    = 1.20 # re-enable skipped approach once balance grows 
 _SIM_HIGH_VOL_THRESH = 0.50
 _SIM_LOW_VOL_THRESH  = 0.20
 
+# ── Weekend market signal integration ────────────────────────────────────────
+_SIM_WKND_MAX_PTS = 0.5   # max conviction pts from weekend IG signal (capped, additive)
+_WKND_SIGNAL_MAP  = {      # June instrument name → weekend_market_signals key
+    "SILVER":  "gold",     # Silver CFD is EDITS_ONLY on weekends; Gold is proxy
+    "GOLD":    "gold",
+    "EURUSD":  "eurusd",
+    "USDJPY":  "usdjpy",
+}
+_wknd_cache: dict = {"data": None, "t": 0.0}
+_WKND_CACHE_TTL   = 300    # re-read Redis at most every 5 min
+
 # ── Dynamic threshold / streak parameters ────────────────────────────────────
 _SIM_THRESH_BASE     = 0.05   # minimum vol threshold (%) — safety floor only
 _SIM_THRESH_CAP      = 0.50   # maximum vol threshold (%)
@@ -2798,7 +2809,10 @@ def _sim_conviction_gauge(
         rel_pts = -0.5
     else:
         rel_pts = 0.0
-    raw = clearance + regime_pts + bucket_pts + streak_pts + rel_pts
+    wknd_pts = _sim_weekend_pts(sym, direction)
+    raw = clearance + regime_pts + bucket_pts + streak_pts + rel_pts + wknd_pts
+    if wknd_pts:
+        import logging; logging.getLogger().debug(f"  wknd_pts={wknd_pts:+.3f} for {sym}/{direction}")
     return max(1, min(10, round(raw)))
 
 
@@ -2872,6 +2886,43 @@ def _sim_is_paused(combo: str) -> bool:
 def _sim_has_boost(combo: str) -> bool:
     exp = (_sim.get("boost_expiry") or {}).get(combo, 0.0)
     return time.time() < exp
+
+
+def _read_weekend_signals() -> dict | None:
+    """Read weekend_market_signals from Redis with 5-min module-level cache."""
+    now = time.time()
+    if now - _wknd_cache["t"] < _WKND_CACHE_TTL and _wknd_cache["data"] is not None:
+        return _wknd_cache["data"]
+    try:
+        raw = _redis().get("weekend_market_signals")
+        if not raw:
+            _wknd_cache.update({"data": None, "t": now})
+            return None
+        data = json.loads(raw)
+        _wknd_cache.update({"data": data, "t": now})
+        return data
+    except Exception:
+        return None
+
+
+def _sim_weekend_pts(sym: str, direction: str) -> float:
+    """Conviction contribution from weekend IG market signal. Returns 0.0 if absent."""
+    instr_key = _WKND_SIGNAL_MAP.get(sym)
+    if not instr_key:
+        return 0.0
+    signals = _read_weekend_signals()
+    if not signals:
+        return 0.0
+    sig = signals.get("instruments", {}).get(instr_key)
+    if not sig or sig.get("confidence", 0) <= 0.1:
+        return 0.0
+    confidence = sig["confidence"]
+    sig_dir    = sig.get("direction", "flat")
+    if sig_dir == direction:
+        return round(confidence * _SIM_WKND_MAX_PTS, 3)
+    if sig_dir not in ("flat", direction):
+        return round(-confidence * _SIM_WKND_MAX_PTS * 0.5, 3)
+    return 0.0
 
 
 def _sim_get_threshold(sym: str, direction: str = "", low_tier: bool = False) -> float:
