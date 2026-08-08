@@ -2380,7 +2380,7 @@ _SIM_HIGH_VOL_THRESH = 0.50
 _SIM_LOW_VOL_THRESH  = 0.20
 
 # ── Weekend market signal integration ────────────────────────────────────────
-_SIM_WKND_MAX_PTS = 0.5   # max conviction pts from weekend IG signal (capped, additive)
+_SIM_WKND_MAX_PTS = 1.0   # max conviction pts from weekend IG signal; matches streak_pts/rel_pts peers
 _WKND_SIGNAL_MAP  = {      # June instrument name → weekend_market_signals key
     "SILVER":  "gold",     # Silver CFD is EDITS_ONLY on weekends; Gold is proxy
     "GOLD":    "gold",
