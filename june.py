@@ -2497,6 +2497,15 @@ _BARBIE_TP_FRAC_MAX:    float = 1.50  # ceiling: 1.5x avg-win (unreachable above
 _BARBIE_ALARM_KEY:     str   = "barbie_alarm"
 _BARBIE_ALARM_TTL:     int   = 3600   # 1-hour expiry; Barbie deletes on read
 _BARBIE_ALARM_DEFAULT_THRESHOLD: float = 0.50  # 50% vol deviation triggers alarm
+
+_BARBIE_PNL_THRESHOLD_KEY: str = "barbie_pnl_threshold"
+# P&L alarm bounds (fraction of session start balance, negative = drawdown).
+# CEIL tightest: 5 max-stop trades (0.5% stop * 10x lev * 20% position = 1%/trade -> 5%).
+# FLOOR loosest: derived from -20% auto-reset ($40/$50): alarm must fire with 35% headroom
+#   before the floor fires, so 65% * 20% = 13% max looseness.
+_PNLWAKE_CEIL_PCT:    float = -0.05
+_PNLWAKE_FLOOR_PCT:   float = -((1.0 - _SIM_BALANCE_FLOOR / _SIM_START_BALANCE) * 0.65)
+_PNLWAKE_DEFAULT_PCT: float = -0.10
 # Open-position adjustment (Barbie writes, June applies; separate from entry baseline)
 _BARBIE_POS_ADJUST_KEY: str  = "barbie_june_pos_adjust"
 
@@ -3255,6 +3264,57 @@ def _sim_check_barbie_alarm(signals: dict) -> None:
                     flush=True,
                 )
                 break   # one alarm at a time; Barbie re-evaluates all on wake
+    except Exception:
+        pass   # alarm is informational; never crash the cycle
+
+
+def _sim_check_pnl_alarm() -> None:
+    """Check session P&L drawdown against Barbie's noise-tolerance threshold.
+
+    Writes barbie_alarm (alarm_type=pnl_drawdown) if drawdown from session start
+    exceeds Barbie's threshold. Reuses the same Redis key as vol-deviation alarms —
+    one alarm at a time; Barbie reads and consumes on next poll.
+
+    Bounds enforced on read of barbie_pnl_threshold (clamped server-side):
+      CEIL  = -5%  (tightest: 5 max-stop trades at full leverage)
+      FLOOR = -13% (loosest: 65% of June's -20% auto-reset budget)
+    """
+    try:
+        balance      = _sim.get("balance", _SIM_START_BALANCE)
+        session_base = _sim.get("stage_entry_balance", _SIM_START_BALANCE)
+        if session_base <= 0:
+            return
+
+        # Read Barbie's threshold from Redis; clamp to safe bounds regardless of what she sent
+        try:
+            raw_th = _redis().get(_BARBIE_PNL_THRESHOLD_KEY)
+            barbie_th = float(raw_th) if raw_th else _PNLWAKE_DEFAULT_PCT
+        except Exception:
+            barbie_th = _PNLWAKE_DEFAULT_PCT
+        threshold = max(_PNLWAKE_FLOOR_PCT, min(_PNLWAKE_CEIL_PCT, barbie_th))
+
+        drawdown_pct = (balance - session_base) / session_base
+        if drawdown_pct >= threshold:
+            return   # within tolerance
+
+        alarm_payload = {
+            "alarm_type":    "pnl_drawdown",
+            "reason":        (
+                f"session P&L drawdown {drawdown_pct:+.1%} crossed threshold {threshold:+.1%} "
+                f"(balance ${balance:.2f}, session_base ${session_base:.2f})"
+            ),
+            "drawdown_pct":  round(drawdown_pct, 4),
+            "threshold_pct": round(threshold, 4),
+            "balance":       round(balance, 2),
+            "session_base":  round(session_base, 2),
+            "set_at":        int(time.time()),
+        }
+        _redis().set(_BARBIE_ALARM_KEY, json.dumps(alarm_payload), ex=_BARBIE_ALARM_TTL)
+        print(
+            f"[{_ts()}] 🔴 Barbie P&L alarm: session drawdown {drawdown_pct:+.1%} "
+            f"crossed {threshold:+.1%} threshold (${balance:.2f}) -- Barbie notified",
+            flush=True,
+        )
     except Exception:
         pass   # alarm is informational; never crash the cycle
 
@@ -4443,6 +4503,7 @@ def run_simulation_step(signals: dict) -> None:
     _load_barbie_overrides()
     _load_claudia_corr_notes()
     _sim_check_barbie_alarm(signals)   # flag-only; never blocks trade logic
+    _sim_check_pnl_alarm()             # P&L drawdown alarm; reuses barbie_alarm key
 
     # Handle open position -- exit check fires even during weekend closure
     if _sim.get("open_position"):
