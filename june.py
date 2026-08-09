@@ -3192,6 +3192,32 @@ def _load_barbie_overrides() -> None:
         _barbie_combo_thresholds = {}
 
 
+
+_claudia_corr_notes: dict = {}   # qualitative correlation context from Claudia's directive
+
+
+def _load_claudia_corr_notes() -> None:
+    """Read claudia_correlation_notes from Redis. Informational only — surfaces
+    Claudia's qualitative correlation reasoning in June's logs. No numeric weighting.
+    Graceful degradation: leaves dict empty if key missing or stale.
+    """
+    global _claudia_corr_notes
+    try:
+        raw = _redis().get("claudia_correlation_notes")
+        if raw:
+            _claudia_corr_notes = json.loads(raw).get("notes", {})
+            if _claudia_corr_notes:
+                for sym, note in _claudia_corr_notes.items():
+                    print(
+                        f"[{_ts()}] 🔗 Claudia corr note [{sym}]: {note[:80]}",
+                        flush=True,
+                    )
+        else:
+            _claudia_corr_notes = {}
+    except Exception:
+        _claudia_corr_notes = {}
+
+
 def _sim_check_barbie_alarm(signals: dict) -> None:
     """Compare live vol against what Barbie assumed when she set stop_vol_mult overrides.
     Writes barbie_alarm to Redis if deviation exceeds threshold. Pure flag — never blocks
@@ -4415,6 +4441,7 @@ def run_simulation_step(signals: dict) -> None:
         pass
     _load_correlation_map()
     _load_barbie_overrides()
+    _load_claudia_corr_notes()
     _sim_check_barbie_alarm(signals)   # flag-only; never blocks trade logic
 
     # Handle open position -- exit check fires even during weekend closure
