@@ -2818,10 +2818,13 @@ def _sim_conviction_gauge(
         rel_pts = -0.5
     else:
         rel_pts = 0.0
-    wknd_pts = _sim_weekend_pts(sym, direction)
-    raw = clearance + regime_pts + bucket_pts + streak_pts + rel_pts + wknd_pts
+    wknd_pts    = _sim_weekend_pts(sym, direction)
+    claudia_pts = _sim_claudia_pts(sym, direction)
+    raw = clearance + regime_pts + bucket_pts + streak_pts + rel_pts + wknd_pts + claudia_pts
     if wknd_pts:
         import logging; logging.getLogger().debug(f"  wknd_pts={wknd_pts:+.3f} for {sym}/{direction}")
+    if claudia_pts:
+        import logging; logging.getLogger().debug(f"  claudia_pts={claudia_pts:+.3f} for {sym}/{direction}")
     return max(1, min(10, round(raw)))
 
 
@@ -3225,6 +3228,68 @@ def _load_claudia_corr_notes() -> None:
             _claudia_corr_notes = {}
     except Exception:
         _claudia_corr_notes = {}
+
+
+_claudia_directive_notes: dict = {}  # session_directive snapshot for soft conviction signal
+
+
+# June-instrument → Claudia sector labels for avoid/thesis mapping
+_JUNE_SECTOR_MAP: dict = {
+    "GOLD":   {"Gold", "Metals", "Mining"},
+    "SILVER": {"Silver", "Metals", "Mining"},
+    "EURUSD": {"FX", "Dollar", "USD"},
+    "USDJPY": {"FX", "Dollar", "USD"},
+}
+
+
+def _load_claudia_directive_notes() -> None:
+    """Read session_directive from Redis into _claudia_directive_notes.
+    Extracts avoid, thesis_sectors, high_conviction, confidence, june_notes.
+    Graceful degradation: leaves dict empty if key missing or stale.
+    Called each cycle alongside _load_claudia_corr_notes().
+    """
+    global _claudia_directive_notes
+    try:
+        raw = _redis().get("session_directive")
+        if not raw:
+            _claudia_directive_notes = {}
+            return
+        _d = json.loads(raw)
+        _claudia_directive_notes = {
+            "avoid":          _d.get("avoid", []),
+            "thesis_sectors": _d.get("thesis_sectors", []),
+            "high_conviction": _d.get("high_conviction", []),
+            "confidence":     _d.get("confidence", "low"),
+            "june_notes":     _d.get("june_notes", {}),
+        }
+    except Exception:
+        _claudia_directive_notes = {}
+
+
+def _sim_claudia_pts(sym: str, direction: str) -> float:
+    """Soft conviction adjustment from Claudia's session directive.
+    Bounded to ±0.3 (below _SIM_WKND_MAX_PTS=1.0 peer ceiling).
+    Returns 0.0 on missing/stale directive or unmapped instrument.
+    Never a gate — additive only.
+    """
+    if not _claudia_directive_notes:
+        return 0.0
+    _MAX = 0.3
+    _avoid          = _claudia_directive_notes.get("avoid", [])
+    _thesis_sectors = _claudia_directive_notes.get("thesis_sectors", [])
+    _confidence     = _claudia_directive_notes.get("confidence", "low")
+    _scale = {"high": 1.0, "medium": 0.67, "low": 0.33}.get(_confidence, 0.33)
+    _sym_sectors = _JUNE_SECTOR_MAP.get(sym, set())
+    # Direct symbol avoid — strongest signal
+    if sym in _avoid:
+        return round(-_MAX * _scale, 3)
+    # Sector-level avoid — half weight (avoids are Miss-Secretary-centric)
+    if _sym_sectors and any(s in _sym_sectors for s in _avoid):
+        return round(-_MAX * _scale * 0.5, 3)
+    # Thesis sector alignment — positive
+    if _sym_sectors and any(s in _sym_sectors for s in _thesis_sectors):
+        return round(_MAX * _scale * 0.5, 3)
+    return 0.0
 
 
 def _sim_check_barbie_alarm(signals: dict) -> None:
@@ -4502,6 +4567,7 @@ def run_simulation_step(signals: dict) -> None:
     _load_correlation_map()
     _load_barbie_overrides()
     _load_claudia_corr_notes()
+    _load_claudia_directive_notes()
     _sim_check_barbie_alarm(signals)   # flag-only; never blocks trade logic
     _sim_check_pnl_alarm()             # P&L drawdown alarm; reuses barbie_alarm key
 
