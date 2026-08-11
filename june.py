@@ -3286,9 +3286,13 @@ def _sim_claudia_pts(sym: str, direction: str) -> float:
     # Sector-level avoid — half weight (avoids are Miss-Secretary-centric)
     if _sym_sectors and any(s in _sym_sectors for s in _avoid):
         return round(-_MAX * _scale * 0.5, 3)
-    # Thesis sector alignment — positive
+    # Thesis sector alignment — direction-aware
+    # thesis_sectors is bullish context; only boost the aligned (long) direction.
+    # Short in a thesis sector gets 0.0: no penalty (thesis != avoid) but no boost.
     if _sym_sectors and any(s in _sym_sectors for s in _thesis_sectors):
-        return round(_MAX * _scale * 0.5, 3)
+        if direction == "long":
+            return round(_MAX * _scale * 0.5, 3)
+        return 0.0  # short opposes bullish thesis — no boost, not penalised
     return 0.0
 
 
