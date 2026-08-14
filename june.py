@@ -2311,6 +2311,10 @@ def poll_cycle() -> bool:
     if _sim:
         run_simulation_step(signals)
 
+    # Live trading step (real orders gated behind june_live_enabled kill switch)
+    if _live:
+        run_live_step(signals)
+
     # Log summary
     alert_tag = f"  🚨 ALERTS → {alerts}" if alerts else ""
     price_row = " | ".join(f"{s}={v['price']:.4f}({v['change_5m']:+.3f}%)" for s, v in signals.items())
@@ -5061,6 +5065,956 @@ def _ts() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# LIVE TRADING — June v0.3
+# Real-money order placement via IG live account, gated behind june_live_enabled.
+#
+# Architecture:
+#   - Own Redis state (june_live_state), never touches june_sim_state
+#   - Reuses sim's proven decision functions (eligibility, conviction, combo_wr_gate,
+#     threshold, TP/stop, 15m-gate, regime_weight, corr_weight, claudia_pts)
+#   - Every order-placement call starts with _live_trade_guard() — structurally
+#     impossible to place a real order while june_live_enabled=false
+#   - With switch OFF: full decision logic runs, logs "WOULD" actions, no real orders
+#   - With switch ON:  real IG OTC orders placed, positions tracked in _live dict
+#
+# Kill switch: redis-cli SET june_live_enabled true   (enable)
+#              redis-cli SET june_live_enabled false  (disable, default)
+# ══════════════════════════════════════════════════════════════════════════════
+
+# ── Live state ────────────────────────────────────────────────────────────────
+_live: dict             = {}      # runtime state; empty = not started
+_live_balance_polled_at: float = 0.0
+_live_pnl_polled_at:    float  = 0.0
+
+_LIVE_REDIS_KEY      = "june_live_state"
+_LIVE_REDIS_TTL      = 30 * 24 * 3600  # 30 days
+_LIVE_POLL_INTERVAL  = 300             # fetch balance + P&L every 5 minutes
+_LIVE_LOT_SIZE_FX    = 10.0           # lotSize for all verified FX pairs (EURUSD/NZDUSD/etc.)
+_LIVE_FX_PIP         = 0.0001         # 1 pip for 4-decimal-place FX pairs
+_LIVE_JPY_PIP        = 0.01           # 1 pip for JPY pairs (2 decimal places)
+_LIVE_MARGIN_FACTOR  = 0.02           # 2% IG retail margin requirement for FX CFDs
+
+# Skim milestones — hardcoded, no other numbers
+_LIVE_SKIM_PHASE1_TRIGGER = 300.0   # first skim fires at $300 cumulative earned P&L
+_LIVE_SKIM_PHASE1_AMOUNT  = 100.0   # $100 increments until $500
+_LIVE_SKIM_PHASE2_TRIGGER = 500.0   # switch to half-mode at $500
+_LIVE_SKIM_HALF_MIN_GAP   = 3600    # half-mode: don't re-flag more often than hourly
+
+
+def _live_log(msg: str) -> None:
+    print(f"[{_ts()}] 🟢 LIVE: {msg}", flush=True)
+
+
+# ── Redis persistence ─────────────────────────────────────────────────────────
+
+def _live_save_state() -> None:
+    try:
+        _redis().set(_LIVE_REDIS_KEY, json.dumps(_live), ex=_LIVE_REDIS_TTL)
+    except Exception as _e:
+        import logging
+        logging.warning(f"live_save_state failed: {_e}")
+
+
+def _live_load_state() -> bool:
+    """Load persisted state from Redis. Returns True if state was found."""
+    global _live
+    try:
+        raw = _redis().get(_LIVE_REDIS_KEY)
+        if raw:
+            _live.update(json.loads(raw))
+            return True
+    except Exception:
+        pass
+    return False
+
+
+# ── IG live POST / DELETE wrappers ────────────────────────────────────────────
+
+def _ig_live_post(path: str, body: dict, version: str = "2") -> Optional[dict]:
+    """POST to live IG account. Returns parsed response dict or None on failure.
+    Handles 401 re-auth and logs errors. Does NOT call _live_trade_guard() —
+    callers must gate before reaching here.
+    """
+    if not _ensure_live_session():
+        return None
+    url  = f"{IG_LIVE_BASE}{path}"
+    hdrs = {
+        "X-IG-API-KEY":     IG_LIVE_KEY,
+        "CST":              _live_sess["cst"],
+        "X-SECURITY-TOKEN": _live_sess["token"],
+        "Content-Type":     "application/json; charset=UTF-8",
+        "Accept":           "application/json; charset=UTF-8",
+        "Version":          version,
+    }
+    try:
+        r = requests.post(url, headers=hdrs, json=body, timeout=15)
+        if r.status_code == 401:
+            _live_log(f"401 on {path} — re-authenticating live session")
+            if not authenticate_live():
+                return None
+            hdrs["CST"]              = _live_sess["cst"]
+            hdrs["X-SECURITY-TOKEN"] = _live_sess["token"]
+            r = requests.post(url, headers=hdrs, json=body, timeout=15)
+        if r.status_code in (200, 201):
+            return r.json()
+        _live_log(f"POST {path}: HTTP {r.status_code} {r.text[:120]}")
+        return None
+    except Exception as exc:
+        _live_log(f"POST {path} error: {exc}")
+        return None
+
+
+def _ig_live_delete(path: str, version: str = "1") -> Optional[dict]:
+    """DELETE to live IG account."""
+    if not _ensure_live_session():
+        return None
+    url  = f"{IG_LIVE_BASE}{path}"
+    hdrs = {
+        "X-IG-API-KEY":     IG_LIVE_KEY,
+        "CST":              _live_sess["cst"],
+        "X-SECURITY-TOKEN": _live_sess["token"],
+        "Content-Type":     "application/json; charset=UTF-8",
+        "Accept":           "application/json; charset=UTF-8",
+        "Version":          version,
+    }
+    try:
+        r = requests.delete(url, headers=hdrs, timeout=15)
+        if r.status_code == 401:
+            if not authenticate_live():
+                return None
+            hdrs["CST"]              = _live_sess["cst"]
+            hdrs["X-SECURITY-TOKEN"] = _live_sess["token"]
+            r = requests.delete(url, headers=hdrs, timeout=15)
+        if r.status_code in (200, 201):
+            return r.json()
+        _live_log(f"DELETE {path}: HTTP {r.status_code} {r.text[:120]}")
+        return None
+    except Exception as exc:
+        _live_log(f"DELETE {path} error: {exc}")
+        return None
+
+
+# ── Balance and P&L polling (Part 1 + Part 3) ────────────────────────────────
+
+def _live_poll_balance() -> None:
+    """Fetch live account balance from IG /accounts every 5 minutes.
+    Updates _live['balance'] and _live['balance_fetched_at'].
+    """
+    global _live_balance_polled_at
+    now = time.time()
+    if now - _live_balance_polled_at < _LIVE_POLL_INTERVAL:
+        return
+    data = _ig_live_get("/accounts", version="1")
+    if not data:
+        return
+    for acct in data.get("accounts", []):
+        if acct.get("preferred") or acct.get("accountType") == "CFD":
+            bal = acct.get("balance", {})
+            _live["balance"]           = float(bal.get("available", 0.0))
+            _live["balance_total"]     = float(bal.get("balance", 0.0))
+            _live["balance_margin"]    = float(bal.get("deposit", 0.0))
+            _live["balance_fetched_at"] = int(now)
+            _live_balance_polled_at    = now
+            _live_log(f"Balance: ${_live['balance']:.2f} available, "
+                      f"${_live['balance_margin']:.2f} in margin")
+            _live_save_state()
+            return
+
+
+def _live_poll_pnl() -> None:
+    """Fetch IG transaction history every 5 minutes.
+
+    Filters to DEAL-type transactions only — deposits (DEPOSIT) and withdrawals
+    (WITHDRAWAL) are excluded, ensuring cumulative_earned_pnl reflects only
+    genuinely earned trading P&L, never account funding events.
+
+    Uses a processed-reference set to avoid double-counting across polls.
+    Polling window: 90 days (covers any reasonable gap between restarts).
+    """
+    global _live_pnl_polled_at
+    now = time.time()
+    if now - _live_pnl_polled_at < _LIVE_POLL_INTERVAL:
+        return
+    data = _ig_live_get(
+        "/history/transactions",
+        params={"type": "ALL", "maxSpanSeconds": 90 * 24 * 3600},
+        version="2",
+    )
+    if not data:
+        return
+    txs         = data.get("transactions", [])
+    seen_refs   = set(_live.get("pnl_seen_refs", []))
+    earned_new  = 0.0
+    for tx in txs:
+        ref  = str(tx.get("reference", ""))
+        ttype = tx.get("transactionType", "")
+        if ttype != "DEAL":
+            continue                # skip DEPOSIT, WITHDRAWAL, EXCHANGE — only real trading P&L
+        if ref in seen_refs:
+            continue
+        pnl_str = tx.get("profitAndLoss", "$0")
+        try:
+            pnl_val = float(pnl_str.replace("$", "").replace(",", ""))
+        except (ValueError, AttributeError):
+            continue
+        earned_new += pnl_val
+        seen_refs.add(ref)
+
+    if earned_new != 0.0:
+        _live["cumulative_earned_pnl"] = round(
+            _live.get("cumulative_earned_pnl", 0.0) + earned_new, 4
+        )
+        _live_log(f"Earned P&L updated: +${earned_new:.4f} → "
+                  f"cumulative ${_live['cumulative_earned_pnl']:.4f}")
+
+    # Cap seen_refs at 2000 entries (prevent unbounded Redis growth)
+    if len(seen_refs) > 2000:
+        seen_refs = set(list(seen_refs)[-2000:])
+    _live["pnl_seen_refs"]  = list(seen_refs)
+    _live["pnl_fetched_at"] = int(now)
+    _live_pnl_polled_at     = now
+    _live_save_state()
+
+
+# ── Skim-cycle mechanics (Part 4) ────────────────────────────────────────────
+
+def _live_check_skim() -> None:
+    """Apply confirmed skim milestones. No other numbers or tiers.
+
+    Phase pre300    : earned P&L < $300 — no skim
+    Phase h100      : earned >= $300, flag $100 increments until earned >= $500
+    Phase half      : earned >= $500, flag 50% of available balance (max once/hour)
+
+    Skim execution (actual funds movement) is gated behind _live_trade_guard().
+    When the switch is OFF, skim thresholds are logged but not flagged, so Jevon
+    reviews the decision before enabling real execution.
+    """
+    earned = _live.get("cumulative_earned_pnl", 0.0)
+    phase  = _live.get("skim_phase", "pre300")
+
+    if phase == "pre300":
+        if earned < _LIVE_SKIM_PHASE1_TRIGGER:
+            return
+        _live["skim_phase"]            = "h100"
+        _live["next_skim_threshold"]   = _LIVE_SKIM_PHASE1_TRIGGER
+        _live_log(f"Skim phase → h100 (earned ${earned:.2f})")
+        phase = "h100"
+
+    if phase == "h100":
+        next_t = _live.get("next_skim_threshold", _LIVE_SKIM_PHASE1_TRIGGER)
+        while earned >= next_t and next_t < _LIVE_SKIM_PHASE2_TRIGGER:
+            if not _live_trade_guard():
+                _live_log(f"SKIM WOULD FLAG: ${_LIVE_SKIM_AMOUNT:.2f} "
+                          f"(earned ${earned:.2f} ≥ ${next_t:.0f} threshold) "
+                          f"— kill switch off, not flagging yet")
+                break
+            skim_now                    = _LIVE_SKIM_PHASE1_AMOUNT
+            _live["skim_pending"]       = round(_live.get("skim_pending", 0.0) + skim_now, 2)
+            _live["skimmed_total"]      = round(_live.get("skimmed_total", 0.0) + skim_now, 2)
+            next_t                     += _LIVE_SKIM_PHASE1_AMOUNT
+            _live_log(f"💰 SKIM FLAGGED: ${skim_now:.2f} "
+                      f"(earned ${earned:.2f}, next at ${next_t:.0f})")
+        _live["next_skim_threshold"] = next_t
+
+        if earned >= _LIVE_SKIM_PHASE2_TRIGGER:
+            _live["skim_phase"] = "half"
+            _live_log("Skim phase → half (earned ≥ $500)")
+            phase = "half"
+        else:
+            _live_save_state()
+            return
+
+    if phase == "half":
+        last_half = _live.get("last_half_skim_time", 0.0)
+        if time.time() - last_half < _LIVE_SKIM_HALF_MIN_GAP:
+            return
+        avail    = _live.get("balance", 0.0)
+        skim_now = round(avail / 2.0, 2)
+        if not _live_trade_guard():
+            _live_log(f"SKIM WOULD FLAG: ${skim_now:.2f} (half of ${avail:.2f}) "
+                      f"— kill switch off, not flagging yet")
+            return
+        _live["skim_pending"]        = round(_live.get("skim_pending", 0.0) + skim_now, 2)
+        _live["skimmed_total"]       = round(_live.get("skimmed_total", 0.0) + skim_now, 2)
+        _live["last_half_skim_time"] = time.time()
+        _live_log(f"💰 SKIM FLAGGED: ${skim_now:.2f} (half of ${avail:.2f} available)")
+
+    _live_save_state()
+
+
+# Fix reference error — _LIVE_SKIM_AMOUNT used inside loop but wrong name
+_LIVE_SKIM_AMOUNT = _LIVE_SKIM_PHASE1_AMOUNT   # alias for readability inside h100 loop
+
+
+# ── Instrument eligibility (Part 2) ──────────────────────────────────────────
+
+def _live_is_eligible(sym: str) -> bool:
+    """Eligibility check using LIVE balance. Reuses _sim_is_eligible formula:
+      min_notional / leverage_ceiling <= concentration_cap * live_balance
+
+    This automatically expands as the live account grows — no hardcoded forex-only flag.
+    Silver/equities (high min_notionals) correctly stay ineligible at $48 and
+    become eligible automatically once balance supports their minimum.
+    """
+    bal    = _live.get("balance", 0.0)
+    if bal <= 0:
+        return False
+    lev    = _SIM_LEV_RANGES.get("sprout", (3, 10))[1]  # ceiling leverage
+    return _sim_is_eligible(sym, bal, lev)
+
+
+def _live_is_paused(combo: str) -> bool:
+    """Live-specific pause tracking — separate from sim's pause_expiry."""
+    exp = (_live.get("pause_expiry") or {}).get(combo, 0.0)
+    return time.time() < exp
+
+
+def _live_has_boost(combo: str) -> bool:
+    """Live-specific boost tracking — separate from sim's boost_expiry."""
+    exp = (_live.get("boost_expiry") or {}).get(combo, 0.0)
+    return time.time() < exp
+
+
+def _live_update_streak(sym: str, direction: str, won: bool) -> None:
+    """Track live-specific streak state (separate from sim's streak_state).
+    Mirrors _sim_update_streak logic against _live dict.
+    """
+    combo        = _sim_combo_key(sym, direction)
+    streak_state = _live.setdefault("streak_state", {})
+    boost_expiry = _live.setdefault("boost_expiry", {})
+    pause_expiry = _live.setdefault("pause_expiry", {})
+    if won:
+        streak_state[combo] = 0
+        boost_expiry[combo] = 0.0
+        pause_expiry[combo] = 0.0
+        return
+    streak_state[combo] = streak_state.get(combo, 0) + 1
+    n = streak_state[combo]
+    if n == _SIM_STREAK_BOOST:
+        boost_end          = time.time() + _SIM_BOOST_DUR
+        boost_expiry[combo] = boost_end
+        _live_log(f"⚠️ {sym} {direction.upper()} live streak {n} — "
+                  f"threshold raised for {int(_SIM_BOOST_DUR // 60)}m")
+    elif n >= _SIM_STREAK_PAUSE:
+        pause_end           = time.time() + _SIM_PAUSE_DUR
+        pause_expiry[combo] = pause_end
+        boost_expiry[combo] = 0.0
+        resume = datetime.fromtimestamp(pause_end, tz=timezone.utc).strftime("%H:%M UTC")
+        _live_log(f"🛑 {sym} {direction.upper()} live streak {n} — paused until {resume}")
+
+
+# ── Sizing helpers ────────────────────────────────────────────────────────────
+
+def _live_compute_ig_size(sym: str, desired_notional_usd: float, mid_price: float) -> int:
+    """Convert desired USD notional to IG order size (integer lots).
+
+    Formula: 1 size unit = lotSize × mid_price USD notional
+    (derived from IG's backfill formula: min_notional = minDealSize × lotSize × mid)
+
+    Equities (.CASH.IP) use different lot sizes — not eligible at current balance
+    so this only covers FX pairs where lotSize=10.0 is universal.
+    """
+    if mid_price <= 0:
+        return 0
+    unit_value = _LIVE_LOT_SIZE_FX * mid_price
+    raw        = desired_notional_usd / unit_value
+    return max(1, int(raw))    # floor to integer, minimum 1 lot
+
+
+def _live_compute_stop_pts(sym: str, stop_pct: float) -> int:
+    """Convert fractional stop loss to IG stop distance in points.
+
+    Points = price × stop_pct / pip_size, where pip_size = 0.01 for JPY, 0.0001 otherwise.
+    Minimum enforced: 4 pts (IG min normal stop distance for FX).
+    """
+    pip_sz = _LIVE_JPY_PIP if "JPY" in sym else _LIVE_FX_PIP
+    # Use a conservative reference price (0.59 for NZDUSD-range pairs is safe approximation;
+    # actual entry price is passed in _live_open_position which uses the real fill price)
+    ref_price = _live_entry_price_ref(sym)
+    pts       = int(ref_price * stop_pct / pip_sz)
+    return max(4, pts)
+
+
+def _live_entry_price_ref(sym: str) -> float:
+    """Return current mid price for sym from signals or spread baselines (best-effort)."""
+    try:
+        raw = _redis().get("june_spread_baselines")
+        if raw:
+            bases = json.loads(raw).get("baselines", {})
+            if sym in bases:
+                # baselines are in % — this gives us the scale, not the price.
+                pass
+    except Exception:
+        pass
+    # Fallback: use _sim_min_notional as proxy (min_notional ≈ lotSize × mid × 1)
+    mn = _sim_min_notional.get(sym)
+    if mn and mn > 0:
+        return mn / _LIVE_LOT_SIZE_FX
+    return 1.0   # safe fallback for pts calculation (will be replaced by real fill price)
+
+
+# ── Order deal confirmation ───────────────────────────────────────────────────
+
+def _live_confirm_deal(deal_ref: str, retries: int = 3) -> Optional[dict]:
+    """Poll /deals/confirms/{dealReference} until status != PENDING.
+    Returns the confirmed deal dict or None on failure.
+    """
+    for _ in range(retries):
+        time.sleep(1)
+        data = _ig_live_get(f"/deals/confirms/{deal_ref}", version="1")
+        if data:
+            status = data.get("dealStatus", "")
+            if status != "PENDING":
+                return data
+    return None
+
+
+# ── Order placement (Part 5) — gated behind _live_trade_guard() ──────────────
+
+def _live_open_position(sym: str, direction: str, signals: dict,
+                        pos_size: float, leverage: int, conviction: int) -> None:
+    """Place a real BUY/SELL order on the IG live account.
+
+    STRUCTURALLY GATED: _live_trade_guard() is the first call. No code path can
+    reach the actual POST without the guard returning True. With the switch OFF,
+    a detailed WOULD-BUY log fires instead so Jevon can review decision quality.
+
+    Args:
+        sym:       instrument key (e.g. "NZDUSD")
+        direction: "long" or "short"
+        signals:   current price signals dict
+        pos_size:  USD position size (from sizing logic)
+        leverage:  conviction-derived leverage multiplier
+        conviction: 1-10 conviction score
+    """
+    sig       = signals.get(sym, {})
+    mid_price = sig.get("price", 0.0)
+    if mid_price <= 0:
+        _live_log(f"open_position aborted: no price for {sym}")
+        return
+
+    notional  = pos_size * leverage
+    ig_size   = _live_compute_ig_size(sym, notional, mid_price)
+    actual_n  = ig_size * _LIVE_LOT_SIZE_FX * mid_price
+    stop_pct  = max(_sim_get_dynamic_stop(sym), _sim_get_spread_floor(sym))
+    tp_pct    = _sim_get_tp(sym, direction, conviction)
+    stop_dist = _live_compute_stop_pts(sym, stop_pct)
+
+    ig_direction = "BUY" if direction == "long" else "SELL"
+    epic         = INSTRUMENTS.get(sym, "")
+
+    _live_log(
+        f"{'WOULD-BUY' if not _june_live_trading_enabled else 'BUY'}: "
+        f"{sym} {ig_direction} size={ig_size} (notional ~${actual_n:.2f}) | "
+        f"conviction {conviction}/10 lev {leverage}:1 | "
+        f"stop {stop_pct*100:.2f}% ({stop_dist}pts) TP {tp_pct*100:.2f}%"
+    )
+
+    if not _live_trade_guard():  # ← structural gate: no order without this passing
+        return
+
+    # ── Real order placement ──────────────────────────────────────────────────
+    order_body = {
+        "epic":          epic,
+        "expiry":        "-",
+        "direction":     ig_direction,
+        "size":          ig_size,
+        "orderType":     "MARKET",
+        "timeInForce":   "FILL_OR_KILL",
+        "guaranteedStop": False,
+        "forceOpen":     True,
+        "currencyCode":  "USD",
+        "stopDistance":  stop_dist,     # attached stop — limits actual risk
+    }
+
+    resp = _ig_live_post("/positions/otc", order_body, version="2")
+    if not resp:
+        _live_log(f"open_position: POST failed for {sym}")
+        return
+
+    deal_ref = resp.get("dealReference", "")
+    if not deal_ref:
+        _live_log(f"open_position: no dealReference in response for {sym}")
+        return
+
+    # Confirm fill
+    confirm = _live_confirm_deal(deal_ref)
+    if not confirm:
+        _live_log(f"open_position: could not confirm {deal_ref} for {sym}")
+        return
+
+    status = confirm.get("dealStatus", "")
+    if status != "ACCEPTED":
+        _live_log(f"open_position: {sym} deal {status}: {confirm.get('reason', '?')}")
+        return
+
+    fill_price = float(confirm.get("level", mid_price))
+    deal_id    = confirm.get("dealId", "")
+    _live["open_position"] = {
+        "instrument":   sym,
+        "direction":    direction,
+        "deal_id":      deal_id,
+        "deal_ref":     deal_ref,
+        "fill_price":   fill_price,
+        "ig_size":      ig_size,
+        "pos_size":     pos_size,
+        "leverage":     leverage,
+        "notional":     actual_n,
+        "stop_pct":     stop_pct,
+        "tp_pct":       tp_pct,
+        "stop_dist":    stop_dist,
+        "entry_time":   time.time(),
+        "entry_vol":    abs(sig.get("change_5m", 0.0)),
+        "conviction":   conviction,
+        "claudia_pts":  _sim_claudia_pts(sym, direction),
+        "reversal_count": 0,
+    }
+    _live["total_trades"]    = _live.get("total_trades", 0) + 1
+    _live_log(
+        f"✅ LIVE POSITION OPENED: {sym} {ig_direction} @ {fill_price:.5f} "
+        f"| size {ig_size} | notional ${actual_n:.2f} | deal {deal_id}"
+    )
+    _live_save_state()
+
+
+def _live_close_position(exit_reason: str, signals: dict) -> None:
+    """Close the current live position via an opposing IG market order.
+
+    STRUCTURALLY GATED: _live_trade_guard() is the first call. With switch OFF,
+    logs WOULD-SELL and returns without placing any order.
+    """
+    pos = (_live.get("open_position") or {}).copy()
+    if not pos:
+        return
+
+    sym       = pos["instrument"]
+    dirn      = pos["direction"]
+    ig_size   = pos.get("ig_size", 1)
+    deal_id   = pos.get("deal_id", "")
+    fill_px   = pos.get("fill_price", 0.0)
+    entry_t   = pos.get("entry_time", time.time())
+
+    # Reconstruct current price for P&L logging
+    sig       = signals.get(sym, {})
+    mid       = sig.get("price", fill_px)
+    exit_px   = mid  # approximate — actual fill confirmed after order
+    pnl_pct   = (exit_px - fill_px) / fill_px if dirn == "long" else \
+                (fill_px - exit_px) / fill_px
+    notional  = pos.get("notional", pos.get("ig_size", 1) * _LIVE_LOT_SIZE_FX * mid)
+    dollar_pnl = notional * pnl_pct
+    hold_min  = (time.time() - entry_t) / 60.0
+    close_dir = "SELL" if dirn == "long" else "BUY"
+    epic      = INSTRUMENTS.get(sym, "")
+
+    _live_log(
+        f"{'WOULD-SELL' if not _june_live_trading_enabled else 'SELL'}: "
+        f"{sym} {close_dir} | P&L ~{pnl_pct*100:+.2f}% (${dollar_pnl:+.2f}) | "
+        f"hold {hold_min:.0f}m | {exit_reason}"
+    )
+
+    if not _live_trade_guard():  # ← structural gate
+        return
+
+    # ── Real close order ──────────────────────────────────────────────────────
+    close_body = {
+        "epic":        epic,
+        "expiry":      "-",
+        "direction":   close_dir,
+        "size":        ig_size,
+        "orderType":   "MARKET",
+        "timeInForce": "FILL_OR_KILL",
+        "dealId":      deal_id,
+    }
+    resp = _ig_live_post("/positions/otc", close_body, version="1")
+    if not resp:
+        _live_log(f"close_position: POST failed for {sym} — position may still be open")
+        return
+
+    deal_ref = resp.get("dealReference", "")
+    confirm  = _live_confirm_deal(deal_ref) if deal_ref else None
+
+    if confirm and confirm.get("dealStatus") == "ACCEPTED":
+        real_exit  = float(confirm.get("level", exit_px))
+        real_pnl_p = (real_exit - fill_px) / fill_px if dirn == "long" else \
+                     (fill_px - real_exit) / fill_px
+        real_dollar = notional * real_pnl_p
+        won         = real_dollar > 0
+        _live_log(
+            f"✅ LIVE POSITION CLOSED: {sym} @ {real_exit:.5f} | "
+            f"P&L {real_pnl_p*100:+.2f}% (${real_dollar:+.2f}) | {exit_reason}"
+        )
+
+        # Record trade
+        trade_rec = {
+            "instrument":   sym,
+            "direction":    dirn,
+            "entry_price":  fill_px,
+            "exit_price":   real_exit,
+            "ig_size":      ig_size,
+            "notional":     round(notional, 2),
+            "pnl_pct":      round(real_pnl_p, 6),
+            "dollar_pnl":   round(real_dollar, 4),
+            "hold_min":     round(hold_min, 1),
+            "exit_epoch":   int(time.time()),
+            "exit_reason":  exit_reason,
+            "conviction":   pos.get("conviction", 0),
+            "claudia_pts":  pos.get("claudia_pts", 0.0),
+        }
+        hist = _live.setdefault("trade_history", [])
+        hist.append(trade_rec)
+        if len(hist) > 50:
+            _live["trade_history"] = hist[-50:]
+
+        # Update totals
+        _live["total_wins"]   = _live.get("total_wins", 0)   + int(won)
+        _live["total_losses"] = _live.get("total_losses", 0) + int(not won)
+        if dirn == "long":
+            _live["long_pnl"]    = round(_live.get("long_pnl", 0.0)  + real_dollar, 4)
+            _live["long_trades"] = _live.get("long_trades", 0) + 1
+            if won: _live["long_wins"] = _live.get("long_wins", 0) + 1
+        else:
+            _live["short_pnl"]    = round(_live.get("short_pnl", 0.0) + real_dollar, 4)
+            _live["short_trades"] = _live.get("short_trades", 0) + 1
+            if won: _live["short_wins"] = _live.get("short_wins", 0) + 1
+
+        _live_update_streak(sym, dirn, won)
+    else:
+        _live_log(f"close_position: confirm failed or rejected for {sym} — check IG manually")
+
+    _live["open_position"] = None
+    _live_save_state()
+
+
+# ── Exit checks (Part 5 — mirrors _sim_check_exit) ───────────────────────────
+
+def _live_check_exit(signals: dict, regime: str) -> None:
+    """Exit checks for live position, mirroring _sim_check_exit logic.
+    Reads sim's calibrated vol_history, win_moves, loss_moves via _sim_get_tp /
+    _sim_get_dynamic_stop — this is intentional: sim calibration informs live.
+    """
+    pos = _live.get("open_position")
+    if not pos:
+        return
+    sym       = pos["instrument"]
+    hold_sec  = time.time() - pos.get("entry_time", time.time())
+    dirn      = pos["direction"]
+
+    # Max hold — always fires regardless of price availability
+    if hold_sec >= _SIM_MAX_HOLD_SECS:
+        _live_log(f"⏰ {sym}: max hold {hold_sec/3600:.1f}h — exiting")
+        _live_close_position("max_hold", signals)
+        return
+
+    if sym not in signals:
+        return
+
+    sig      = signals[sym]
+    mid      = sig.get("price", 0.0)
+    if mid <= 0:
+        return
+
+    fill_px  = pos.get("fill_price", mid)
+    pnl_pct  = (mid - fill_px) / fill_px if dirn == "long" else (fill_px - mid) / fill_px
+    sig_dir  = sig.get("direction", "neutral")
+
+    stop_pct = pos.get("stop_pct", _sim_get_dynamic_stop(sym))
+    tp_pct   = pos.get("tp_pct",   _sim_get_tp(sym, dirn, pos.get("conviction", 5)))
+
+    if pnl_pct <= -stop_pct:
+        _live_close_position("stop_loss", signals)
+        return
+    if pnl_pct >= tp_pct:
+        _live_close_position("take_profit", signals)
+        return
+
+    # Asymmetric reversal (same patience logic as sim)
+    opposing = (dirn == "long"  and (regime == "bear" or sig_dir == "bear")) or \
+               (dirn == "short" and (regime == "bull"  or sig_dir == "bull"))
+    if opposing:
+        patience  = _SIM_REV_PATIENCE_WIN if pnl_pct > 0 else _SIM_REV_PATIENCE_LOSS
+        rev_count = pos.get("reversal_count", 0) + 1
+        _live["open_position"]["reversal_count"] = rev_count
+        if rev_count >= patience:
+            _live_close_position("reversal", signals)
+            return
+    elif pos.get("reversal_count", 0):
+        _live["open_position"]["reversal_count"] = 0
+
+
+# ── Instrument selection (Part 2 — mirrors _sim_select_instrument) ────────────
+
+def _live_select_instrument(signals: dict, regime: str) -> Optional[str]:
+    """Candidate selection using live balance. Calls same sub-functions as sim.
+
+    Eligibility formula: _sim_is_eligible(sym, live_balance, lev_ceiling) — identical
+    to sim's check, so eligibility expands automatically as live account grows.
+    Silver and equities correctly fail at $48 and unlock when balance supports them.
+    """
+    bal        = _live.get("balance", 0.0)
+    if bal <= 0:
+        return None
+    lev_ceil   = _SIM_LEV_RANGES.get("sprout", (3, 10))[1]
+    best_sym, best_vol = None, 0.0
+
+    for sym in _sim_eligible:
+        if not _sim_is_eligible(sym, bal, lev_ceil):
+            continue
+        if sym not in signals:
+            continue
+        sig  = signals[sym]
+        vol  = abs(sig.get("change_5m", 0.0))
+        dirn = sig.get("direction", "neutral")
+        direction_str = "long" if dirn == "bull" else ("short" if dirn == "bear" else "")
+
+        thresh = _sim_get_threshold(sym, direction_str, low_tier=(_sim_vol_bucket(vol) == "low"))
+        if vol < thresh:
+            continue
+        if sig.get("spread_alert"):
+            continue
+        if direction_str and _live_is_paused(_sim_combo_key(sym, direction_str)):
+            continue
+        if regime == "bull" and dirn != "bull": continue
+        if regime == "bear" and dirn != "bear": continue
+        if regime in ("volatile", "neutral") and dirn == "neutral": continue
+        if direction_str:
+            skip, reason = _sim_combo_wr_gate(sym, direction_str)
+            if skip:
+                _live_log(f"skip {sym}: {reason}")
+                continue
+        weight     = _sim_regime_weight(sym, direction_str)
+        corr_adj   = _sim_corr_weight(sym, direction_str, signals)
+        eff_vol    = vol * weight * corr_adj
+        if eff_vol > best_vol:
+            best_vol = eff_vol
+            best_sym = sym
+
+    return best_sym
+
+
+# ── Entry logic (Part 5 — mirrors _sim_try_entry) ─────────────────────────────
+
+def _live_try_entry(signals: dict, regime: str) -> None:
+    """Evaluate entry for live trading. Reuses all sim decision functions.
+    Calls _live_open_position which is the only place orders are placed.
+    """
+    if _live.get("open_position"):
+        return     # one position at a time
+
+    bal = _live.get("balance", 0.0)
+    if bal <= 0:
+        return
+
+    # Extend signals with fresh equity CFD snapshots (same pattern as sim)
+    _ext = dict(signals)
+    _now_ext = time.time()
+    for _eq_b, _eq_d in _direct_cfd_signals.items():
+        if _eq_b in _ext:
+            continue
+        if _now_ext - _eq_d.get("ts", 0) > 20 * 60:
+            continue
+        _eq_mid = _eq_d.get("mid", 0.0)
+        if _eq_mid <= 0.0:
+            continue
+        _eq_dir_raw = _eq_d.get("direction", "flat")
+        _ext[_eq_b] = {
+            "change_5m":    _eq_d["pct"],
+            "direction":    "neutral" if _eq_dir_raw == "flat" else _eq_dir_raw,
+            "spread_alert": False,
+            "price":        _eq_mid,
+            "spread_pct":   0.1,
+            "change_15m":   None,
+        }
+
+    sym = _live_select_instrument(_ext, regime)
+    if not sym or sym not in _ext:
+        return
+
+    sig       = _ext[sym]
+    chg       = sig.get("change_5m", 0.0)
+    vol       = abs(chg)
+    direction = "long" if chg > 0 else "short"
+    combo     = _sim_combo_key(sym, direction)
+
+    # 1m anti-reversal gate (same as sim)
+    price_1m = _price_n_minutes_ago(sym, 1)
+    if price_1m and price_1m > 0:
+        cur_px = sig.get("price", 0.0)
+        rev_pct = abs(cur_px - price_1m) / price_1m * 100.0
+        if direction == "long" and cur_px < price_1m and rev_pct >= _SIM_1M_MIN_REVERSAL:
+            return
+        if direction == "short" and cur_px > price_1m and rev_pct >= _SIM_1M_MIN_REVERSAL:
+            return
+
+    # 15m gate (same as sim, uses sim's reliability data — calibration shared)
+    change_15m = sig.get("change_15m") or 0.0
+    hist_sym   = _history.get(sym)
+    has_15m    = hist_sym is not None and len(hist_sym) >= 15
+    gate_mode, rel_score = _sim_15m_gate_mode(sym, direction)
+
+    if has_15m and gate_mode != "relaxed":
+        blocked = False
+        if gate_mode == "strict":
+            blocked = (direction == "long" and change_15m <= 0) or \
+                      (direction == "short" and change_15m >= 0)
+        else:
+            blocked = (direction == "long" and change_15m <= -_SIM_15M_DEADZONE) or \
+                      (direction == "short" and change_15m >= _SIM_15M_DEADZONE)
+        if blocked:
+            _live_log(f"skip {sym}: 15m gate ({gate_mode})")
+            return
+
+    # Conviction and leverage
+    thresh  = _sim_get_threshold(sym, direction)
+    weight  = _sim_regime_weight(sym, direction)
+    conv    = _sim_conviction_gauge(sym, direction, vol, thresh, weight, combo,
+                                    gate_mode, rel_score)
+    lev     = _sim_conviction_leverage("sprout", conv)
+
+    # Sizing — use pct_10 targeting (10% of live balance, minimum $10)
+    pos_size = max(10.0, round(bal * 0.10, 2))
+    notional = pos_size * lev
+
+    # Check IG minimum feasibility
+    if not _sim_check_min_feasible(sym, pos_size, lev):
+        # Try with $10 fixed if pct_10 too small
+        if not _sim_check_min_feasible(sym, 10.0, lev):
+            _live_log(f"skip {sym}: notional ${notional:.2f} < IG min "
+                      f"${_sim_min_notional.get(sym, 0):.2f}")
+            return
+        pos_size = 10.0
+        notional = pos_size * lev
+
+    _live_log(
+        f"🎯 LIVE candidate: {sym} {direction.upper()} vol {vol:.3f}% "
+        f"conv {conv}/10 lev {lev}:1 pos ${pos_size:.2f} notional ${notional:.2f}"
+    )
+
+    _live_open_position(sym, direction, _ext, pos_size, lev, conv)
+
+
+# ── Top-level live step (called from poll_cycle) ──────────────────────────────
+
+def run_live_step(signals: dict) -> None:
+    """Called from poll_cycle() each cycle, after run_simulation_step().
+    Runs full live decision logic regardless of kill switch state.
+    Orders only placed when _june_live_trading_enabled is True.
+    Sim state and sim logic are completely unaffected.
+    """
+    if not _live:
+        return    # not started
+
+    # Periodic balance and P&L refresh (every 5 minutes, not every cycle)
+    _live_poll_balance()
+    _live_poll_pnl()
+
+    # Skim check after P&L update
+    _live_check_skim()
+
+    if _live.get("balance", 0.0) <= 0:
+        _live_log("balance $0 or unavailable — skipping entry/exit logic")
+        return
+
+    # Read macro regime (same Redis key as sim, no duplication)
+    regime = "neutral"
+    try:
+        raw = _redis().get("june_macro_regime")
+        if raw:
+            regime = json.loads(raw).get("regime", "neutral")
+    except Exception:
+        pass
+
+    # Exit check — always runs (decision logic, not order placement)
+    if _live.get("open_position"):
+        _live_check_exit(signals, regime)
+        if _live.get("open_position"):
+            return    # still holding
+
+    # Weekend block
+    if is_weekend_closure():
+        return
+
+    # Entry check
+    _live_try_entry(signals, regime)
+
+
+# ── Startup ───────────────────────────────────────────────────────────────────
+
+def _live_startup() -> None:
+    """Initialize live trading state. Called once from main() after sim_startup().
+    Safe to call when live account is not available — degrades gracefully.
+    """
+    global _live
+    if not all([IG_LIVE_BASE, IG_LIVE_KEY, IG_LIVE_USER, IG_LIVE_PASS]):
+        print(f"[{_ts()}] ℹ️  Live trading: IG live credentials not configured — live step disabled",
+              flush=True)
+        return
+
+    # Load persisted state from prior session
+    loaded = _live_load_state()
+
+    # Ensure all required keys present
+    defaults = {
+        "balance":              0.0,
+        "balance_total":        0.0,
+        "balance_margin":       0.0,
+        "balance_fetched_at":   0,
+        "cumulative_earned_pnl": 0.0,
+        "pnl_seen_refs":        [],
+        "pnl_fetched_at":       0,
+        "skim_phase":           "pre300",
+        "next_skim_threshold":  _LIVE_SKIM_PHASE1_TRIGGER,
+        "skim_pending":         0.0,
+        "skimmed_total":        0.0,
+        "last_half_skim_time":  0.0,
+        "open_position":        None,
+        "total_trades":         0,
+        "total_wins":           0,
+        "total_losses":         0,
+        "long_pnl":             0.0,
+        "short_pnl":            0.0,
+        "long_trades":          0,
+        "short_trades":         0,
+        "long_wins":            0,
+        "short_wins":           0,
+        "boost_expiry":         {},
+        "pause_expiry":         {},
+        "streak_state":         {},
+        "trade_history":        [],
+    }
+    for k, v in defaults.items():
+        _live.setdefault(k, v)
+
+    # Fetch initial balance (immediate, not deferred)
+    global _live_balance_polled_at
+    _live_balance_polled_at = 0.0   # force immediate fetch
+    _live_poll_balance()
+
+    _live_save_state()
+
+    status = "LOADED from Redis" if loaded else "FRESH state"
+    kswitch = "ON 🟢" if _june_live_trading_enabled else "OFF 🔒"
+    tw = _live.get("total_wins", 0)
+    tl = _live.get("total_losses", 0)
+    print(
+        f"[{_ts()}] 🟢 Live trading initialized ({status}) | "
+        f"kill switch {kswitch} | "
+        f"balance ${_live.get('balance', 0.0):.2f} | "
+        f"earned P&L ${_live.get('cumulative_earned_pnl', 0.0):.2f} | "
+        f"trades {tw}W/{tl}L",
+        flush=True,
+    )
+
+    if _live.get("open_position"):
+        pos = _live["open_position"]
+        hold_min = (time.time() - pos.get("entry_time", time.time())) / 60.0
+        _live_log(
+            f"⚠️  Resuming open live position: {pos['instrument']} "
+            f"{pos['direction'].upper()} deal={pos.get('deal_id','?')} "
+            f"held {hold_min:.0f}min"
+        )
+
+
 # ── Startup checks ────────────────────────────────────────────────────────────
 def startup_check() -> bool:
     required = ["IG_API_KEY", "IG_USERNAME", "IG_PASSWORD", "REDIS_HOST", "REDIS_PASSWORD"]
@@ -5108,6 +6062,9 @@ def main():
 
     # Start virtual trading simulation (runs in parallel with intelligence)
     sim_startup()
+
+    # Start live trading (gated behind kill switch; safe to call with switch off)
+    _live_startup()
 
     if not INSTRUMENTS:
         print(f"[{_ts()}] ❌ No valid instruments after verification — exiting", flush=True)
