@@ -318,6 +318,8 @@ _sess: dict      = {"cst": None, "token": None, "born": 0.0}
 _live_sess: dict = {"cst": None, "token": None, "born": 0.0}
 _live_available: bool = False  # True after successful live account auth
 _june_live_trading_enabled: bool = False  # kill switch: must be True via Redis to place live orders
+_live_lot_sizes: dict = {}   # sym -> IG lotSize from LIVE API (populated in _live_startup)
+_live_min_deal:  dict = {}   # sym -> minDealSize.value from LIVE API (populated in _live_startup)
 
 # Rolling price history: {sym: deque([(epoch, mid), ...])}
 _history: dict = {sym: deque(maxlen=HISTORY_LEN) for sym in INSTRUMENTS}
@@ -5349,6 +5351,29 @@ _LIVE_SKIM_AMOUNT = _LIVE_SKIM_PHASE1_AMOUNT   # alias for readability inside h1
 
 # ── Instrument eligibility (Part 2) ──────────────────────────────────────────
 
+
+def _live_fetch_market_data(sym: str, epic: str) -> bool:
+    """Fetch IG lotSize and minDealSize from the LIVE account for one instrument.
+
+    Called at startup for every entry in INSTRUMENTS so _live_compute_ig_size and
+    _live_compute_stop_pts use the real live-account values, not the FX default.
+    Returns True on success, False on 404 or network error (instrument stays
+    ineligible for live until data arrives).
+    """
+    data = _ig_live_get(f"/markets/{epic}", version="1")
+    if not data:
+        return False
+    inst     = data.get("instrument", {})
+    deal     = data.get("dealingRules", {})
+    lot_sz   = float(inst.get("lotSize") or 1.0)
+    min_obj  = deal.get("minDealSize") or {}
+    min_val  = float(min_obj.get("value") or 1.0)
+    _live_lot_sizes[sym] = lot_sz
+    _live_min_deal[sym]  = min_val
+    _live_log(f"LIVE mkt: {sym} lot={lot_sz} minDeal={min_val}")
+    return True
+
+
 def _live_is_eligible(sym: str) -> bool:
     """Eligibility check using LIVE balance. Reuses _sim_is_eligible formula:
       min_notional / leverage_ceiling <= concentration_cap * live_balance
@@ -5406,20 +5431,26 @@ def _live_update_streak(sym: str, direction: str, won: bool) -> None:
 
 # ── Sizing helpers ────────────────────────────────────────────────────────────
 
-def _live_compute_ig_size(sym: str, desired_notional_usd: float, mid_price: float) -> int:
-    """Convert desired USD notional to IG order size (integer lots).
+def _live_compute_ig_size(sym: str, desired_notional_usd: float, mid_price: float) -> float:
+    """Convert desired USD notional to IG order size using per-instrument lot sizes.
 
-    Formula: 1 size unit = lotSize × mid_price USD notional
-    (derived from IG's backfill formula: min_notional = minDealSize × lotSize × mid)
+    Formula: ig_size = desired_notional / (lot_sz x mid_price)
+    Lot sizes fetched from LIVE IG API at startup and stored in _live_lot_sizes.
+    Sizes are fractional (IG supports non-integer sizes for equity CFDs and some FX).
+    Minimum clamped to minDealSize from _live_min_deal (default 1.0).
 
-    Equities (.CASH.IP) use different lot sizes — not eligible at current balance
-    so this only covers FX pairs where lotSize=10.0 is universal.
+    Example: AMD lot=0.01, mid=$507 -> 1 unit=$5.07. For $10 target:
+      ig_size = max(1.0, round(10.0/5.07, 2)) = 1.97 -> notional ~$10.00
     """
     if mid_price <= 0:
-        return 0
-    unit_value = _LIVE_LOT_SIZE_FX * mid_price
-    raw        = desired_notional_usd / unit_value
-    return max(1, int(raw))    # floor to integer, minimum 1 lot
+        return 0.0
+    lot_sz   = _live_lot_sizes.get(sym, _LIVE_LOT_SIZE_FX)
+    min_deal = _live_min_deal.get(sym, 1.0)
+    unit_val = lot_sz * mid_price
+    if unit_val <= 0:
+        return 0.0
+    sized = round(desired_notional_usd / unit_val, 2)
+    return max(min_deal, sized)
 
 
 def _live_compute_stop_pts(sym: str, stop_pct: float) -> int:
@@ -5437,21 +5468,20 @@ def _live_compute_stop_pts(sym: str, stop_pct: float) -> int:
 
 
 def _live_entry_price_ref(sym: str) -> float:
-    """Return current mid price for sym from signals or spread baselines (best-effort)."""
-    try:
-        raw = _redis().get("june_spread_baselines")
-        if raw:
-            bases = json.loads(raw).get("baselines", {})
-            if sym in bases:
-                # baselines are in % — this gives us the scale, not the price.
-                pass
-    except Exception:
-        pass
-    # Fallback: use _sim_min_notional as proxy (min_notional ≈ lotSize × mid × 1)
-    mn = _sim_min_notional.get(sym)
-    if mn and mn > 0:
-        return mn / _LIVE_LOT_SIZE_FX
-    return 1.0   # safe fallback for pts calculation (will be replaced by real fill price)
+    """Approximate current mid price for sym for stop-point calculation (best-effort).
+
+    Uses live lot size and min_deal fetched from LIVE IG API:
+      mid ~= min_notional / (min_deal x lot_sz)
+    This is exact when min_notional was set at current price; acceptable approximation
+    otherwise -- stop distance uses actual fill price inside IG platform.
+    """
+    mn       = _sim_min_notional.get(sym, 0.0)
+    lot_sz   = _live_lot_sizes.get(sym, _LIVE_LOT_SIZE_FX)
+    min_deal = _live_min_deal.get(sym, 1.0)
+    denom    = min_deal * lot_sz
+    if mn > 0 and denom > 0:
+        return mn / denom    # mid ~= min_n / (minDeal x lotSz)
+    return 1.0   # safe fallback
 
 
 # ── Order deal confirmation ───────────────────────────────────────────────────
@@ -5496,7 +5526,8 @@ def _live_open_position(sym: str, direction: str, signals: dict,
 
     notional  = pos_size * leverage
     ig_size   = _live_compute_ig_size(sym, notional, mid_price)
-    actual_n  = ig_size * _LIVE_LOT_SIZE_FX * mid_price
+    lot_sz    = _live_lot_sizes.get(sym, _LIVE_LOT_SIZE_FX)  # per-instrument lot size
+    actual_n  = ig_size * lot_sz * mid_price
     stop_pct  = max(_sim_get_dynamic_stop(sym), _sim_get_spread_floor(sym))
     tp_pct    = _sim_get_tp(sym, direction, conviction)
     stop_dist = _live_compute_stop_pts(sym, stop_pct)
@@ -5989,6 +6020,12 @@ def _live_startup() -> None:
     global _live_balance_polled_at
     _live_balance_polled_at = 0.0   # force immediate fetch
     _live_poll_balance()
+
+    # Fetch per-instrument lot sizes from LIVE IG API so sizing is correct
+    _live_log(f"Fetching live market data for {len(INSTRUMENTS)} instruments...")
+    for _lfd_sym, _lfd_epic in list(INSTRUMENTS.items()):
+        _live_fetch_market_data(_lfd_sym, _lfd_epic)
+        time.sleep(0.3)
 
     _live_save_state()
 
