@@ -317,6 +317,7 @@ _THREE_WAY_GROUPS = [
 _sess: dict      = {"cst": None, "token": None, "born": 0.0}
 _live_sess: dict = {"cst": None, "token": None, "born": 0.0}
 _live_available: bool = False  # True after successful live account auth
+_june_live_trading_enabled: bool = False  # kill switch: must be True via Redis to place live orders
 
 # Rolling price history: {sym: deque([(epoch, mid), ...])}
 _history: dict = {sym: deque(maxlen=HISTORY_LEN) for sym in INSTRUMENTS}
@@ -506,6 +507,34 @@ def _ig_get(path: str, params: Optional[dict] = None, version: str = "1") -> Opt
         print(f"[{_ts()}] ⚠️  {path} error: {exc}", flush=True)
         return None
 
+
+
+def _refresh_live_kill_switch() -> None:
+    """Read june_live_enabled from Redis each cycle; update the module flag.
+
+    Default is OFF. Enable with: redis-cli SET june_live_enabled true
+    Disable with:               redis-cli SET june_live_enabled false
+    Fail-safe: any exception leaves the flag unchanged (stays False if never set).
+    """
+    global _june_live_trading_enabled
+    try:
+        val = _redis().get("june_live_enabled")
+        _june_live_trading_enabled = val in (b"true", b"1", "true", "1")
+    except Exception:
+        pass
+
+
+def _live_trade_guard() -> bool:
+    """Return True only if live trading is explicitly enabled.
+
+    Call this at the top of any function that places a live order.
+    Returns False (blocking the trade) when kill switch is off.
+    """
+    if not _june_live_trading_enabled:
+        import logging
+        logging.warning("🔒 live_trade_guard: june_live_enabled=false — order blocked")
+        return False
+    return True
 
 
 def authenticate_live() -> bool:
@@ -3660,6 +3689,7 @@ def _sim_close_position(prices: dict, exit_reason: str) -> None:
         "entry_vol": pos.get("entry_vol", 0),
         "stage": _sim.get("stage", "sprout"), "phase": _sim.get("phase", 1),
         "conviction": pos.get("conviction", 5),
+        "claudia_pts": pos.get("claudia_pts", 0.0),
     }
     history = _sim.setdefault("trade_history", [])
     history.append(trade_rec)
@@ -3921,6 +3951,7 @@ def _sim_try_entry(signals: dict, regime: str, leverage: int) -> None:
         "vol_bucket": vbkt, "approach": approach, "regime": regime,
         "entry_change_15m": change_15m, "tp_pct": tp_pct, "stop_pct": stop_pct,
         "conviction": conviction,
+        "claudia_pts": _sim_claudia_pts(sym, direction),
     }
 
     action = "BUY" if direction == "long" else "SELL"
@@ -4572,6 +4603,7 @@ def run_simulation_step(signals: dict) -> None:
     _load_barbie_overrides()
     _load_claudia_corr_notes()
     _load_claudia_directive_notes()
+    _refresh_live_kill_switch()
     _sim_check_barbie_alarm(signals)   # flag-only; never blocks trade logic
     _sim_check_pnl_alarm()             # P&L drawdown alarm; reuses barbie_alarm key
 
