@@ -320,6 +320,7 @@ _live_available: bool = False  # True after successful live account auth
 _june_live_trading_enabled: bool = False  # kill switch: must be True via Redis to place live orders
 _live_lot_sizes: dict = {}   # sym -> IG lotSize from LIVE API (populated in _live_startup)
 _live_min_deal:  dict = {}   # sym -> minDealSize.value from LIVE API (populated in _live_startup)
+_live_pip_sizes: dict = {}   # sym -> pip size in price units from LIVE API (populated in _live_startup)
 
 # Rolling price history: {sym: deque([(epoch, mid), ...])}
 _history: dict = {sym: deque(maxlen=HISTORY_LEN) for sym in INSTRUMENTS}
@@ -5352,6 +5353,35 @@ _LIVE_SKIM_AMOUNT = _LIVE_SKIM_PHASE1_AMOUNT   # alias for readability inside h1
 # ── Instrument eligibility (Part 2) ──────────────────────────────────────────
 
 
+
+def _live_parse_pip_size(one_pip_means) -> float:
+    """Parse IG onePipMeans into pip size in price units.
+
+    API examples and their resolved pip_sz:
+      "0.0001 USD/EUR"       -> 0.0001  (standard 4-decimal FX)
+      "0.01 JPY/USD"         -> 0.01    (JPY pairs, 2-decimal)
+      "1 Cents/Troy Ounce"   -> 0.01    (SILVER: 1 cent = $0.01)
+      "1 $/Troy Ounce"       -> 1.0     (GOLD)
+      "1 Index Point"        -> 1.0     (SPX500/GER40/UK100)
+      "1"                    -> 1.0     (OIL)
+      None                   -> 0.01    (equity CFDs: US stocks move in $0.01 increments;
+                                         IG does not expose onePipMeans for .CASH.IP epics)
+    """
+    if one_pip_means is None:
+        return 0.01   # equity CFD fallback: US stocks price in $0.01 increments
+    s = str(one_pip_means).strip()
+    if not s:
+        return 0.01
+    try:
+        first = float(s.split()[0])
+    except (ValueError, IndexError):
+        return 0.01
+    # "1 Cents/..." — numeric value is 1, but unit is cents → $0.01
+    if first == 1.0 and "cent" in s.lower():
+        return 0.01
+    return first
+
+
 def _live_fetch_market_data(sym: str, epic: str) -> bool:
     """Fetch IG lotSize and minDealSize from the LIVE account for one instrument.
 
@@ -5368,9 +5398,12 @@ def _live_fetch_market_data(sym: str, epic: str) -> bool:
     lot_sz   = float(inst.get("lotSize") or 1.0)
     min_obj  = deal.get("minDealSize") or {}
     min_val  = float(min_obj.get("value") or 1.0)
+    one_pip = inst.get("onePipMeans")
+    pip_sz  = _live_parse_pip_size(one_pip)
     _live_lot_sizes[sym] = lot_sz
     _live_min_deal[sym]  = min_val
-    _live_log(f"LIVE mkt: {sym} lot={lot_sz} minDeal={min_val}")
+    _live_pip_sizes[sym] = pip_sz
+    _live_log(f"LIVE mkt: {sym} lot={lot_sz} minDeal={min_val} pip={pip_sz}")
     return True
 
 
@@ -5456,12 +5489,12 @@ def _live_compute_ig_size(sym: str, desired_notional_usd: float, mid_price: floa
 def _live_compute_stop_pts(sym: str, stop_pct: float) -> int:
     """Convert fractional stop loss to IG stop distance in points.
 
-    Points = price × stop_pct / pip_size, where pip_size = 0.01 for JPY, 0.0001 otherwise.
-    Minimum enforced: 4 pts (IG min normal stop distance for FX).
+    Points = price x stop_pct / pip_size, where pip_size is per-instrument
+    (fetched from IG LIVE /markets/{epic} onePipMeans at startup).
+    Falls back to _LIVE_FX_PIP (0.0001) for instruments whose fetch failed.
+    Minimum enforced: 4 pts (IG documented minimum stop distance).
     """
-    pip_sz = _LIVE_JPY_PIP if "JPY" in sym else _LIVE_FX_PIP
-    # Use a conservative reference price (0.59 for NZDUSD-range pairs is safe approximation;
-    # actual entry price is passed in _live_open_position which uses the real fill price)
+    pip_sz    = _live_pip_sizes.get(sym, _LIVE_FX_PIP)
     ref_price = _live_entry_price_ref(sym)
     pts       = int(ref_price * stop_pct / pip_sz)
     return max(4, pts)
@@ -5632,7 +5665,8 @@ def _live_close_position(exit_reason: str, signals: dict) -> None:
     exit_px   = mid  # approximate — actual fill confirmed after order
     pnl_pct   = (exit_px - fill_px) / fill_px if dirn == "long" else \
                 (fill_px - exit_px) / fill_px
-    notional  = pos.get("notional", pos.get("ig_size", 1) * _LIVE_LOT_SIZE_FX * mid)
+    lot_sz_c  = _live_lot_sizes.get(sym, _LIVE_LOT_SIZE_FX)
+    notional  = pos.get("notional", pos.get("ig_size", 1) * lot_sz_c * mid)
     dollar_pnl = notional * pnl_pct
     hold_min  = (time.time() - entry_t) / 60.0
     close_dir = "SELL" if dirn == "long" else "BUY"
