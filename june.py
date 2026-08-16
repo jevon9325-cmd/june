@@ -5104,6 +5104,14 @@ _LIVE_SKIM_PHASE1_AMOUNT  = 100.0   # $100 increments until $500
 _LIVE_SKIM_PHASE2_TRIGGER = 500.0   # switch to half-mode at $500
 _LIVE_SKIM_HALF_MIN_GAP   = 3600    # half-mode: don't re-flag more often than hourly
 
+# Daily drawdown circuit breaker for the live account.
+# Derivation: max per-trade loss = 10% position × 10× leverage × 0.5% max stop = 0.5%/trade.
+# Reaching -5% needs 10 consecutive max-stop exits — structurally impossible in one session
+# given the 60-second cycle and 15-minute per-combo gate. If reached, something has broken
+# mechanically. Threshold is intentionally tighter than Miss Secretary's -10% equity floor
+# because June's CFD stops are tighter and losses compound faster at leverage.
+_LIVE_CIRCUIT_BREAKER_PCT = -0.05   # -5% daily drawdown → auto-disable kill switch
+
 
 def _live_log(msg: str) -> None:
     print(f"[{_ts()}] 🟢 LIVE: {msg}", flush=True)
@@ -5219,6 +5227,12 @@ def _live_poll_balance() -> None:
             _live["balance_margin"]    = float(bal.get("deposit", 0.0))
             _live["balance_fetched_at"] = int(now)
             _live_balance_polled_at    = now
+            # Seed day-start on first fetch of each UTC day (used by circuit breaker)
+            _today_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+            if _live.get("balance_day_start_date") != _today_utc or _live.get("balance_day_start", 0.0) <= 0:
+                _live["balance_day_start"]      = _live["balance_total"]
+                _live["balance_day_start_date"] = _today_utc
+                _live_log(f"Day-start balance recorded: ${_live['balance_total']:.2f} ({_today_utc})")
             _live_log(f"Balance: ${_live['balance']:.2f} available, "
                       f"${_live['balance_margin']:.2f} in margin")
             _live_save_state()
@@ -5348,6 +5362,44 @@ def _live_check_skim() -> None:
 
 # Fix reference error — _LIVE_SKIM_AMOUNT used inside loop but wrong name
 _LIVE_SKIM_AMOUNT = _LIVE_SKIM_PHASE1_AMOUNT   # alias for readability inside h100 loop
+
+
+def _live_check_circuit_breaker() -> None:
+    """Daily drawdown circuit breaker — disables june_live_enabled if live account
+    falls more than _LIVE_CIRCUIT_BREAKER_PCT below the day's opening balance_total.
+
+    Uses balance_total (cash + unrealized P&L) so an open losing position is caught
+    immediately on the next 5-minute balance poll, not only after it closes.
+
+    On breach: sets june_live_enabled=false in Redis AND updates the module flag.
+    Does NOT auto-resume — Jevon must re-enable manually after reviewing logs.
+    Rate cost: zero (dict lookup only; no new API calls).
+    """
+    global _june_live_trading_enabled
+    if not _june_live_trading_enabled:
+        return   # already disabled — nothing to do
+    day_start = _live.get("balance_day_start", 0.0)
+    current   = _live.get("balance_total", 0.0)
+    if day_start <= 0 or current <= 0:
+        return   # balance not yet fetched — no baseline to compare
+    drawdown = (current - day_start) / day_start
+    if drawdown > _LIVE_CIRCUIT_BREAKER_PCT:
+        return   # within daily tolerance
+    # Threshold breached — disable kill switch via Redis + module flag
+    try:
+        _redis().set("june_live_enabled", "false")
+    except Exception:
+        pass
+    _june_live_trading_enabled = False
+    _live_log(
+        f"\U0001f6a8 CIRCUIT BREAKER FIRED \u2014 live trading disabled.\n"
+        f"  Day-start balance : ${day_start:.2f}\n"
+        f"  Current balance   : ${current:.2f}\n"
+        f"  Drawdown          : {drawdown:+.2%}\n"
+        f"  Threshold         : {_LIVE_CIRCUIT_BREAKER_PCT:+.2%}\n"
+        f"  Re-enable requires: redis-cli SET june_live_enabled true (after review)"
+    )
+
 
 
 # ── Instrument eligibility (Part 2) ──────────────────────────────────────────
@@ -5976,6 +6028,11 @@ def run_live_step(signals: dict) -> None:
     # Skim check after P&L update
     _live_check_skim()
 
+    # Daily drawdown circuit breaker — auto-disables kill switch if >5% down from day open
+    _live_check_circuit_breaker()
+    if not _june_live_trading_enabled:
+        return   # circuit breaker fired this cycle; no further action
+
     if _live.get("balance", 0.0) <= 0:
         _live_log("balance $0 or unavailable — skipping entry/exit logic")
         return
@@ -6032,6 +6089,8 @@ def _live_startup() -> None:
         "skim_pending":         0.0,
         "skimmed_total":        0.0,
         "last_half_skim_time":  0.0,
+        "balance_day_start":      0.0,
+        "balance_day_start_date": "",
         "open_position":        None,
         "total_trades":         0,
         "total_wins":           0,
