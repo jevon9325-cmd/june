@@ -41,6 +41,7 @@ import sys
 import time
 from collections import deque
 from datetime import datetime, timezone, timedelta
+from zoneinfo import ZoneInfo
 from typing import Optional
 
 import requests
@@ -82,7 +83,12 @@ HISTORY_LEN = 20        # rolling price readings per instrument (~20 min at 60s)
 # ── Weekend / session windows (all in UTC minutes-since-midnight) ────────────
 # IG CFD closure: Friday 21:15 UTC → Sunday 21:00 UTC
 WEEKEND_CLOSE_MIN = 21 * 60 + 15   # Friday 21:15 UTC — IG CFD close
-WEEKEND_OPEN_MIN  = 21 * 60        # Sunday 21:00 UTC — IG CFD reopen
+WEEKEND_OPEN_MIN  = 21 * 60        # Sunday 21:00 UTC — superseded; kept for reference only
+
+# DST-aware UK timezone for is_weekend_closure() — replaces hardcoded UTC constants above.
+# IG forex-specific hours: open Sunday 21:00 UK local, close Friday 22:00 UK local.
+# Europe/London handles BST (UTC+1 summer) and GMT (UTC+0 winter) automatically.
+_UK_TZ = ZoneInfo("Europe/London")
 
 # Overnight window used for baseline tracking and gap detection
 OVERNIGHT_START_MIN   = 21 * 60       # 21:00 UTC — after NY close
@@ -737,15 +743,22 @@ def verify_epics():
 
 # ── Market session helpers ────────────────────────────────────────────────────
 def is_weekend_closure() -> bool:
-    """True during IG CFD weekend closure: Fri 21:15 UTC → Sun 21:00 UTC."""
-    now  = datetime.now(timezone.utc)
-    dow  = now.weekday()   # 0=Mon … 4=Fri, 5=Sat, 6=Sun
-    mins = now.hour * 60 + now.minute
-    if dow == 5:                                      # full Saturday
+    """True during IG forex weekend closure: Fri 22:00 UK local → Sun 21:00 UK local.
+
+    Uses Europe/London (via _UK_TZ) for DST-aware conversion so the reopen time
+    tracks IG's published 9pm UK forex hours year-round:
+      BST (UTC+1, summer): 21:00 UK = 20:00 UTC = 15:00 Jamaica
+      GMT (UTC+0, winter): 21:00 UK = 21:00 UTC = 16:00 Jamaica
+    Jamaica is UTC-5 with no DST, so the Jamaica offset is always -5 from UTC.
+    """
+    now_uk = datetime.now(_UK_TZ)
+    dow    = now_uk.weekday()            # 0=Mon … 4=Fri, 5=Sat, 6=Sun
+    uk_h   = now_uk.hour + now_uk.minute / 60.0
+    if dow == 5:                         # full Saturday
         return True
-    if dow == 4 and mins >= WEEKEND_CLOSE_MIN:        # Friday after 21:15 UTC
+    if dow == 4 and uk_h >= 22.0:       # Friday after 22:00 UK (IG forex close)
         return True
-    if dow == 6 and mins < WEEKEND_OPEN_MIN:          # Sunday before 21:00 UTC
+    if dow == 6 and uk_h < 21.0:        # Sunday before 21:00 UK (IG forex open)
         return True
     return False
 
