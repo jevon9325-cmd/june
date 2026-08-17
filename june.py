@@ -335,6 +335,12 @@ _no_history_warned: set = set()   # instruments logged no-5m-history this run
 # Rolling spread history: {sym: deque([spread_pct, ...])} — ~1h at 60s
 _spread_hist: dict = {sym: deque(maxlen=SPREAD_HISTORY_LEN) for sym in INSTRUMENTS}
 
+# Live-price fallback: activated per-epic when demo marketStatus == OFFLINE.
+# _live_price_scale caches correction = live_SF / demo_SF (derived from IG metadata).
+# _live_fallback_active tracks which epics are currently sourced from live /prices/.
+_live_price_scale:    dict = {}  # epic -> float correction factor
+_live_fallback_active: set = set()  # epics currently bypassing demo pricing
+
 # Overnight state: reset each time NY close is captured (21:00 UTC)
 _overnight: dict = {
     "ny_close": {},   # {sym: price} — snapshot at 21:00 UTC
@@ -670,7 +676,20 @@ def _finnhub_price(sym: str) -> Optional[dict]:
 
 
 def fetch_price(epic: str) -> Optional[dict]:
-    """Return bid/offer/mid/spread for an epic, or None on any error."""
+    """Return bid/offer/mid/spread for an epic, or None on any error.
+
+    Normal path: demo /markets/{epic} snapshot (unchanged for TRADEABLE instruments).
+    Fallback:    when demo marketStatus == OFFLINE and live session is available,
+                 uses live /prices/{epic} (MINUTE resolution, most recent candle).
+                 Scale correction applied via IG-authoritative scalingFactor metadata:
+                   correction = live_SF / demo_SF
+                 Confirmed 7-instrument test (2026-08-17):
+                   Silver: demo_SF=100, live_SF=1 -> correction=0.01
+                   All others (GOLD, OIL, AUDUSD, GER40, SPX500, EURUSD): SF match -> 1.0
+                 _history cleared on first cycle a given epic enters fallback,
+                 preventing stale-scale contamination in the 5m/15m change calculations.
+    """
+    global _live_price_scale, _live_fallback_active
     if ".CASH." in epic:
         sym = _INSTRUMENTS_REVERSE.get(epic)
         return _finnhub_price(sym) if sym else None
@@ -680,10 +699,81 @@ def fetch_price(epic: str) -> Optional[dict]:
     snap  = data.get("snapshot", {})
     bid   = snap.get("bid")
     offer = snap.get("offer")
+
+    if snap.get("marketStatus") == "OFFLINE" and _live_available:
+        return _fetch_price_live_fallback(epic, snap)
+
+    # Demo is TRADEABLE -- use it as normal.
+    # If this epic was previously in fallback, mark it as exited so the next
+    # OFFLINE episode will clear history again on entry.
+    if epic in _live_fallback_active:
+        _live_fallback_active.discard(epic)
+        sym = _INSTRUMENTS_REVERSE.get(epic, epic)
+        print(f"[{_ts()}] Live price: {sym} demo back TRADEABLE -- resuming demo pricing", flush=True)
+
     if bid is None or offer is None:
         return None
     bid, offer = float(bid), float(offer)
     mid = (bid + offer) / 2.0
+    return {"bid": bid, "offer": offer, "mid": mid, "spread": offer - bid}
+
+
+def _fetch_price_live_fallback(epic: str, demo_snap: dict) -> Optional[dict]:
+    """Live /prices/ fallback for instruments OFFLINE on demo.
+
+    Derives scale correction from IG scalingFactor fields (fetched once per
+    fallback session via live /markets/, then cached). Clears _history for this
+    epic on first entry to prevent mixing old-scale and new-scale values in the
+    rolling window used by compute_signal() to calculate change_5m / change_15m.
+    """
+    global _live_price_scale, _live_fallback_active
+
+    # Derive and cache scale correction (once per fallback session per epic)
+    if epic not in _live_price_scale:
+        live_data = _ig_live_get(f"/markets/{epic}", version="1")
+        if not live_data:
+            return None
+        demo_sf = float(demo_snap.get("scalingFactor") or 1)
+        live_sf = float(live_data.get("snapshot", {}).get("scalingFactor") or 1)
+        correction = live_sf / demo_sf if demo_sf != 0 else 1.0
+        _live_price_scale[epic] = correction
+        sym = _INSTRUMENTS_REVERSE.get(epic, epic)
+        print(
+            f"[{_ts()}] Live price fallback: {sym} demo OFFLINE "
+            f"(demo_SF={int(demo_sf)} live_SF={int(live_sf)} correction={correction:.6f})",
+            flush=True,
+        )
+
+    correction = _live_price_scale[epic]
+
+    # Clear stale history on first cycle entering fallback for this epic
+    if epic not in _live_fallback_active:
+        sym = _INSTRUMENTS_REVERSE.get(epic)
+        if sym and sym in _history:
+            _history[sym].clear()
+            print(f"[{_ts()}] {sym}: history cleared (entering live fallback)", flush=True)
+        _live_fallback_active.add(epic)
+
+    # Fetch current price from live /prices/ (MINUTE resolution, most recent candle)
+    price_data = _ig_live_get(
+        f"/prices/{epic}",
+        params={"resolution": "MINUTE", "max": 1, "pageSize": 1},
+        version="3",
+    )
+    if not price_data:
+        return None
+    prices = price_data.get("prices", [])
+    if not prices:
+        return None
+    cp      = prices[-1].get("closePrice", {})
+    raw_bid = cp.get("bid")
+    raw_ask = cp.get("ask")
+    if raw_bid is None or raw_ask is None:
+        return None
+
+    bid   = raw_bid * correction
+    offer = raw_ask * correction
+    mid   = (bid + offer) / 2.0
     return {"bid": bid, "offer": offer, "mid": mid, "spread": offer - bid}
 
 
