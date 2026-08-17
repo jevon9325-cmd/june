@@ -122,7 +122,7 @@ DIRECT_CFD_CONFIRMED_MISS_TTL = 24 * 3600  # 24h after all search strategies exh
 # Minimum notional values for core instruments — confirmed from IG API 2026-07-14.
 # Pre-populated in sim_startup() so FX + Silver trade immediately without /markets/ calls.
 _KNOWN_MIN_NOTIONALS: dict = {
-    "EURUSD": 11.44, "GBPUSD":  0.54, "USDJPY":  1.23, "SILVER": 330.0,  # BMU cents-denom pricing gate; revisit when account ~$165+
+    "EURUSD": 11.44, "GBPUSD":  0.54, "USDJPY":  1.23, "SILVER":   3.30,  # BMU: minDeal=0.05 lots x lot=1.0 x ~6600c x $0.01 = $3.30 real IG floor
     "AUDUSD":  6.0,  "USDCAD": 14.0,  "EURGBP": 11.0,  "NZDUSD":  6.0,  "USDCHF": 9.0,
 }
 _NOTIONAL_REDIS_KEY = "june_min_notionals"  # separate key — survives sim resets
@@ -5667,16 +5667,18 @@ def _live_entry_price_ref(sym: str) -> float:
     """Approximate current mid price for sym for stop-point calculation (best-effort).
 
     Uses live lot size and min_deal fetched from LIVE IG API:
-      mid ~= min_notional / (min_deal x lot_sz)
+      native_mid ~= min_notional / (min_deal x lot_sz x price_unit)
+    price_unit=0.01 for cent-denominated instruments (Silver BMU), 1.0 for others.
     This is exact when min_notional was set at current price; acceptable approximation
     otherwise -- stop distance uses actual fill price inside IG platform.
     """
-    mn       = _sim_min_notional.get(sym, 0.0)
-    lot_sz   = _live_lot_sizes.get(sym, _LIVE_LOT_SIZE_FX)
-    min_deal = _live_min_deal.get(sym, 1.0)
-    denom    = min_deal * lot_sz
+    mn         = _sim_min_notional.get(sym, 0.0)
+    lot_sz     = _live_lot_sizes.get(sym, _LIVE_LOT_SIZE_FX)
+    min_deal   = _live_min_deal.get(sym, 1.0)
+    price_unit = _live_price_unit.get(sym, 1.0)
+    denom      = min_deal * lot_sz * price_unit
     if mn > 0 and denom > 0:
-        return mn / denom    # mid ~= min_n / (minDeal x lotSz)
+        return mn / denom    # native_mid ~= min_n / (minDeal x lotSz x price_unit)
     return 1.0   # safe fallback
 
 
