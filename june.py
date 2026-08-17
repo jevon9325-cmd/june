@@ -5683,12 +5683,12 @@ def _live_entry_price_ref(sym: str) -> float:
 # ── Order deal confirmation ───────────────────────────────────────────────────
 
 def _live_confirm_deal(deal_ref: str, retries: int = 3) -> Optional[dict]:
-    """Poll /deals/confirms/{dealReference} until status != PENDING.
+    """Poll /confirms/{dealReference} until status != PENDING.
     Returns the confirmed deal dict or None on failure.
     """
     for _ in range(retries):
         time.sleep(1)
-        data = _ig_live_get(f"/deals/confirms/{deal_ref}", version="1")
+        data = _ig_live_get(f"/confirms/{deal_ref}", version="1")
         if data:
             status = data.get("dealStatus", "")
             if status != "PENDING":
@@ -5758,7 +5758,6 @@ def _live_open_position(sym: str, direction: str, signals: dict,
     }
 
     resp = _ig_live_post("/positions/otc", order_body, version="2")
-    _live_log(f"DIAG POST resp: {resp}")  # temporary
     if not resp:
         _live_log(f"open_position: POST failed for {sym}")
         return
