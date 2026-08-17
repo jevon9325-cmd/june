@@ -5753,7 +5753,8 @@ def _live_open_position(sym: str, direction: str, signals: dict,
         "guaranteedStop": False,
         "forceOpen":     True,
         "currencyCode":  "USD",
-        "stopDistance":  stop_dist,     # attached stop — limits actual risk
+        # stopDistance omitted: exits managed programmatically; attached stops
+        # were causing silent IG rejections (404 on confirms) for FX instruments
     }
 
     resp = _ig_live_post("/positions/otc", order_body, version="2")
