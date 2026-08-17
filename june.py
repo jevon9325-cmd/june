@@ -6225,6 +6225,7 @@ def _live_startup() -> None:
 
     _live_save_state()
 
+    _refresh_live_kill_switch()  # read Redis state before printing banner
     status = "LOADED from Redis" if loaded else "FRESH state"
     kswitch = "ON 🟢" if _june_live_trading_enabled else "OFF 🔒"
     tw = _live.get("total_wins", 0)
