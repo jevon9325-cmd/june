@@ -4898,6 +4898,8 @@ def sim_startup() -> None:
         # Merge saved min_notionals into pre-populated dict.
         # API-confirmed values from prior runs override hardcoded estimates.
         _sim_min_notional.update(saved.get("min_notionals", {}))
+        if _persist_raw:  # re-apply: Redis overrides beat saved API-discovered values
+            _sim_min_notional.update(_json.loads(_persist_raw))
         _sim_eligible = set(saved.get("eligible_instruments", []))
         for _s in _sim_min_notional:
             _sim_eligible.add(_s)
