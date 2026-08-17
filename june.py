@@ -5758,6 +5758,7 @@ def _live_open_position(sym: str, direction: str, signals: dict,
     }
 
     resp = _ig_live_post("/positions/otc", order_body, version="2")
+    _live_log(f"DIAG POST resp: {resp}")  # temporary
     if not resp:
         _live_log(f"open_position: POST failed for {sym}")
         return
