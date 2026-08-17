@@ -4904,6 +4904,8 @@ def sim_startup() -> None:
         _sim_eligible = set(saved.get("eligible_instruments", []))
         for _s in _sim_min_notional:
             _sim_eligible.add(_s)
+        # Safety: re-assert hardcoded known values — Redis/saved-state may carry stale overrides
+        _sim_min_notional.update(_KNOWN_MIN_NOTIONALS)
 
         # Queue truly unknown instruments for gradual background backfill (Part 3).
         # No API calls at startup — _advance_notional_backfill() drains 2/cycle.
@@ -5076,7 +5078,8 @@ def sim_startup() -> None:
         f"Stop: +${_SIM_PROFIT_STOP} (doubled) or ${_SIM_LOSS_STOP} (60% loss)",
         flush=True,
     )
-    # _KNOWN_MIN_NOTIONALS already applied at top of sim_startup(); queue the rest.
+    # Re-assert hardcoded known values — Redis NOTIONAL_REDIS_KEY may have overwritten them above
+    _sim_min_notional.update(_KNOWN_MIN_NOTIONALS)
     # No startup API burst — _advance_notional_backfill() drains 2/cycle.
     # Includes direct_cfd_map entries (Option A) to grow pool beyond INSTRUMENTS.
     _notional_pending[:] = (
