@@ -327,6 +327,7 @@ _june_live_trading_enabled: bool = False  # kill switch: must be True via Redis 
 _live_lot_sizes: dict = {}   # sym -> IG lotSize from LIVE API (populated in _live_startup)
 _live_min_deal:  dict = {}   # sym -> minDealSize.value from LIVE API (populated in _live_startup)
 _live_pip_sizes: dict = {}   # sym -> pip size in price units from LIVE API (populated in _live_startup)
+_live_price_unit: dict = {}  # sym -> USD-per-native-price-unit (0.01 for cents, 1.0 otherwise)
 
 # Rolling price history: {sym: deque([(epoch, mid), ...])}
 _history: dict = {sym: deque(maxlen=HISTORY_LEN) for sym in INSTRUMENTS}
@@ -5557,10 +5558,12 @@ def _live_fetch_market_data(sym: str, epic: str) -> bool:
     min_val  = float(min_obj.get("value") or 1.0)
     one_pip = inst.get("onePipMeans")
     pip_sz  = _live_parse_pip_size(one_pip)
-    _live_lot_sizes[sym] = lot_sz
-    _live_min_deal[sym]  = min_val
-    _live_pip_sizes[sym] = pip_sz
-    _live_log(f"LIVE mkt: {sym} lot={lot_sz} minDeal={min_val} pip={pip_sz}")
+    price_unit = 0.01 if (one_pip and "cent" in str(one_pip).lower()) else 1.0
+    _live_lot_sizes[sym]  = lot_sz
+    _live_min_deal[sym]   = min_val
+    _live_pip_sizes[sym]  = pip_sz
+    _live_price_unit[sym] = price_unit
+    _live_log(f"LIVE mkt: {sym} lot={lot_sz} minDeal={min_val} pip={pip_sz} unit={price_unit}")
     return True
 
 
@@ -5634,9 +5637,11 @@ def _live_compute_ig_size(sym: str, desired_notional_usd: float, mid_price: floa
     """
     if mid_price <= 0:
         return 0.0
-    lot_sz   = _live_lot_sizes.get(sym, _LIVE_LOT_SIZE_FX)
-    min_deal = _live_min_deal.get(sym, 1.0)
-    unit_val = lot_sz * mid_price
+    lot_sz     = _live_lot_sizes.get(sym, _LIVE_LOT_SIZE_FX)
+    min_deal   = _live_min_deal.get(sym, 1.0)
+    price_unit = _live_price_unit.get(sym, 1.0)
+    price_usd  = mid_price * price_unit   # convert native price to USD (e.g. cents -> dollars)
+    unit_val   = lot_sz * price_usd
     if unit_val <= 0:
         return 0.0
     sized = round(desired_notional_usd / unit_val, 2)
@@ -5651,9 +5656,10 @@ def _live_compute_stop_pts(sym: str, stop_pct: float) -> int:
     Falls back to _LIVE_FX_PIP (0.0001) for instruments whose fetch failed.
     Minimum enforced: 4 pts (IG documented minimum stop distance).
     """
-    pip_sz    = _live_pip_sizes.get(sym, _LIVE_FX_PIP)
-    ref_price = _live_entry_price_ref(sym)
-    pts       = int(ref_price * stop_pct / pip_sz)
+    pip_sz     = _live_pip_sizes.get(sym, _LIVE_FX_PIP)
+    price_unit = _live_price_unit.get(sym, 1.0)
+    ref_price  = _live_entry_price_ref(sym)  # native price units (cents for Silver)
+    pts        = int(ref_price * price_unit * stop_pct / pip_sz)
     return max(4, pts)
 
 
@@ -5715,9 +5721,10 @@ def _live_open_position(sym: str, direction: str, signals: dict,
         return
 
     notional  = pos_size * leverage
-    ig_size   = _live_compute_ig_size(sym, notional, mid_price)
-    lot_sz    = _live_lot_sizes.get(sym, _LIVE_LOT_SIZE_FX)  # per-instrument lot size
-    actual_n  = ig_size * lot_sz * mid_price
+    ig_size    = _live_compute_ig_size(sym, notional, mid_price)
+    lot_sz     = _live_lot_sizes.get(sym, _LIVE_LOT_SIZE_FX)  # per-instrument lot size
+    price_unit = _live_price_unit.get(sym, 1.0)
+    actual_n   = ig_size * lot_sz * mid_price * price_unit   # USD notional
     stop_pct  = max(_sim_get_dynamic_stop(sym), _sim_get_spread_floor(sym))
     tp_pct    = _sim_get_tp(sym, direction, conviction)
     stop_dist = _live_compute_stop_pts(sym, stop_pct)
