@@ -122,7 +122,7 @@ DIRECT_CFD_CONFIRMED_MISS_TTL = 24 * 3600  # 24h after all search strategies exh
 # Minimum notional values for core instruments — confirmed from IG API 2026-07-14.
 # Pre-populated in sim_startup() so FX + Silver trade immediately without /markets/ calls.
 _KNOWN_MIN_NOTIONALS: dict = {
-    "EURUSD": 11.44, "GBPUSD":  0.54, "USDJPY":  1.23, "SILVER": 29.25,
+    "EURUSD": 11.44, "GBPUSD":  0.54, "USDJPY":  1.23, "SILVER": 330.0,  # BMU cents-denom pricing gate; revisit when account ~$165+
     "AUDUSD":  6.0,  "USDCAD": 14.0,  "EURGBP": 11.0,  "NZDUSD":  6.0,  "USDCHF": 9.0,
 }
 _NOTIONAL_REDIS_KEY = "june_min_notionals"  # separate key — survives sim resets
@@ -222,7 +222,7 @@ INSTRUMENTS: dict = {
     "GER40":  "IX.D.DAX.IFD.IP",       # discovered: Germany 40 Cash (E25)
     "UK100":  "IX.D.FTSE.CFD.IP",      # verified demo
     "GOLD":   "CS.D.CFDGOLD.BMU.IP",   # smaller variant: Spot Gold ($1) -- $406 min vs $4,059 for .MFI.IP
-    "SILVER": "CS.D.CFDSILVER.CFM.IP", # discovered: Mini Spot Silver (500oz)
+    "SILVER": "CS.D.CFDSILVER.BMU.IP",   # Spot Silver ($1) -- BMU matches Gold pattern; CFM (500oz) has null live bid/offer, causes 403
     "OIL":    "CC.D.LCO.BMU.IP",       # smaller variant: Oil - Brent Crude ($1) -- $9,244 min vs $123,197 for .USS.IP
     # Additional forex majors/minors — eligibility checked at startup against IG min notional
     "AUDUSD": "CS.D.AUDUSD.CFD.IP",    # AUD/USD — ~$6 min notional (similar lot structure to EURUSD)
