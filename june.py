@@ -328,6 +328,7 @@ _live_lot_sizes: dict = {}   # sym -> IG lotSize from LIVE API (populated in _li
 _live_min_deal:  dict = {}   # sym -> minDealSize.value from LIVE API (populated in _live_startup)
 _live_pip_sizes: dict = {}   # sym -> pip size in price units from LIVE API (populated in _live_startup)
 _live_price_unit: dict = {}  # sym -> USD-per-native-price-unit (0.01 for cents, 1.0 otherwise)
+_live_margin:    dict = {}   # sym -> IG margin rate (0.0-1.0 fraction) from LIVE API, e.g. 0.8=80%
 
 # Rolling price history: {sym: deque([(epoch, mid), ...])}
 _history: dict = {sym: deque(maxlen=HISTORY_LEN) for sym in INSTRUMENTS}
@@ -5562,26 +5563,32 @@ def _live_fetch_market_data(sym: str, epic: str) -> bool:
     one_pip = inst.get("onePipMeans")
     pip_sz  = _live_parse_pip_size(one_pip)
     price_unit = 0.01 if (one_pip and "cent" in str(one_pip).lower()) else 1.0
+    margin_rate = float(inst.get("margin") or 0.0)
     _live_lot_sizes[sym]  = lot_sz
     _live_min_deal[sym]   = min_val
     _live_pip_sizes[sym]  = pip_sz
     _live_price_unit[sym] = price_unit
-    _live_log(f"LIVE mkt: {sym} lot={lot_sz} minDeal={min_val} pip={pip_sz} unit={price_unit}")
+    _live_margin[sym]     = margin_rate
+    _live_log(f"LIVE mkt: {sym} lot={lot_sz} minDeal={min_val} pip={pip_sz} unit={price_unit} margin={margin_rate:.0%}")
     return True
 
 
 def _live_is_eligible(sym: str) -> bool:
-    """Eligibility check using LIVE balance. Reuses _sim_is_eligible formula:
-      min_notional / leverage_ceiling <= concentration_cap * live_balance
+    """Eligibility check using LIVE balance and IG's real per-instrument margin rate.
 
-    This automatically expands as the live account grows — no hardcoded forex-only flag.
-    Silver/equities (high min_notionals) correctly stay ineligible at $48 and
-    become eligible automatically once balance supports their minimum.
+    Formula: (min_notional / effective_leverage) <= concentration_cap * balance
+    where effective_leverage = min(sim_ceiling, 1/margin_rate).
+
+    Prevents sending orders IG will reject: an instrument at 80% margin (1.25x real
+    leverage) cannot pass eligibility using 10x sim leverage.
     """
-    bal    = _live.get("balance", 0.0)
+    bal = _live.get("balance", 0.0)
     if bal <= 0:
         return False
-    lev    = _SIM_LEV_RANGES.get("sprout", (3, 10))[1]  # ceiling leverage
+    lev = float(_SIM_LEV_RANGES.get("sprout", (3, 10))[1])  # sim ceiling
+    margin_rate = _live_margin.get(sym)
+    if margin_rate and margin_rate > 0:
+        lev = min(lev, 1.0 / margin_rate)   # cap at real IG leverage
     return _sim_is_eligible(sym, bal, lev)
 
 
@@ -6106,6 +6113,11 @@ def _live_try_entry(signals: dict, regime: str) -> None:
     conv    = _sim_conviction_gauge(sym, direction, vol, thresh, weight, combo,
                                     gate_mode, rel_score)
     lev     = _sim_conviction_leverage("sprout", conv)
+
+    # Cap leverage at IG's real margin rate — prevents INSUFFICIENT_FUNDS rejection
+    _mr = _live_margin.get(sym)
+    if _mr and _mr > 0:
+        lev = min(lev, max(1, int(1.0 / _mr)))
 
     # Sizing — use pct_10 targeting (10% of live balance, minimum $10)
     pos_size = max(10.0, round(bal * 0.10, 2))
