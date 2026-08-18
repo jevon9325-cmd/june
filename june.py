@@ -124,6 +124,7 @@ DIRECT_CFD_CONFIRMED_MISS_TTL = 24 * 3600  # 24h after all search strategies exh
 _KNOWN_MIN_NOTIONALS: dict = {
     "EURUSD": 11.44, "GBPUSD":  0.54, "USDJPY":  1.23, "SILVER":   3.30,  # BMU: minDeal=0.05 lots x lot=1.0 x ~6600c x $0.01 = $3.30 real IG floor
     "AUDUSD":  6.0,  "USDCAD": 14.0,  "EURGBP": 11.0,  "NZDUSD":  6.0,  "USDCHF": 9.0,
+    "OIL": 2.71,  # BMU: live minDeal=0.03 x lot=1.0 x ~$90.22/barrel = $2.71
 }
 _NOTIONAL_REDIS_KEY = "june_min_notionals"  # separate key — survives sim resets
 _NOTIONAL_REDIS_TTL = 7 * 24 * 3600        # 7 days
@@ -1728,7 +1729,8 @@ def _advance_notional_backfill() -> None:
                     mid = fh["mid"]
         ccy0    = inst.get("currencies", [{}])[0] if inst.get("currencies") else {}
         fx_base = float(ccy0.get("baseExchangeRate") or 1.0) or 1.0
-        min_usd = (min_val * lot_sz * mid) / fx_base
+        pu      = _live_price_unit.get(sym, 1.0)  # 0.01 for cent-denominated (e.g. OIL CC.D.*)
+        min_usd = (min_val * lot_sz * mid * pu) / fx_base
         _sim_min_notional[sym] = round(min_usd, 2)
         _sim_eligible.add(sym)
         changed = True
@@ -5563,6 +5565,8 @@ def _live_fetch_market_data(sym: str, epic: str) -> bool:
     one_pip = inst.get("onePipMeans")
     pip_sz  = _live_parse_pip_size(one_pip)
     price_unit = 0.01 if (one_pip and "cent" in str(one_pip).lower()) else 1.0
+    if price_unit == 1.0 and epic.upper().startswith("CC."):
+        price_unit = 0.01  # CC.D.* commodity epics price in cents; "1" pip lacks "cent" keyword
     margin_rate = float(inst.get("margin") or 0.0)
     _live_lot_sizes[sym]  = lot_sz
     _live_min_deal[sym]   = min_val
