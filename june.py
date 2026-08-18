@@ -5888,6 +5888,7 @@ def _live_close_position(exit_reason: str, signals: dict) -> None:
         "timeInForce": "FILL_OR_KILL",
         "forceOpen":     False,         # required by IG v1 API — absent field treated as null → HTTP 400
         "guaranteedStop": False,         # required by IG v1 API — absent field treated as null → HTTP 400
+        "currencyCode":   "USD",         # required by IG v1 API — absent field treated as null → HTTP 400
         "dealId":         deal_id,
     }
     resp = _ig_live_post("/positions/otc", close_body, version="1")
