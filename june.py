@@ -5587,8 +5587,8 @@ def _live_is_eligible(sym: str) -> bool:
         return False
     lev = float(_SIM_LEV_RANGES.get("sprout", (3, 10))[1])  # sim ceiling
     margin_rate = _live_margin.get(sym)
-    if margin_rate and margin_rate > 0:
-        lev = min(lev, 1.0 / margin_rate)   # cap at real IG leverage
+    if margin_rate and 0 < margin_rate <= 1.0:
+        lev = min(lev, 1.0 / margin_rate)   # cap at real IG leverage (only valid for 0-100% rates)
     return _sim_is_eligible(sym, bal, lev)
 
 
@@ -6116,7 +6116,7 @@ def _live_try_entry(signals: dict, regime: str) -> None:
 
     # Cap leverage at IG's real margin rate — prevents INSUFFICIENT_FUNDS rejection
     _mr = _live_margin.get(sym)
-    if _mr and _mr > 0:
+    if _mr and 0 < _mr <= 1.0:
         lev = min(lev, max(1, int(1.0 / _mr)))
 
     # Sizing — use pct_10 targeting (10% of live balance, minimum $10)
