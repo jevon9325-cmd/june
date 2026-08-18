@@ -5976,11 +5976,16 @@ def _live_check_exit(signals: dict, regime: str) -> None:
         _live_close_position("take_profit", signals)
         return
 
-    # Asymmetric reversal (same patience logic as sim)
+    # Asymmetric reversal — mirrors sim logic including Barbie reversal_confirm_secs override
     opposing = (dirn == "long"  and (regime == "bear" or sig_dir == "bear")) or \
                (dirn == "short" and (regime == "bull"  or sig_dir == "bull"))
     if opposing:
-        patience  = _SIM_REV_PATIENCE_WIN if pnl_pct > 0 else _SIM_REV_PATIENCE_LOSS
+        _brb = _barbie_overrides.get(sym, {}).get("reversal_confirm_secs")
+        if _brb is not None:
+            _clamped = max(_BARBIE_OVERRIDE_MIN_SECS, min(_BARBIE_OVERRIDE_MAX_SECS, int(_brb)))
+            patience = max(1, round(_clamped / POLL_ACTIVE))
+        else:
+            patience = _SIM_REV_PATIENCE_WIN if pnl_pct > 0 else _SIM_REV_PATIENCE_LOSS
         rev_count = pos.get("reversal_count", 0) + 1
         _live["open_position"]["reversal_count"] = rev_count
         if rev_count >= patience:
