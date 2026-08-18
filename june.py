@@ -6133,8 +6133,8 @@ def _live_try_entry(signals: dict, regime: str) -> None:
 
 def run_live_step(signals: dict) -> None:
     """Called from poll_cycle() each cycle, after run_simulation_step().
-    Runs full live decision logic regardless of kill switch state.
-    Orders only placed when _june_live_trading_enabled is True.
+    Exit/risk management runs unconditionally regardless of kill-switch state.
+    june_live_enabled gates NEW positions only — never exit management.
     Sim state and sim logic are completely unaffected.
     """
     if not _live:
@@ -6147,16 +6147,7 @@ def run_live_step(signals: dict) -> None:
     # Skim check after P&L update
     _live_check_skim()
 
-    # Daily drawdown circuit breaker — auto-disables kill switch if >5% down from day open
-    _live_check_circuit_breaker()
-    if not _june_live_trading_enabled:
-        return   # circuit breaker fired this cycle; no further action
-
-    if _live.get("balance", 0.0) <= 0:
-        _live_log("balance $0 or unavailable — skipping entry/exit logic")
-        return
-
-    # Read macro regime (same Redis key as sim, no duplication)
+    # Read macro regime once — shared by both exit and entry checks below
     regime = "neutral"
     try:
         raw = _redis().get("june_macro_regime")
@@ -6165,11 +6156,25 @@ def run_live_step(signals: dict) -> None:
     except Exception:
         pass
 
-    # Exit check — always runs (decision logic, not order placement)
+    # Exit/risk management — runs BEFORE kill-switch check.
+    # june_live_enabled controls new-trade authority only; any open position
+    # must be managed unconditionally so live money is never left without
+    # stop/TP coverage regardless of why the kill switch was disabled.
     if _live.get("open_position"):
         _live_check_exit(signals, regime)
         if _live.get("open_position"):
-            return    # still holding
+            return    # still holding — skip entry logic
+
+    # Daily drawdown circuit breaker — gates new-trade authority only.
+    # Runs after exit management so a position that just closed still triggers
+    # the check before the next entry is attempted this cycle.
+    _live_check_circuit_breaker()
+    if not _june_live_trading_enabled:
+        return   # new-trade authority OFF — no entry attempts
+
+    if _live.get("balance", 0.0) <= 0:
+        _live_log("balance $0 or unavailable — skipping entry logic")
+        return
 
     # Weekend block
     if is_weekend_closure():
