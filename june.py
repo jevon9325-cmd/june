@@ -5988,20 +5988,19 @@ def _live_check_exit(signals: dict, regime: str) -> None:
 # ── Instrument selection (Part 2 — mirrors _sim_select_instrument) ────────────
 
 def _live_select_instrument(signals: dict, regime: str) -> Optional[str]:
-    """Candidate selection using live balance. Calls same sub-functions as sim.
+    """Candidate selection using live balance and real IG margin rates.
 
-    Eligibility formula: _sim_is_eligible(sym, live_balance, lev_ceiling) — identical
-    to sim's check, so eligibility expands automatically as live account grows.
-    Silver and equities correctly fail at $48 and unlock when balance supports them.
+    Uses _live_is_eligible which caps effective leverage at 1/margin_rate for
+    instruments with margin_rate <= 1.0 — prevents selecting instruments
+    that IG would reject with INSUFFICIENT_FUNDS.
     """
     bal        = _live.get("balance", 0.0)
     if bal <= 0:
         return None
-    lev_ceil   = _SIM_LEV_RANGES.get("sprout", (3, 10))[1]
     best_sym, best_vol = None, 0.0
 
     for sym in _sim_eligible:
-        if not _sim_is_eligible(sym, bal, lev_ceil):
+        if not _live_is_eligible(sym):
             continue
         if sym not in signals:
             continue
