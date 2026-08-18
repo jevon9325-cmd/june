@@ -3532,12 +3532,14 @@ def _sim_check_pnl_alarm() -> None:
 
 
 def _sim_apply_pos_adjust() -> None:
-    """Apply Barbie's barbie_june_pos_adjust to the currently-open position.
+    """Apply Barbie's barbie_june_pos_adjust to open position(s) -- sim AND live.
 
     TWO STRUCTURALLY SEPARATE PATHS -- this is the LIVE-POSITION path only:
       - Reads: barbie_june_pos_adjust  (distinct Redis key from entry-baseline)
-      - Writes: _sim["open_position"]["stop_pct"] / ["tp_pct"] (live position dict)
+      - Writes: _sim["open_position"] AND _live["open_position"] stop_pct / tp_pct
       - Called from: _sim_check_exit() -- exit evaluation time only
+      - Single Redis read+delete per cycle; sim runs before live so this function
+        is the sole consumer of the key -- live side never needs a separate read.
 
     The ENTRY-BASELINE path is entirely separate and does not share any code:
       - Reads: barbie_june_overrides -> _barbie_overrides global
@@ -3547,73 +3549,122 @@ def _sim_apply_pos_adjust() -> None:
         that path because this function is never called from _sim_try_entry().
 
     Stop-loss: TIGHTEN ONLY for open position (new_stop_pct < curr_stop_pct required).
+               Enforced identically for both sim and live sides.
     TP: either direction within [_SIM_TP_FLOOR, _SIM_TP_CAP].
     """
     try:
         raw = _redis().get(_BARBIE_POS_ADJUST_KEY)
         if not raw:
             return
-        adj = json.loads(raw)
-        pos = _sim.get("open_position")
-        if not pos:
-            _redis().delete(_BARBIE_POS_ADJUST_KEY)   # stale -- no open position
+        adj     = json.loads(raw)
+        adj_sym = adj.get("instrument")
+
+        sim_pos  = _sim.get("open_position")
+        live_pos = _live.get("open_position") if _live else None
+
+        # Nothing open anywhere -- clean up stale key
+        if not sim_pos and not live_pos:
+            _redis().delete(_BARBIE_POS_ADJUST_KEY)
             return
-        sym  = pos.get("instrument")
-        dirn = pos.get("direction")
-        if adj.get("instrument") != sym:
-            return   # adjust targets a different instrument -- stale, ignore
 
-        fill          = pos.get("fill_price", 0)
-        curr_stop_pct = pos.get("stop_pct", 0.0)
-        curr_tp_pct   = pos.get("tp_pct", 0.0)
-        changed       = False
+        sim_match  = bool(sim_pos  and sim_pos.get("instrument")  == adj_sym)
+        live_match = bool(live_pos and live_pos.get("instrument") == adj_sym)
 
-        # ── Stop: TIGHTEN ONLY (smaller pct = closer to fill price = more protective) ──
-        new_stop_pct = adj.get("stop_pct")
-        if new_stop_pct is not None:
-            new_stop_pct = max(_SIM_STOP_FLOOR, min(_SIM_STOP_CAP, float(new_stop_pct)))
-            if new_stop_pct < curr_stop_pct:
-                _sim["open_position"]["stop_pct"]   = new_stop_pct
-                _sim["open_position"]["stop_price"] = (
-                    fill * (1 - new_stop_pct) if dirn == "long"
-                    else fill * (1 + new_stop_pct)
+        # Key targets a different instrument than every open position -- keep for later
+        if not sim_match and not live_match:
+            return
+
+        sim_changed = live_changed = False
+
+        # ── Apply to sim position ───────────────────────────────────────────────────────────────────────────────────
+        if sim_match:
+            sym  = adj_sym
+            dirn = sim_pos.get("direction")
+            fill = sim_pos.get("fill_price", 0)
+            curr_stop_pct = sim_pos.get("stop_pct", 0.0)
+            curr_tp_pct   = sim_pos.get("tp_pct",   0.0)
+
+            new_stop_pct = adj.get("stop_pct")
+            if new_stop_pct is not None:
+                new_stop_pct = max(_SIM_STOP_FLOOR, min(_SIM_STOP_CAP, float(new_stop_pct)))
+                if new_stop_pct < curr_stop_pct:
+                    _sim["open_position"]["stop_pct"]   = new_stop_pct
+                    _sim["open_position"]["stop_price"] = (
+                        fill * (1 - new_stop_pct) if dirn == "long"
+                        else fill * (1 + new_stop_pct)
+                    )
+                    print(
+                        f"[{_ts()}] 🎀 Barbie pos-adjust [sim]: {sym} stop "
+                        f"{curr_stop_pct*100:.3f}% -> {new_stop_pct*100:.3f}% (tightened)",
+                        flush=True,
+                    )
+                    sim_changed = True
+                else:
+                    print(
+                        f"[{_ts()}] ⚠️  Barbie pos-adjust REJECTED loose stop for {sym} [sim]: "
+                        f"{new_stop_pct*100:.3f}% >= current {curr_stop_pct*100:.3f}% "
+                        f"-- live-position stop may only tighten (baseline mult still free)",
+                        flush=True,
+                    )
+
+            new_tp_pct = adj.get("tp_pct")
+            if new_tp_pct is not None:
+                new_tp_pct = max(_SIM_TP_FLOOR, min(_SIM_TP_CAP, float(new_tp_pct)))
+                _sim["open_position"]["tp_pct"]   = new_tp_pct
+                _sim["open_position"]["tp_price"] = (
+                    fill * (1 + new_tp_pct) if dirn == "long"
+                    else fill * (1 - new_tp_pct)
                 )
                 print(
-                    f"[{_ts()}] \U0001f380 Barbie pos-adjust: {sym} stop "
-                    f"{curr_stop_pct*100:.3f}% -> {new_stop_pct*100:.3f}% (tightened)",
+                    f"[{_ts()}] 🎀 Barbie pos-adjust [sim]: {sym} TP "
+                    f"{curr_tp_pct*100:.3f}% -> {new_tp_pct*100:.3f}%",
                     flush=True,
                 )
-                changed = True
-            else:
-                print(
-                    f"[{_ts()}] ⚠️  Barbie pos-adjust REJECTED loose stop for {sym}: "
-                    f"{new_stop_pct*100:.3f}% >= current {curr_stop_pct*100:.3f}% "
-                    f"-- live-position stop may only tighten (baseline mult still free)",
-                    flush=True,
-                )
+                sim_changed = True
 
-        # ── TP: either direction, within absolute safety bounds ──
-        new_tp_pct = adj.get("tp_pct")
-        if new_tp_pct is not None:
-            new_tp_pct = max(_SIM_TP_FLOOR, min(_SIM_TP_CAP, float(new_tp_pct)))
-            _sim["open_position"]["tp_pct"]   = new_tp_pct
-            _sim["open_position"]["tp_price"] = (
-                fill * (1 + new_tp_pct) if dirn == "long"
-                else fill * (1 - new_tp_pct)
-            )
-            print(
-                f"[{_ts()}] \U0001f380 Barbie pos-adjust: {sym} TP "
-                f"{curr_tp_pct*100:.3f}% -> {new_tp_pct*100:.3f}%",
-                flush=True,
-            )
-            changed = True
+        # ── Apply to live position (same tighten-only stop rule, same TP bounds) ─────────────────────────────────────────────────────────────
+        # _live_check_exit() evaluates _live["open_position"]["stop_pct"] and ["tp_pct"]
+        # directly. No stop_price equivalent needed -- exit computes distance via pct.
+        if live_match:
+            sym  = adj_sym
+            dirn = live_pos.get("direction")
+            curr_stop_pct = live_pos.get("stop_pct", 0.0)
+            curr_tp_pct   = live_pos.get("tp_pct",   0.0)
+
+            new_stop_pct = adj.get("stop_pct")
+            if new_stop_pct is not None:
+                new_stop_pct = max(_SIM_STOP_FLOOR, min(_SIM_STOP_CAP, float(new_stop_pct)))
+                if new_stop_pct < curr_stop_pct:
+                    _live["open_position"]["stop_pct"] = new_stop_pct
+                    _live_log(
+                        f"🎀 Barbie pos-adjust [live]: {sym} stop "
+                        f"{curr_stop_pct*100:.3f}% -> {new_stop_pct*100:.3f}% (tightened)"
+                    )
+                    live_changed = True
+                else:
+                    _live_log(
+                        f"⚠️ Barbie pos-adjust REJECTED loose stop for {sym} [live]: "
+                        f"{new_stop_pct*100:.3f}% >= current {curr_stop_pct*100:.3f}% "
+                        f"-- live-position stop may only tighten"
+                    )
+
+            new_tp_pct = adj.get("tp_pct")
+            if new_tp_pct is not None:
+                new_tp_pct = max(_SIM_TP_FLOOR, min(_SIM_TP_CAP, float(new_tp_pct)))
+                _live["open_position"]["tp_pct"] = new_tp_pct
+                _live_log(
+                    f"🎀 Barbie pos-adjust [live]: {sym} TP "
+                    f"{curr_tp_pct*100:.3f}% -> {new_tp_pct*100:.3f}%"
+                )
+                live_changed = True
 
         _redis().delete(_BARBIE_POS_ADJUST_KEY)   # consumed -- remove regardless
-        if changed:
+        if sim_changed:
             _sim_save_state()
+        if live_changed:
+            _live_save_state()
     except Exception:
         pass   # never crash the exit cycle
-
 
 def _sim_corr_weight(sym: str, direction_str: str, signals: dict) -> float:
     """Return a correlation-based weight multiplier for a sim candidate.
