@@ -3981,6 +3981,12 @@ def _sim_try_entry(signals: dict, regime: str, leverage: int) -> None:
     vol       = abs(chg)
     direction = "long" if chg > 0 else "short"
 
+    # Spread/ATR hard gate — block sim entry when spread dominates ATR
+    if sig.get("spread_atr_wide"):
+        _sar_r = sig.get("spread_atr_ratio") or 0
+        _sim_log(f"🚫 [SPREAD GATE] {sym} sim entry blocked: Spread/ATR ratio {_sar_r:.0%} > 35%")
+        return
+
     # 1m gate: only block if opposing move is >= _SIM_1M_MIN_REVERSAL%
     # Noise-filtered -- tiny spread-level ticks no longer block entries.
     price_1m = _price_n_minutes_ago(sym, 1)
@@ -5395,6 +5401,12 @@ _LIVE_SKIM_HALF_MIN_GAP   = 3600    # half-mode: don't re-flag more often than h
 # because June's CFD stops are tighter and losses compound faster at leverage.
 _LIVE_CIRCUIT_BREAKER_PCT = -0.05   # -5% daily drawdown → auto-disable kill switch
 
+# Instrument performance filter (Fix 3)
+_PERF_BLOCK_WINDOW     = 8       # rolling window of confirmed live trades
+_PERF_BLOCK_WR_THRESH  = 0.30    # block if win rate < 30% over window
+_PERF_BLOCK_SAR_THRESH = 0.50    # block if avg Spread/ATR ratio > 50% over window
+_PERF_BLOCK_TTL        = 86400   # 24-hour block duration (seconds)
+
 
 def _live_log(msg: str) -> None:
     print(f"[{_ts()}] 🟢 LIVE: {msg}", flush=True)
@@ -5818,6 +5830,73 @@ def _live_is_paused(combo: str) -> bool:
     return time.time() < exp
 
 
+_perf_block_cache: dict = {}   # {sym: cache_expire_ts} — in-memory, refreshed from Redis
+
+
+def _live_perf_blocked(sym: str) -> bool:
+    """True if sym is blocked by the instrument performance filter.
+    Caches Redis state locally for 5 minutes per symbol to avoid per-cycle churn.
+    On Redis error: permits the trade (fail-open).
+    """
+    now = time.time()
+    if now < _perf_block_cache.get(sym, 0.0):
+        return True  # still within cache window — blocked
+    try:
+        val = _redis().get(f"june_perf_block:{sym}")
+    except Exception:
+        return False  # Redis unavailable — fail open
+    if val:
+        _perf_block_cache[sym] = now + 300.0  # cache for 5 min
+        return True
+    _perf_block_cache.pop(sym, None)
+    return False
+
+
+def _live_perf_record(sym: str, won: bool, sar) -> None:
+    """Update rolling per-instrument performance stats in Redis.
+    Applies a 24-hour live block if win rate < _PERF_BLOCK_WR_THRESH over the
+    last _PERF_BLOCK_WINDOW trades, or if avg Spread/ATR > _PERF_BLOCK_SAR_THRESH.
+    Called only after a confirmed IG position close.
+    """
+    try:
+        r      = _redis()
+        key    = f"june_perf_stats:{sym}"
+        raw    = r.get(key)
+        stats  = json.loads(raw) if raw else {"trades": []}
+        trades = stats.get("trades", [])
+        trades.append({"won": won, "sar": round(sar or 0.0, 4)})
+        if len(trades) > _PERF_BLOCK_WINDOW:
+            trades = trades[-_PERF_BLOCK_WINDOW:]
+        stats["trades"] = trades
+        r.set(key, json.dumps(stats))
+
+        if len(trades) < _PERF_BLOCK_WINDOW:
+            return  # not enough history yet
+
+        win_rate = sum(1 for t in trades if t["won"]) / len(trades)
+        sar_vals = [t["sar"] for t in trades if t["sar"] > 0]
+        avg_sar  = sum(sar_vals) / len(sar_vals) if sar_vals else 0.0
+
+        if win_rate < _PERF_BLOCK_WR_THRESH:
+            r.setex(f"june_perf_block:{sym}", _PERF_BLOCK_TTL, "1")
+            _perf_block_cache[sym] = time.time() + 300.0
+            _live_log(
+                f"⛔ [PERF BLOCK] {sym}: Win rate {win_rate:.0%} below "
+                f"{_PERF_BLOCK_WR_THRESH:.0%} threshold "
+                f"({_PERF_BLOCK_WINDOW} trades). Live trading suspended for 24h."
+            )
+        elif avg_sar > _PERF_BLOCK_SAR_THRESH:
+            r.setex(f"june_perf_block:{sym}", _PERF_BLOCK_TTL, "1")
+            _perf_block_cache[sym] = time.time() + 300.0
+            _live_log(
+                f"⛔ [PERF BLOCK] {sym}: Avg Spread/ATR {avg_sar:.0%} above "
+                f"{_PERF_BLOCK_SAR_THRESH:.0%} threshold "
+                f"({_PERF_BLOCK_WINDOW} trades). Live trading suspended for 24h."
+            )
+    except Exception as exc:
+        _live_log(f"[perf_record] {sym}: Redis error — {exc}")
+
+
 def _live_has_boost(combo: str) -> bool:
     """Live-specific boost tracking — separate from sim's boost_expiry."""
     exp = (_live.get("boost_expiry") or {}).get(combo, 0.0)
@@ -6214,6 +6293,7 @@ def _live_close_position(exit_reason: str, signals: dict) -> None:
             if won: _live["short_wins"] = _live.get("short_wins", 0) + 1
 
         _live_update_streak(sym, dirn, won)
+        _live_perf_record(sym, won, sig.get("spread_atr_ratio"))
         # After stop_loss: block only the stopped direction for 10 min.
         # Allows the opposing direction to evaluate immediately if technicals flip.
         if exit_reason == "stop_loss":
@@ -6256,7 +6336,13 @@ def _live_check_exit(signals: dict, regime: str) -> None:
         return
 
     fill_px  = pos.get("fill_price", mid)
-    pnl_pct  = (mid - fill_px) / fill_px if dirn == "long" else (fill_px - mid) / fill_px
+    # Use spread-adjusted exit price: bid for LONG exits, ask for SHORT exits.
+    # spread_pct is IG-sourced for FX/commodities; Finnhub-synthetic for equity CFDs.
+    # This matches IG actual fill direction, reducing stop-loss overshoot on FX/commodities.
+    _sp_pct  = sig.get("spread_pct", 0.0)
+    _half_sp = mid * _sp_pct / 200.0   # spread_pct is %; /100 for fraction, /2 for half-spread
+    _exit_px = (mid - _half_sp) if dirn == "long" else (mid + _half_sp)
+    pnl_pct  = (_exit_px - fill_px) / fill_px if dirn == "long" else (fill_px - _exit_px) / fill_px
     sig_dir  = sig.get("direction", "neutral")
 
     # ── Time-Decay Exit Compression (live mirror) ─────────────────────────────
@@ -6394,6 +6480,8 @@ def _live_select_instrument(signals: dict, regime: str) -> Optional[str]:
         weight     = _sim_regime_weight(sym, direction_str)
         corr_adj   = _sim_corr_weight(sym, direction_str, signals)
         eff_vol    = vol * weight * corr_adj
+        if _live_perf_blocked(sym):
+            continue  # performance filter: below 30% WR or chronic wide Spread/ATR
         if sig.get("spread_atr_wide"):
             eff_vol *= 0.5   # rank penalty: spread > ATR threshold
         if eff_vol > best_vol:
@@ -6448,6 +6536,12 @@ def _live_try_entry(signals: dict, regime: str) -> None:
     vol       = abs(chg)
     direction = "long" if chg > 0 else "short"
     combo     = _sim_combo_key(sym, direction)
+
+    # Spread/ATR hard gate — block live entry when spread dominates ATR
+    if sig.get("spread_atr_wide"):
+        _sar_r = sig.get("spread_atr_ratio") or 0
+        _live_log(f"🚫 [SPREAD GATE] {sym} live entry blocked: Spread/ATR ratio {_sar_r:.0%} > 35%")
+        return
 
     # 1m anti-reversal gate (same as sim)
     price_1m = _price_n_minutes_ago(sym, 1)
