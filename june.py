@@ -5554,6 +5554,18 @@ def _live_check_circuit_breaker() -> None:
     except Exception:
         pass
     _june_live_trading_enabled = False
+    # Write a durable Redis alert so the next startup cannot miss this silently
+    try:
+        import datetime as _dt2, json as _json2
+        _alert_payload = _json2.dumps({
+            "fired_at":     _dt2.datetime.utcnow().isoformat(),
+            "day_start":    round(day_start, 2),
+            "current":      round(current, 2),
+            "drawdown_pct": round(drawdown * 100, 2),
+        })
+        _redis().set("june_circuit_breaker_alert", _alert_payload, ex=48 * 3600)
+    except Exception:
+        pass
     _live_log(
         f"\U0001f6a8 CIRCUIT BREAKER FIRED \u2014 live trading disabled.\n"
         f"  Day-start balance : ${day_start:.2f}\n"
@@ -6349,6 +6361,25 @@ def _live_startup() -> None:
     _live_save_state()
 
     _refresh_live_kill_switch()  # read Redis state before printing banner
+
+    # Warn if circuit breaker fired in a prior session (48h alert window)
+    try:
+        import json as _json3
+        _cb_alert_raw = _redis().get("june_circuit_breaker_alert")
+        if _cb_alert_raw:
+            _cb = _json3.loads(_cb_alert_raw)
+            _ks = "ON" if _june_live_trading_enabled else "OFF"
+            _parts = [
+                "[" + _ts() + "] *** PRIOR CIRCUIT BREAKER ALERT (within 48h)",
+                "   Fired at   : " + str(_cb.get("fired_at", "?")) + " UTC",
+                "   Day-start  : $" + str(round(_cb.get("day_start", 0), 2)),
+                "   At breach  : $" + str(round(_cb.get("current", 0), 2)),
+                "   Drawdown   : " + str(round(_cb.get("drawdown_pct", 0), 2)) + "%",
+                "   Kill switch: " + _ks,
+            ]
+            print(chr(10).join(_parts), flush=True)
+    except Exception:
+        pass
     status = "LOADED from Redis" if loaded else "FRESH state"
     kswitch = "ON 🟢" if _june_live_trading_enabled else "OFF 🔒"
     tw = _live.get("total_wins", 0)
