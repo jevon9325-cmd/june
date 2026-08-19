@@ -5393,9 +5393,13 @@ def _live_poll_balance() -> None:
             # Seed day-start on first fetch of each UTC day (used by circuit breaker)
             _today_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d")
             if _live.get("balance_day_start_date") != _today_utc or _live.get("balance_day_start", 0.0) <= 0:
-                _live["balance_day_start"]      = _live["balance_total"]
+                # Use cash (available + margin) not NAV — excludes unrealized P&L so an
+                # open position with unrealized profit cannot inflate the baseline and
+                # cause a false circuit-breaker trigger when the position closes flat.
+                _cash_only = _live["balance"] + _live["balance_margin"]
+                _live["balance_day_start"]      = _cash_only
                 _live["balance_day_start_date"] = _today_utc
-                _live_log(f"Day-start balance recorded: ${_live['balance_total']:.2f} ({_today_utc})")
+                _live_log(f"Day-start balance recorded: ${_cash_only:.2f} (cash only, excl unrealized P&L) ({_today_utc})")
             _live_log(f"Balance: ${_live['balance']:.2f} available, "
                       f"${_live['balance_margin']:.2f} in margin")
             _live_save_state()
