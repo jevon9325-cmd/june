@@ -6214,15 +6214,12 @@ def _live_close_position(exit_reason: str, signals: dict) -> None:
             if won: _live["short_wins"] = _live.get("short_wins", 0) + 1
 
         _live_update_streak(sym, dirn, won)
-        # After stop_loss: pause ALL directions for this symbol for 10 min.
-        # Prevents immediate whipsawing into the same symbol after a stop-out.
+        # After stop_loss: block only the stopped direction for 10 min.
+        # Allows the opposing direction to evaluate immediately if technicals flip.
         if exit_reason == "stop_loss":
             _sl_exp = time.time() + 10 * 60
-            _live.setdefault("pause_expiry", {}).update({
-                _sim_combo_key(sym, "long"):  _sl_exp,
-                _sim_combo_key(sym, "short"): _sl_exp,
-            })
-            _live_log(f"⏸️ [STOP COOLDOWN] {sym}: stop_loss -- 10-min symbol cooldown applied (all directions)")
+            _live.setdefault("pause_expiry", {})[_sim_combo_key(sym, dirn)] = _sl_exp
+            _live_log(f"⏸️ [SAME-DIR COOLDOWN] {sym} {dirn} blocked for 10m. Opposing direction remains active.")
     else:
         _live_log(f"close_position: confirm failed or rejected for {sym} — check IG manually")
 
