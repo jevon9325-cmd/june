@@ -110,7 +110,9 @@ MAINT_MAX_SECS         = 90 * 60    # force exit maintenance after 90 min
 MOMENTUM_PCT        = 0.30   # |change_5m| % to flag in momentum_alerts
 
 SPREAD_HISTORY_LEN  = 60     # readings kept per instrument (~1h at 60s)
-SPREAD_ALERT_FACTOR = 3.0    # current spread > 3× avg → spread_alert: True
+SPREAD_ALERT_FACTOR  = 3.0    # current spread > 3× avg → spread_alert: True
+SPREAD_ATR_THRESHOLD = 0.35   # spread > 35% of 14-period ATR → boundary warning + rank/size penalty
+ATR_PERIOD           = 14     # periods for ATR from rolling mid-price history
 SPREAD_MIN_READINGS = 5      # minimum readings before anomaly detection active
 
 PREMARKET_GAP_PCT   = 0.50   # |change vs 06:00 baseline| to flag pre-London gap
@@ -1222,6 +1224,23 @@ def _price_n_minutes_ago(sym: str, minutes: float) -> Optional[float]:
     if not candidates:
         return None
     return min(candidates, key=lambda x: x[0])[1]
+
+
+
+def _compute_atr(sym: str) -> float | None:
+    """Approximate 14-period ATR from rolling mid-price history.
+    Uses |consecutive mid changes| as a proxy for True Range (no OHLC available).
+    Returns None when fewer than ATR_PERIOD+1 readings exist — caller skips penalty.
+    """
+    hist = _history.get(sym)
+    if not hist or len(hist) < ATR_PERIOD + 1:
+        return None
+    prices = [px for _, px in hist]
+    trs = [abs(prices[i] - prices[i - 1]) for i in range(1, len(prices))]
+    recent = trs[-ATR_PERIOD:]
+    if not recent:
+        return None
+    return sum(recent) / len(recent)
 
 
 def compute_signal(sym: str, price: dict, spread_alert: bool = False) -> dict:
@@ -2371,6 +2390,24 @@ def poll_cycle() -> bool:
             )
 
         sig = compute_signal(sym, price, spread_alert=spread_alert)
+        # Spread-to-ATR boundary check — default to no penalty when ATR not yet available
+        _atr = _compute_atr(sym)
+        if _atr is not None and _atr > 0:
+            _sar = price["spread"] / _atr
+            sig["spread_atr_ratio"] = round(_sar, 4)
+            if _sar > SPREAD_ATR_THRESHOLD:
+                sig["spread_atr_wide"] = True
+                print(
+                    f"[{_ts()}] 📐 Spread/ATR boundary: {sym} "
+                    f"spread={price['spread']:.6f} ATR={_atr:.6f} "
+                    f"ratio={_sar:.1%} > {SPREAD_ATR_THRESHOLD:.0%}",
+                    flush=True,
+                )
+            else:
+                sig["spread_atr_wide"] = False
+        else:
+            sig["spread_atr_ratio"] = None
+            sig["spread_atr_wide"] = False
         if sig["change_5m"] is None:
             if sym not in _no_history_warned:
                 print(f"[{_ts()}] {sym}: warming up -- no 5m price history yet", flush=True)
@@ -6132,6 +6169,8 @@ def _live_select_instrument(signals: dict, regime: str) -> Optional[str]:
         weight     = _sim_regime_weight(sym, direction_str)
         corr_adj   = _sim_corr_weight(sym, direction_str, signals)
         eff_vol    = vol * weight * corr_adj
+        if sig.get("spread_atr_wide"):
+            eff_vol *= 0.5   # rank penalty: spread > ATR threshold
         if eff_vol > best_vol:
             best_vol = eff_vol
             best_sym = sym
@@ -6227,6 +6266,14 @@ def _live_try_entry(signals: dict, regime: str) -> None:
 
     # Sizing — use pct_10 targeting (10% of live balance, minimum $10)
     pos_size = max(10.0, round(bal * 0.10, 2))
+    # Proportional size reduction when spread is wide relative to ATR
+    _sar_live = sig.get("spread_atr_ratio")
+    if sig.get("spread_atr_wide") and _sar_live:
+        _scale = min(1.0, (SPREAD_ATR_THRESHOLD / _sar_live) ** 0.5)
+        pos_size = max(10.0, round(pos_size * _scale, 2))
+        _live_log(
+            f"  📐 Spread/ATR={_sar_live:.1%}: position scaled ×{_scale:.2f} → ${pos_size:.2f}"
+        )
     notional = pos_size * lev
 
     # Check IG minimum feasibility
