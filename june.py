@@ -6745,6 +6745,23 @@ def _live_startup() -> None:
     for k, v in defaults.items():
         _live.setdefault(k, v)
 
+    # Post-load: correct balance_day_start from the per-day Redis key when it exists.
+    # The per-day key (june_balance_day_start:YYYY-MM-DD) is written on the first
+    # genuine seed of each UTC day in _live_poll_balance(). If a prior session seeded
+    # from a wrong IG balance (e.g., stale reading with open margin), this override
+    # corrects the value on every restart before the CB can fire against it.
+    try:
+        _pld_today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        _pld_val   = _redis().get(f"june_balance_day_start:{_pld_today}")
+        if _pld_val:
+            _pld_saved = _live.get("balance_day_start", 0.0)
+            _live["balance_day_start"]      = float(_pld_val)
+            _live["balance_day_start_date"] = _pld_today
+            if abs(_pld_saved - float(_pld_val)) > 0.01:
+                _live_log(f"Day-start balance RESTORED: ${float(_pld_val):.2f} (state had ${_pld_saved:.2f})")
+    except Exception:
+        pass
+
     # Fetch initial balance (immediate, not deferred)
     global _live_balance_polled_at
     _live_balance_polled_at = 0.0   # force immediate fetch
