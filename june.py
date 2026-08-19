@@ -6132,7 +6132,9 @@ def _live_try_entry(signals: dict, regime: str) -> None:
     if _live.get("open_position"):
         return     # one position at a time
 
-    bal = _live.get("balance", 0.0)
+    total   = _live.get("balance_total", 0.0)
+    skimmed = _live.get("skimmed_total", 0.0)
+    bal     = max(0.0, total - skimmed)   # tradeable capital = total equity minus set-aside
     if bal <= 0:
         return
 
