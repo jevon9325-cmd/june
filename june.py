@@ -333,6 +333,7 @@ _live_pip_sizes: dict = {}   # sym -> pip size in price units from LIVE API (pop
 _live_price_unit: dict = {}  # sym -> USD-per-native-price-unit (0.01 for cents, 1.0 otherwise)
 _live_margin:    dict = {}   # sym -> IG margin rate (0.0-1.0 fraction) from LIVE API, e.g. 0.8=80%
 _live_equity_cfd: set = set() # syms whose epic ends .CASH.IP — IG size field is shares, not lots
+_MACRO_STALE_SECS  = 2 * 3600   # Claudia freshness gate: beyond this treat directional bias as stale
 
 # Rolling price history: {sym: deque([(epoch, mid), ...])}
 _history: dict = {sym: deque(maxlen=HISTORY_LEN) for sym in INSTRUMENTS}
@@ -5878,6 +5879,62 @@ def _live_entry_price_ref(sym: str) -> float:
     return 1.0   # safe fallback
 
 
+
+def _live_macro_confluence(sym: str, signal_dir: str) -> tuple:
+    """Soft Macro Confluence Model — scale pos_size by Claudia directional alignment.
+
+    Reads _claudia_directive_notes (refreshed each cycle from session_directive)
+    and checks claudia_sector_momentum freshness (TTL ~12 min) to guard staleness.
+
+    Returns:
+        macro_scale : float — 1.0 (aligned), 0.8 (neutral/stale/missing), 0.5 (conflict)
+        claudia_dir : int   — +1 (Bullish), -1 (Bearish), 0 (Neutral/stale)
+        note        : str   — log tag for the confluence log line
+        compress_sl : bool  — True only when macro_scale == 0.5 (counter-trend)
+    """
+    notes = _claudia_directive_notes
+    if not notes:
+        return 0.8, 0, "missing", False
+
+    # Freshness: claudia_sector_momentum has a short TTL (~12 min, refreshed each cycle).
+    # If its timestamp is >_MACRO_STALE_SECS old, Claudia has not run recently.
+    try:
+        _csm_raw = _redis().get("claudia_sector_momentum")
+        if not _csm_raw:
+            return 0.8, 0, "stale", False
+        _csm_ts = json.loads(_csm_raw).get("timestamp", 0)
+        if _csm_ts and (time.time() - _csm_ts) > _MACRO_STALE_SECS:
+            return 0.8, 0, "stale", False
+    except Exception:
+        return 0.8, 0, "stale", False
+
+    avoid          = notes.get("avoid", [])
+    thesis_sectors = notes.get("thesis_sectors", [])
+    high_conv      = notes.get("high_conviction", [])
+    sym_sectors    = _JUNE_SECTOR_MAP.get(sym, set())
+
+    # Derive Claudia directional bias: +1 = Bullish, -1 = Bearish, 0 = Neutral
+    claudia_dir = 0
+    if sym in high_conv:
+        claudia_dir = 1                                     # explicitly bullish on this symbol
+    elif sym in avoid:
+        claudia_dir = -1                                    # explicitly bearish / avoid
+    elif sym_sectors:
+        if any(s in thesis_sectors for s in sym_sectors):
+            claudia_dir = 1                                 # symbol's sector is in thesis
+        elif any(s in avoid for s in sym_sectors):
+            claudia_dir = -1                                # symbol's sector is avoided
+
+    if claudia_dir == 0:
+        return 0.8, 0, "neutral", False
+
+    local_dir = 1 if signal_dir == "long" else -1
+    if claudia_dir == local_dir:
+        return 1.0, claudia_dir, "aligned", False
+    else:
+        return 0.5, claudia_dir, "conflict", True           # counter-trend: halve size, tighten SL
+
+
 # ── Order deal confirmation ───────────────────────────────────────────────────
 
 def _live_confirm_deal(deal_ref: str, retries: int = 3) -> Optional[dict]:
@@ -5897,7 +5954,8 @@ def _live_confirm_deal(deal_ref: str, retries: int = 3) -> Optional[dict]:
 # ── Order placement (Part 5) — gated behind _live_trade_guard() ──────────────
 
 def _live_open_position(sym: str, direction: str, signals: dict,
-                        pos_size: float, leverage: int, conviction: int) -> None:
+                        pos_size: float, leverage: int, conviction: int,
+                        stop_mult: float = 1.0) -> None:
     """Place a real BUY/SELL order on the IG live account.
 
     STRUCTURALLY GATED: _live_trade_guard() is the first call. No code path can
@@ -5927,6 +5985,8 @@ def _live_open_position(sym: str, direction: str, signals: dict,
     else:
         actual_n = ig_size * lot_sz * mid_price * price_unit # USD notional
     stop_pct  = max(_sim_get_dynamic_stop(sym), _sim_get_spread_floor(sym))
+    if stop_mult != 1.0:
+        stop_pct = round(stop_pct * stop_mult, 6)  # counter-trend SL compression
     tp_pct    = _sim_get_tp(sym, direction, conviction)
     stop_dist = _live_compute_stop_pts(sym, stop_pct)
 
@@ -6363,6 +6423,17 @@ def _live_try_entry(signals: dict, regime: str) -> None:
         )
     notional = pos_size * lev
 
+    # Macro confluence — scale pos_size by Claudia directional alignment
+    _macro_scale, _claudia_dir, _conf_note, _compress_sl = _live_macro_confluence(sym, direction)
+    if _macro_scale < 1.0:
+        pos_size = max(10.0, round(pos_size * _macro_scale, 2))
+        notional = pos_size * lev
+    _claudia_label = "Bullish" if _claudia_dir == 1 else ("Bearish" if _claudia_dir == -1 else "Neutral")
+    _live_log(
+        f"🤝 [CONFLUENCE] {sym}: Local={direction}, Macro={_claudia_label}"
+        f" ({_conf_note}) | Sizing scaled to {_macro_scale}x"
+    )
+
     # Check IG minimum feasibility
     if not _sim_check_min_feasible(sym, pos_size, lev):
         # Try with $10 fixed if pct_10 too small
@@ -6378,7 +6449,8 @@ def _live_try_entry(signals: dict, regime: str) -> None:
         f"conv {conv}/10 lev {lev}:1 pos ${pos_size:.2f} notional ${notional:.2f}"
     )
 
-    _live_open_position(sym, direction, _ext, pos_size, lev, conv)
+    _live_open_position(sym, direction, _ext, pos_size, lev, conv,
+                       stop_mult=0.8 if _compress_sl else 1.0)
 
 
 # ── Top-level live step (called from poll_cycle) ──────────────────────────────
