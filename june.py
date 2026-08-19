@@ -4327,6 +4327,45 @@ def _sim_check_exit(signals: dict, regime: str) -> None:
                     f'reversal exit wait to {_rev_secs}s.',
                     flush=True,
                 )
+    # ── Dynamic Profit Lock-in Engine (DPLE) ─────────────────────────────────
+    # Milestone 1 (>=50% of TP): move effective_sl to breakeven + spread buffer.
+    # Milestone 2 (>=75% of TP): trail at 50% of peak unrealized profit.
+    # dple_effective_sl is in P&L-fraction space (same units as pnl_pct):
+    #   negative = tolerate a small loss (M1 spread-buffer floor)
+    #   positive = trail a profit floor (M2 half-peak trail)
+    # Both milestones only RAISE the floor -- never move it backward.
+    _dple_tp = pos.get('tp_pct', _sim_get_tp(sym, dirn, pos.get('conviction', 5)))
+    if _dple_tp > 0:
+        if pnl_pct > 0:
+            _peak = max(pos.get('peak_pnl_pct', 0.0), pnl_pct)
+            if _peak > pos.get('peak_pnl_pct', 0.0):
+                _sim['open_position']['peak_pnl_pct'] = _peak
+                pos = _sim['open_position']
+        _peak    = pos.get('peak_pnl_pct', 0.0)
+        _dple_sl = pos.get('dple_effective_sl', None)
+        if pnl_pct >= 0.75 * _dple_tp:
+            _trail_sl = 0.5 * _peak
+            if _dple_sl is None or _trail_sl > _dple_sl:
+                _sim['open_position']['dple_effective_sl'] = _trail_sl
+                _sim['open_position']['breakeven_locked']  = True
+                pos = _sim['open_position']
+                _dple_sl = _trail_sl
+                _sim_log(
+                    f'💰 [PROFIT TRAIL] {sym}: Locked in 50% of peak profit '
+                    f'at {_trail_sl*100:.3f}%% floor'
+                )
+        elif pnl_pct >= 0.5 * _dple_tp and not pos.get('breakeven_locked'):
+            _spread_buf = _sim_get_spread_floor(sym)
+            _be_sl = -_spread_buf
+            if _dple_sl is None or _be_sl > _dple_sl:
+                _sim['open_position']['dple_effective_sl'] = _be_sl
+                _sim['open_position']['breakeven_locked']  = True
+                pos = _sim['open_position']
+                _dple_sl = _be_sl
+            _sim_log(f'🛡️ [BREAKEVEN LOCK] {sym}: 50% TP distance reached. Stop moved to entry.')
+        if _dple_sl is not None and pnl_pct < _dple_sl:
+            _sim_close_position(prices, 'dple_trail'); return
+
     # Hard exits — instrument-calibrated thresholds (stored at entry, fallback to live calc)
     stop_pct = pos.get("stop_pct", _sim_get_dynamic_stop(sym))
     if pnl_pct <= -stop_pct:
@@ -6175,6 +6214,15 @@ def _live_close_position(exit_reason: str, signals: dict) -> None:
             if won: _live["short_wins"] = _live.get("short_wins", 0) + 1
 
         _live_update_streak(sym, dirn, won)
+        # After stop_loss: pause ALL directions for this symbol for 10 min.
+        # Prevents immediate whipsawing into the same symbol after a stop-out.
+        if exit_reason == "stop_loss":
+            _sl_exp = time.time() + 10 * 60
+            _live.setdefault("pause_expiry", {}).update({
+                _sim_combo_key(sym, "long"):  _sl_exp,
+                _sim_combo_key(sym, "short"): _sl_exp,
+            })
+            _live_log(f"⏸️ [STOP COOLDOWN] {sym}: stop_loss -- 10-min symbol cooldown applied (all directions)")
     else:
         _live_log(f"close_position: confirm failed or rejected for {sym} — check IG manually")
 
@@ -6244,6 +6292,39 @@ def _live_check_exit(signals: dict, regime: str) -> None:
                     f'Compressed SL to {round(_eff_sl_l * 100, 3)}% and '
                     f'reversal exit wait to {_rev_secs_l}s.'
                 )
+    # ── Dynamic Profit Lock-in Engine (DPLE) -- live mirror ────────────────────
+    _dple_tp_l = pos.get('tp_pct', _sim_get_tp(sym, dirn, pos.get('conviction', 5)))
+    if _dple_tp_l > 0:
+        if pnl_pct > 0:
+            _peak_l = max(pos.get('peak_pnl_pct', 0.0), pnl_pct)
+            if _peak_l > pos.get('peak_pnl_pct', 0.0):
+                _live['open_position']['peak_pnl_pct'] = _peak_l
+                pos = _live['open_position']
+        _peak_l    = pos.get('peak_pnl_pct', 0.0)
+        _dple_sl_l = pos.get('dple_effective_sl', None)
+        if pnl_pct >= 0.75 * _dple_tp_l:
+            _trail_sl_l = 0.5 * _peak_l
+            if _dple_sl_l is None or _trail_sl_l > _dple_sl_l:
+                _live['open_position']['dple_effective_sl'] = _trail_sl_l
+                _live['open_position']['breakeven_locked']  = True
+                pos = _live['open_position']
+                _dple_sl_l = _trail_sl_l
+                _live_log(
+                    f'💰 [PROFIT TRAIL] {sym}: Locked in 50% of peak profit '
+                    f'at {_trail_sl_l*100:.3f}%% floor'
+                )
+        elif pnl_pct >= 0.5 * _dple_tp_l and not pos.get('breakeven_locked'):
+            _spread_buf_l = _sim_get_spread_floor(sym)
+            _be_sl_l = -_spread_buf_l
+            if _dple_sl_l is None or _be_sl_l > _dple_sl_l:
+                _live['open_position']['dple_effective_sl'] = _be_sl_l
+                _live['open_position']['breakeven_locked']  = True
+                pos = _live['open_position']
+                _dple_sl_l = _be_sl_l
+            _live_log(f'🛡️ [BREAKEVEN LOCK] {sym}: 50% TP distance reached. Stop moved to entry.')
+        if _dple_sl_l is not None and pnl_pct < _dple_sl_l:
+            _live_close_position('dple_trail', signals); return
+
     stop_pct = pos.get("stop_pct", _sim_get_dynamic_stop(sym))
     tp_pct   = pos.get("tp_pct",   _sim_get_tp(sym, dirn, pos.get("conviction", 5)))
 
