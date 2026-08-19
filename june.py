@@ -4153,6 +4153,7 @@ def _sim_try_entry(signals: dict, regime: str, leverage: int) -> None:
         "vol_bucket": vbkt, "approach": approach, "regime": regime,
         "entry_change_15m": change_15m, "tp_pct": tp_pct, "stop_pct": stop_pct,
         "conviction": conviction,
+        "initial_sl_pct": stop_pct,  # baseline for time-decay SL compression
         "claudia_pts": _sim_claudia_pts(sym, direction),
     }
 
@@ -4284,6 +4285,43 @@ def _sim_check_exit(signals: dict, regime: str) -> None:
     dirn     = pos["direction"]
     sig_dir  = _exit_sig[sym].get("direction", "neutral")
 
+    # ── Time-Decay Exit Compression ─────────────────────────────────────────────────────────────────
+    # For positions active >30 min without reaching 50% TP distance:
+    # compress SL 15% per 15-min window (floor 50% initial SL);
+    # decay reversal patience by 1 cycle per window (floor 1).
+    age_min = hold_sec / 60.0
+    _tdec_windows = 0
+    if age_min >= 30.0:
+        _init_sl  = pos.get('initial_sl_pct', pos.get('stop_pct', _sim_get_dynamic_stop(sym)))
+        _tp_val   = pos.get('tp_pct', _sim_get_tp(sym, dirn, pos.get('conviction', 5)))
+        _tp_prog  = pnl_pct / _tp_val if _tp_val > 0 else 0.0
+        if _tp_prog < 0.50:
+            _tdec_windows = int((age_min - 30.0) / 15.0) + 1
+            _compression  = max(0.50, 1.0 - 0.15 * _tdec_windows)
+            _eff_sl       = _init_sl * _compression
+            _fill_p       = pos.get('fill_price', 0.0)
+            if _eff_sl < pos.get('stop_pct', 0.0) and _fill_p > 0:
+                _new_sp = _fill_p * (1.0 - _eff_sl) if dirn == 'long' else _fill_p * (1.0 + _eff_sl)
+                _sim['open_position']['stop_pct']   = _eff_sl
+                _sim['open_position']['stop_price'] = _new_sp
+                pos = _sim['open_position']
+            _brb_td   = _barbie_overrides.get(sym, {}).get('reversal_confirm_secs')
+            if _brb_td is not None:
+                _cl_td    = max(_BARBIE_OVERRIDE_MIN_SECS, min(_BARBIE_OVERRIDE_MAX_SECS, int(_brb_td)))
+                _base_pat = max(1, round(_cl_td / POLL_ACTIVE))
+            else:
+                _base_pat = _SIM_REV_PATIENCE_WIN if pnl_pct > 0 else _SIM_REV_PATIENCE_LOSS
+            _rev_secs = max(1, _base_pat - _tdec_windows) * POLL_ACTIVE
+            if _tdec_windows > pos.get('tdec_windows_logged', -1):
+                _sim['open_position']['tdec_windows_logged'] = _tdec_windows
+                pos = _sim['open_position']
+                print(
+                    f'[{_ts()}] ⏳ [TIME DECAY] {sym}: active for {int(age_min)}m '
+                    f'without 50% TP progress. '
+                    f'Compressed SL to {round(_eff_sl * 100, 3)}% and '
+                    f'reversal exit wait to {_rev_secs}s.',
+                    flush=True,
+                )
     # Hard exits — instrument-calibrated thresholds (stored at entry, fallback to live calc)
     stop_pct = pos.get("stop_pct", _sim_get_dynamic_stop(sym))
     if pnl_pct <= -stop_pct:
@@ -4314,6 +4352,7 @@ def _sim_check_exit(signals: dict, regime: str) -> None:
             patience = max(1, round(_clamped / POLL_ACTIVE))
         else:
             patience = _SIM_REV_PATIENCE_WIN if pnl_pct > 0 else _SIM_REV_PATIENCE_LOSS
+        patience = max(1, patience - _tdec_windows)  # time-decay window decay
         rev_count = pos.get("reversal_count", 0) + 1
         _sim["open_position"]["reversal_count"] = rev_count
         if rev_count >= patience:
@@ -5944,6 +5983,7 @@ def _live_open_position(sym: str, direction: str, signals: dict,
         "entry_vol":    abs(sig.get("change_5m", 0.0)),
         "conviction":   conviction,
         "claudia_pts":  _sim_claudia_pts(sym, direction),
+        "initial_sl_pct": stop_pct,  # baseline for time-decay SL compression
         "reversal_count": 0,
     }
     _live["total_trades"]    = _live.get("total_trades", 0) + 1
@@ -6098,6 +6138,36 @@ def _live_check_exit(signals: dict, regime: str) -> None:
     pnl_pct  = (mid - fill_px) / fill_px if dirn == "long" else (fill_px - mid) / fill_px
     sig_dir  = sig.get("direction", "neutral")
 
+    # ── Time-Decay Exit Compression (live mirror) ─────────────────────────────
+    age_min_l = hold_sec / 60.0
+    _tdec_windows = 0
+    if age_min_l >= 30.0:
+        _init_sl_l  = pos.get('initial_sl_pct', pos.get('stop_pct', _sim_get_dynamic_stop(sym)))
+        _tp_val_l   = pos.get('tp_pct', _sim_get_tp(sym, dirn, pos.get('conviction', 5)))
+        _tp_prog_l  = pnl_pct / _tp_val_l if _tp_val_l > 0 else 0.0
+        if _tp_prog_l < 0.50:
+            _tdec_windows  = int((age_min_l - 30.0) / 15.0) + 1
+            _compression_l = max(0.50, 1.0 - 0.15 * _tdec_windows)
+            _eff_sl_l      = _init_sl_l * _compression_l
+            if _eff_sl_l < pos.get('stop_pct', 0.0):
+                _live['open_position']['stop_pct'] = _eff_sl_l
+                pos = _live['open_position']
+            _brb_td_l   = _barbie_overrides.get(sym, {}).get('reversal_confirm_secs')
+            if _brb_td_l is not None:
+                _cl_td_l    = max(_BARBIE_OVERRIDE_MIN_SECS, min(_BARBIE_OVERRIDE_MAX_SECS, int(_brb_td_l)))
+                _base_pat_l = max(1, round(_cl_td_l / POLL_ACTIVE))
+            else:
+                _base_pat_l = _SIM_REV_PATIENCE_WIN if pnl_pct > 0 else _SIM_REV_PATIENCE_LOSS
+            _rev_secs_l = max(1, _base_pat_l - _tdec_windows) * POLL_ACTIVE
+            if _tdec_windows > pos.get('tdec_windows_logged', -1):
+                _live['open_position']['tdec_windows_logged'] = _tdec_windows
+                pos = _live['open_position']
+                _live_log(
+                    f'⏳ [TIME DECAY] {sym}: active for {int(age_min_l)}m '
+                    f'without 50% TP progress. '
+                    f'Compressed SL to {round(_eff_sl_l * 100, 3)}% and '
+                    f'reversal exit wait to {_rev_secs_l}s.'
+                )
     stop_pct = pos.get("stop_pct", _sim_get_dynamic_stop(sym))
     tp_pct   = pos.get("tp_pct",   _sim_get_tp(sym, dirn, pos.get("conviction", 5)))
 
@@ -6118,6 +6188,7 @@ def _live_check_exit(signals: dict, regime: str) -> None:
             patience = max(1, round(_clamped / POLL_ACTIVE))
         else:
             patience = _SIM_REV_PATIENCE_WIN if pnl_pct > 0 else _SIM_REV_PATIENCE_LOSS
+        patience = max(1, patience - _tdec_windows)  # time-decay window decay
         rev_count = pos.get("reversal_count", 0) + 1
         _live["open_position"]["reversal_count"] = rev_count
         if rev_count >= patience:
