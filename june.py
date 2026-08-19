@@ -5522,16 +5522,32 @@ def _live_poll_balance() -> None:
             _live["balance_margin"]    = float(bal.get("deposit", 0.0))
             _live["balance_fetched_at"] = int(now)
             _live_balance_polled_at    = now
-            # Seed day-start on first fetch of each UTC day (used by circuit breaker)
-            _today_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+            # Seed day-start on first fetch of each UTC day (used by circuit breaker).
+            # Persisted to Redis so a service restart on the same calendar day restores
+            # the original baseline instead of re-seeding from IG (which can return a
+            # stale or margin-inflated balance and re-fire the circuit breaker).
+            _today_utc  = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+            _redis_dkey = f"june_balance_day_start:{_today_utc}"
             if _live.get("balance_day_start_date") != _today_utc or _live.get("balance_day_start", 0.0) <= 0:
-                # Use cash (available + margin) not NAV — excludes unrealized P&L so an
-                # open position with unrealized profit cannot inflate the baseline and
-                # cause a false circuit-breaker trigger when the position closes flat.
-                _cash_only = _live["balance"] + _live["balance_margin"]
+                _redis_val = None
+                try:
+                    _redis_val = _redis().get(_redis_dkey)
+                except Exception:
+                    pass
+                if _redis_val:
+                    # Restore persisted baseline — avoids CB re-fire on same-day restart
+                    _cash_only = float(_redis_val)
+                    _live_log(f"Day-start balance RESTORED from Redis: ${_cash_only:.2f} ({_today_utc})")
+                else:
+                    # First genuine seed for this UTC day — persist to Redis (TTL 36h)
+                    _cash_only = _live["balance"] + _live["balance_margin"]
+                    try:
+                        _redis().setex(_redis_dkey, 36 * 3600, str(_cash_only))
+                    except Exception:
+                        pass
+                    _live_log(f"Day-start balance recorded: ${_cash_only:.2f} (cash only, excl unrealized P&L) ({_today_utc})")
                 _live["balance_day_start"]      = _cash_only
                 _live["balance_day_start_date"] = _today_utc
-                _live_log(f"Day-start balance recorded: ${_cash_only:.2f} (cash only, excl unrealized P&L) ({_today_utc})")
             _live_log(f"Balance: ${_live['balance']:.2f} available, "
                       f"${_live['balance_margin']:.2f} in margin")
             _live_save_state()
