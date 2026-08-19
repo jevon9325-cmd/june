@@ -5961,7 +5961,8 @@ def _live_open_position(sym: str, direction: str, signals: dict,
 
     status = confirm.get("dealStatus", "")
     if status != "ACCEPTED":
-        _live_log(f"open_position: {sym} deal {status}: {confirm.get('reason', '?')}")
+        _live_log(f"open_position: {sym} deal {status}: {confirm.get('reason', '?')} — 10min cooldown")
+        _live.setdefault("pause_expiry", {})[_sim_combo_key(sym, direction)] = time.time() + 600
         return
 
     fill_price = float(confirm.get("level", mid_price))
