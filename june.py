@@ -5645,15 +5645,26 @@ def _ig_margin_to_max_lev(margin_rate: float, ceiling: int) -> int:
 
 
 def _live_is_eligible(sym: str) -> bool:
-    """Eligibility check using LIVE balance and IG's real per-instrument margin rate.
+    """Eligibility check using effective live balance and IG's real per-instrument margin rate.
 
-    Formula: (min_notional / effective_leverage) <= concentration_cap * balance
+    effective_balance = balance_total - skimmed_total
+      balance_total : IG total equity (deposits + realized P&L, before unrealized).
+                      Includes capital currently in margin use, so eligibility is not
+                      incorrectly shrunk when another position is already open.
+      skimmed_total : cumulative profit marked set-aside by the skim mechanism --
+                      still physically in the IG account but not to be risked on
+                      new trades. Subtracting it ensures set-aside funds are genuinely
+                      excluded from the concentration-cap denominator.
+
+    Formula: (min_notional / effective_leverage) <= concentration_cap * effective_balance
     where effective_leverage = _ig_margin_to_max_lev(margin_rate, sim_ceiling).
 
     Covers all IG instrument categories: FX/commodities/indices use decimal fraction
     scale (0.5=50% margin); equity/ETF types use percentage scale (20.0=20% margin).
     """
-    bal = _live.get("balance", 0.0)
+    total   = _live.get("balance_total", 0.0)
+    skimmed = _live.get("skimmed_total", 0.0)
+    bal     = max(0.0, total - skimmed)
     if bal <= 0:
         return False
     lev = int(_SIM_LEV_RANGES.get("sprout", (3, 10))[1])  # sim ceiling
