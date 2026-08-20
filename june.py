@@ -113,6 +113,10 @@ SPREAD_HISTORY_LEN  = 60     # readings kept per instrument (~1h at 60s)
 SPREAD_ALERT_FACTOR  = 3.0    # current spread > 3× avg → spread_alert: True
 SPREAD_ATR_THRESHOLD = 0.35   # spread > 35% of 14-period ATR → boundary warning + rank/size penalty
 ATR_PERIOD           = 14     # periods for ATR from rolling mid-price history
+# Hybrid tiered Spread/ATR thresholds — per asset class, used by entry gate with 5m ATR
+_SPREAD_ATR_TIERS:        dict  = {"FX": 0.35, "METAL": 0.60, "ENERGY": 0.85}
+_SPREAD_ATR_ASSET_CLASS:  dict  = {"GOLD": "METAL", "SILVER": "METAL", "OIL": "ENERGY"}
+_SPREAD_ATR_FALLBACK_BUMP: float = 0.15  # added to tier threshold when using 1m-ATR fallback
 SPREAD_MIN_READINGS = 5      # minimum readings before anomaly detection active
 
 PREMARKET_GAP_PCT   = 0.50   # |change vs 06:00 baseline| to flag pre-London gap
@@ -1243,6 +1247,40 @@ def _compute_atr(sym: str) -> float | None:
     if not recent:
         return None
     return sum(recent) / len(recent)
+
+
+def _compute_atr_5m(sym: str) -> tuple:
+    """5-minute ATR from rolling mid-price history.
+    Computes mean |price[i] - price[i-5]| (five-minute deltas) over the deque.
+    Returns (atr, is_fallback=False) when >= 15 five-minute deltas are available.
+    Falls back to 14-period 1-minute ATR with is_fallback=True when history is thin.
+    Returns (None, False) when insufficient data exists for either calculation.
+    """
+    hist = _history.get(sym)
+    if not hist:
+        return None, False
+    prices = [px for _, px in hist]
+    n = len(prices)
+    STEP     = 5    # five-minute window
+    REQUIRED = 15   # minimum five-minute deltas for full 5m ATR
+    deltas_5m = [abs(prices[i] - prices[i - STEP]) for i in range(STEP, n)]
+    if len(deltas_5m) >= REQUIRED:
+        return sum(deltas_5m) / len(deltas_5m), False   # full 5m ATR
+    # Fewer than 15 five-minute deltas — fall back to 1-minute ATR
+    if n < ATR_PERIOD + 1:
+        return None, True   # not enough data even for 1m ATR
+    trs_1m = [abs(prices[i] - prices[i - 1]) for i in range(1, n)]
+    recent = trs_1m[-ATR_PERIOD:]
+    return (sum(recent) / len(recent) if recent else None), True
+
+
+def _spread_atr_threshold(sym: str, is_fallback: bool) -> float:
+    """Tiered Spread/ATR entry threshold by asset class.
+    ENERGY (OIL): 0.85 | METAL (GOLD, SILVER): 0.60 | FX/EQUITY: 0.35
+    +0.15 added during 1m-ATR fallback while 5m history warms up.
+    """
+    tier = _SPREAD_ATR_TIERS.get(_SPREAD_ATR_ASSET_CLASS.get(sym, "FX"), 0.35)
+    return tier + (_SPREAD_ATR_FALLBACK_BUMP if is_fallback else 0.0)
 
 
 def compute_signal(sym: str, price: dict, spread_alert: bool = False) -> dict:
@@ -3981,11 +4019,18 @@ def _sim_try_entry(signals: dict, regime: str, leverage: int) -> None:
     vol       = abs(chg)
     direction = "long" if chg > 0 else "short"
 
-    # Spread/ATR hard gate — block sim entry when spread dominates ATR
-    if sig.get("spread_atr_wide"):
-        _sar_r = sig.get("spread_atr_ratio") or 0
-        _sim_log(f"🚫 [SPREAD GATE] {sym} sim entry blocked: Spread/ATR ratio {_sar_r:.0%} > 35%")
-        return
+    # Hybrid Spread/ATR gate — tiered threshold using 5-minute ATR baseline (fail-open)
+    _atr5, _atr5_fb = _compute_atr_5m(sym)
+    if _atr5 is not None and _atr5 > 0:
+        _sp_raw = (sig.get("spread_pct", 0.0) or 0.0) * (sig.get("price", 0.0) or 0.0) / 100.0
+        _sar5   = _sp_raw / _atr5
+        _thr5   = _spread_atr_threshold(sym, _atr5_fb)
+        if _sar5 > _thr5:
+            _sim_log(
+                f"🚫 [HYBRID SPREAD GATE] {sym}: Spread/ATR(5m) ratio {_sar5:.2f} "
+                f"> tier cap {_thr5:.2f} | Entry suppressed"
+            )
+            return
 
     # 1m gate: only block if opposing move is >= _SIM_1M_MIN_REVERSAL%
     # Noise-filtered -- tiny spread-level ticks no longer block entries.
@@ -6553,11 +6598,18 @@ def _live_try_entry(signals: dict, regime: str) -> None:
     direction = "long" if chg > 0 else "short"
     combo     = _sim_combo_key(sym, direction)
 
-    # Spread/ATR hard gate — block live entry when spread dominates ATR
-    if sig.get("spread_atr_wide"):
-        _sar_r = sig.get("spread_atr_ratio") or 0
-        _live_log(f"🚫 [SPREAD GATE] {sym} live entry blocked: Spread/ATR ratio {_sar_r:.0%} > 35%")
-        return
+    # Hybrid Spread/ATR gate — tiered threshold using 5-minute ATR baseline (fail-open)
+    _atr5, _atr5_fb = _compute_atr_5m(sym)
+    if _atr5 is not None and _atr5 > 0:
+        _sp_raw = (sig.get("spread_pct", 0.0) or 0.0) * (sig.get("price", 0.0) or 0.0) / 100.0
+        _sar5   = _sp_raw / _atr5
+        _thr5   = _spread_atr_threshold(sym, _atr5_fb)
+        if _sar5 > _thr5:
+            _live_log(
+                f"🚫 [HYBRID SPREAD GATE] {sym}: Spread/ATR(5m) ratio {_sar5:.2f} "
+                f"> tier cap {_thr5:.2f} | Entry suppressed"
+            )
+            return
 
     # 1m anti-reversal gate (same as sim)
     price_1m = _price_n_minutes_ago(sym, 1)
