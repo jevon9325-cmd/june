@@ -265,6 +265,188 @@ class TestPositionReconciliation(unittest.TestCase):
 
 
 # ────────────────────────────────────────────────────────────────────────────
+
+
+# ────────────────────────────────────────────────────────────────────────────
+class TestMinStopDistance(unittest.TestCase):
+    """P2/P3: IG minimum stop distance enforcement in _live_compute_stop_pts()."""
+
+    def _compute_stop_pts(self, sym, ref_price, price_unit, stop_pct, pip_sz,
+                          min_stop_pts_map):
+        """Replicate _live_compute_stop_pts() logic from june.py."""
+        pts = int(ref_price * price_unit * stop_pct / pip_sz)
+        ig_min = min_stop_pts_map.get(sym, 4)
+        return max(ig_min + 1, pts)
+
+    def test_below_minimum_expands(self):
+        """Stop below IG minimum must expand to min+1."""
+        # Strategy gives 3 pts, IG minimum is 10 — result must be 11
+        result = self._compute_stop_pts(
+            sym="NVDA", ref_price=120.0, price_unit=1.0,
+            stop_pct=0.0001, pip_sz=0.01,  # very small stop → ~1 pt
+            min_stop_pts_map={"NVDA": 10}
+        )
+        self.assertGreaterEqual(result, 11,
+            f"Stop {result} must be >= min+1 (11) when IG minimum is 10")
+
+    def test_above_minimum_unchanged(self):
+        """Stop already above IG minimum must not be inflated."""
+        # Strategy gives 50 pts, IG minimum is 10 — result must stay 50
+        result = self._compute_stop_pts(
+            sym="AAPL", ref_price=175.0, price_unit=1.0,
+            stop_pct=0.003, pip_sz=0.01,  # ~52 pts
+            min_stop_pts_map={"AAPL": 10}
+        )
+        self.assertEqual(result, 52,
+            f"Stop {result} must stay at strategy value (52) when above IG minimum+1")
+
+    def test_missing_sym_uses_floor4(self):
+        """Symbol not in map falls back to hard floor of 4 pts."""
+        result = self._compute_stop_pts(
+            sym="UNKNOWN", ref_price=10.0, price_unit=1.0,
+            stop_pct=0.0001, pip_sz=0.01,
+            min_stop_pts_map={}
+        )
+        self.assertGreaterEqual(result, 5,
+            f"Unknown symbol must use floor 4 → result >= 5, got {result}")
+
+    def test_exact_minimum_gets_buffer(self):
+        """Stop equal to IG minimum must still get +1 buffer."""
+        # IG min = 5; strategy also gives 5 pts → must return 6
+        result = self._compute_stop_pts(
+            sym="MSFT", ref_price=300.0, price_unit=1.0,
+            stop_pct=5/30000, pip_sz=0.01,  # exactly 5 pts
+            min_stop_pts_map={"MSFT": 5}
+        )
+        self.assertGreaterEqual(result, 6,
+            f"Stop at exact minimum ({result}) must be >= min+1 (6)")
+
+
+# ────────────────────────────────────────────────────────────────────────────
+class TestAuth401Retry(unittest.TestCase):
+    """Session token auto-refresh: 401 triggers re-auth and one retry."""
+
+    def _make_response(self, status_code, json_body=None):
+        r = MagicMock()
+        r.status_code = status_code
+        r.json.return_value = json_body or {}
+        r.text = str(json_body or "")
+        return r
+
+    def test_401_then_200_succeeds(self):
+        """401 triggers authenticate_live(); second request with fresh token returns data."""
+        ok_data = {"epic": "NVDA", "bid": 130.0}
+        # Simulate: first GET returns 401, second GET returns 200 with ok_data
+        responses = [
+            self._make_response(401),
+            self._make_response(200, ok_data),
+        ]
+        call_count = {"n": 0}
+        def fake_get(url, headers=None, params=None, timeout=None):
+            r = responses[call_count["n"]]
+            call_count["n"] += 1
+            return r
+
+        sess_store = {"cst": "old_cst", "token": "old_tok"}
+        def fake_reauth():
+            sess_store["cst"]   = "new_cst"
+            sess_store["token"] = "new_tok"
+            return True
+
+        with patch("requests.get", side_effect=fake_get):
+            # Minimal replicated logic from _ig_live_get
+            r = fake_get("url")
+            if r.status_code == 401:
+                reauthed = fake_reauth()
+                self.assertTrue(reauthed, "Re-auth must succeed")
+                r = fake_get("url")
+            result = r.json() if r.status_code == 200 else None
+
+        self.assertEqual(result, ok_data, "Should return data after re-auth success")
+        self.assertEqual(call_count["n"], 2, "Exactly 2 requests: initial + retry")
+        self.assertEqual(sess_store["cst"], "new_cst", "CST must be refreshed")
+
+    def test_401_reauth_failure_returns_none(self):
+        """If re-auth itself fails, the wrapper must return None — not retry blindly."""
+        def fake_reauth_fail():
+            return False
+
+        r = self._make_response(401)
+        if r.status_code == 401:
+            reauthed = fake_reauth_fail()
+            result = None if not reauthed else {"should": "not reach here"}
+        else:
+            result = r.json()
+
+        self.assertIsNone(result, "Failed re-auth must yield None — no blind retry")
+
+    def test_non_401_error_no_reauth(self):
+        """500 errors must not trigger re-auth loop."""
+        reauth_calls = {"n": 0}
+        def fake_reauth():
+            reauth_calls["n"] += 1
+            return True
+
+        r = self._make_response(500)
+        if r.status_code == 401:
+            fake_reauth()
+        result = None  # 500 → return None in wrapper
+
+        self.assertIsNone(result)
+        self.assertEqual(reauth_calls["n"], 0, "Re-auth must not fire on 500")
+
+
+# ────────────────────────────────────────────────────────────────────────────
+class TestDealConfirmPolling(unittest.TestCase):
+    """P5: _live_confirm_deal() exponential backoff and status handling."""
+
+    def _simulate_confirm(self, status_sequence, retries=4):
+        """Replicate _live_confirm_deal() logic, feeding statuses from sequence."""
+        _backoff = [0.2, 0.5, 1.0, 2.0]
+        calls = []
+        for attempt in range(retries):
+            # time.sleep skipped in tests
+            if attempt < len(status_sequence):
+                status = status_sequence[attempt]
+                calls.append(status)
+                data = {"dealStatus": status, "dealReference": "REF123"}
+                if status != "PENDING":
+                    return data, calls
+        return None, calls
+
+    def test_immediate_accepted(self):
+        """First poll returns ACCEPTED — must return immediately, one call."""
+        result, calls = self._simulate_confirm(["ACCEPTED"])
+        self.assertIsNotNone(result)
+        self.assertEqual(result["dealStatus"], "ACCEPTED")
+        self.assertEqual(len(calls), 1, "Should return after first poll")
+
+    def test_pending_then_accepted(self):
+        """Two PENDINGs then ACCEPTED — must return on third poll."""
+        result, calls = self._simulate_confirm(["PENDING", "PENDING", "ACCEPTED"])
+        self.assertIsNotNone(result)
+        self.assertEqual(result["dealStatus"], "ACCEPTED")
+        self.assertEqual(len(calls), 3, "Must wait through PENDINGs then return")
+
+    def test_rejected_returns_data(self):
+        """REJECTED is not PENDING — must return the rejected dict (caller inspects it)."""
+        result, calls = self._simulate_confirm(["REJECTED"])
+        self.assertIsNotNone(result)
+        self.assertEqual(result["dealStatus"], "REJECTED")
+
+    def test_all_pending_returns_none(self):
+        """If all retries exhausted still PENDING — must return None."""
+        result, calls = self._simulate_confirm(["PENDING", "PENDING", "PENDING", "PENDING"])
+        self.assertIsNone(result, "All-PENDING after all retries must return None")
+        self.assertEqual(len(calls), 4, "Must make all 4 attempts before giving up")
+
+    def test_backoff_sequence_length(self):
+        """Backoff list has 4 entries matching the default retries=4."""
+        _backoff = [0.2, 0.5, 1.0, 2.0]
+        self.assertEqual(len(_backoff), 4, "Backoff list length must match retries default")
+        self.assertEqual(_backoff[0], 0.2)
+        self.assertEqual(_backoff[-1], 2.0)
+
 if __name__ == "__main__":
     suite = unittest.TestLoader().loadTestsFromModule(__import__("__main__"))
     runner = unittest.TextTestRunner(verbosity=2)

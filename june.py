@@ -337,6 +337,7 @@ _live_pip_sizes: dict = {}   # sym -> pip size in price units from LIVE API (pop
 _live_price_unit: dict = {}  # sym -> USD-per-native-price-unit (0.01 for cents, 1.0 otherwise)
 _live_margin:    dict = {}   # sym -> IG margin rate (0.0-1.0 fraction) from LIVE API, e.g. 0.8=80%
 _live_equity_cfd: set = set() # syms whose epic ends .CASH.IP — IG size field is shares, not lots
+_live_min_stop_pts: dict = {}  # sym -> minNormalStopOrLimitDistance (pts) from IG at startup
 _MACRO_STALE_SECS  = 2 * 3600   # Claudia freshness gate: beyond this treat directional bias as stale
 
 # Rolling price history: {sym: deque([(epoch, mid), ...])}
@@ -626,6 +627,10 @@ def _ig_live_get(path: str, params: Optional[dict] = None, version: str = "1") -
     # GET against IG live endpoint. Intelligence-only, no orders.
     # Mirrors _ig_get() using live base URL and live session tokens.
     # 403/429 silently return None (rate-limit recovery expected).
+    global _live_api_paused_until
+    if time.time() < _live_api_paused_until:
+        print(f"[{_ts()}] GET {path} skipped -- 429 rate-limit pause active", flush=True)
+        return None
     if not _ensure_live_session():
         return None
     url  = f"{IG_LIVE_BASE}{path}"
@@ -648,7 +653,11 @@ def _ig_live_get(path: str, params: Optional[dict] = None, version: str = "1") -
             r = requests.get(url, headers=hdrs, params=params, timeout=10)
         if r.status_code == 200:
             return r.json()
-        if r.status_code not in (403, 429):
+        if r.status_code == 429:
+            _live_api_paused_until = time.time() + 60.0
+            print(f"[{_ts()}] ⚠️  LIVE GET 429 rate-limit -- API paused 60s", flush=True)
+            return None
+        if r.status_code not in (403,):
             print(f"[{_ts()}] ⚠️  LIVE {path}: HTTP {r.status_code} {r.text[:80]}", flush=True)
         return None
     except Exception as exc:
@@ -5476,7 +5485,8 @@ _LIVE_SKIM_HALF_MIN_GAP   = 3600    # half-mode: don't re-flag more often than h
 # mechanically. Threshold is intentionally tighter than Miss Secretary's -10% equity floor
 # because June's CFD stops are tighter and losses compound faster at leverage.
 _LIVE_CIRCUIT_BREAKER_PCT = -0.05   # -5% daily drawdown → auto-disable kill switch
-_LIVE_CB_FLOOR_USD        = 20.0    # min dollar loss before CB fires — prevents micro-account starvation
+_LIVE_CB_FLOOR_USD        = 20.0
+_live_api_paused_until: float = 0.0  # epoch; set on 429; all HTTP wrappers check this
 # Micro-Profit Defense Engine — friction threshold and guaranteed floor
 _MPD_SLIPPAGE_PIPS   = 2   # extra buffer in price points (activation gate only)
 _MPD_MIN_PROFIT_PIPS = 1   # minimum guaranteed profit in points above spread
@@ -5522,6 +5532,10 @@ def _ig_live_post(path: str, body: dict, version: str = "2") -> Optional[dict]:
     Handles 401 re-auth and logs errors. Does NOT call _live_trade_guard() —
     callers must gate before reaching here.
     """
+    global _live_api_paused_until
+    if time.time() < _live_api_paused_until:
+        _live_log(f"POST {path} skipped -- 429 rate-limit pause active")
+        return None
     if not _ensure_live_session():
         return None
     url  = f"{IG_LIVE_BASE}{path}"
@@ -5908,6 +5922,8 @@ def _live_fetch_market_data(sym: str, epic: str) -> bool:
     _live_pip_sizes[sym]  = pip_sz
     _live_price_unit[sym] = price_unit
     _live_margin[sym]     = margin_rate
+    _ms_obj = deal.get("minNormalStopOrLimitDistance") or {}
+    _live_min_stop_pts[sym] = max(4, int(float(_ms_obj.get("value") or 4)))
     if epic.upper().endswith(".CASH.IP"):
         _live_equity_cfd.add(sym)
     _live_log(f"LIVE mkt: {sym} lot={lot_sz} minDeal={min_val} pip={pip_sz} unit={price_unit} margin={margin_rate:.0%}")
@@ -6111,7 +6127,7 @@ def _live_compute_stop_pts(sym: str, stop_pct: float) -> int:
     price_unit = _live_price_unit.get(sym, 1.0)
     ref_price  = _live_entry_price_ref(sym)  # native price units (cents for Silver)
     pts        = int(ref_price * price_unit * stop_pct / pip_sz)
-    return max(4, pts)
+    return max(_live_min_stop_pts.get(sym, 4) + 1, pts)
 
 
 def _live_entry_price_ref(sym: str) -> float:
@@ -6191,17 +6207,20 @@ def _live_macro_confluence(sym: str, signal_dir: str) -> tuple:
 
 # ── Order deal confirmation ───────────────────────────────────────────────────
 
-def _live_confirm_deal(deal_ref: str, retries: int = 3) -> Optional[dict]:
-    """Poll /confirms/{dealReference} until status != PENDING.
-    Returns the confirmed deal dict or None on failure.
+def _live_confirm_deal(deal_ref: str, retries: int = 4) -> Optional[dict]:
+    """Poll /confirms/{dealReference} with exponential backoff until status != PENDING.
+    Backoff: [0.2, 0.5, 1.0, 2.0]s. Returns confirmed dict or None after all retries.
     """
-    for _ in range(retries):
-        time.sleep(1)
+    _backoff = [0.2, 0.5, 1.0, 2.0]
+    for attempt in range(retries):
+        time.sleep(_backoff[min(attempt, len(_backoff) - 1)])
         data = _ig_live_get(f"/confirms/{deal_ref}", version="1")
         if data:
             status = data.get("dealStatus", "")
             if status != "PENDING":
                 return data
+            _live_log(f"confirm {deal_ref}: PENDING (attempt {attempt+1}/{retries})")
+    _live_log(f"confirm {deal_ref}: PENDING after {retries} attempts -- aborting")
     return None
 
 
@@ -6587,7 +6606,8 @@ def _live_check_exit(signals: dict, regime: str) -> None:
                 pos = _live["open_position"]
                 # Try broker-side stop update; fall back to software mirror if too close
                 _mpd_dist_l = abs(mid - _p_stop_l)
-                _mpd_min_l  = max(4, int(_mpd_spn_l / _mpd_pip_l + 1)) * _mpd_pip_l
+                _mpd_ig_min = (_live_min_stop_pts.get(sym, 4) + 1) * _mpd_pip_l
+                _mpd_min_l  = max(_mpd_ig_min, (_mpd_spn_l / _mpd_pip_l + 1) * _mpd_pip_l)
                 _mpd_synced = False
                 if _mpd_dist_l >= _mpd_min_l:
                     _put_r = _ig_live_put(
