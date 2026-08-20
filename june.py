@@ -4417,6 +4417,35 @@ def _sim_check_exit(signals: dict, regime: str) -> None:
         if _dple_sl is not None and pnl_pct < _dple_sl:
             _sim_close_position(prices, 'dple_trail'); return
 
+    # ── Micro-Profit Defense Engine (MPD) — sim mirror ──────────────────────────
+    # Arms once bid/ask clears the total transaction friction threshold above entry.
+    # Thereafter enforces a ratcheting P_stop floor (pnl_pct fraction space, one-way).
+    _mpd_fp = pos.get("fill_price", 0.0)
+    if _mpd_fp > 0:
+        _mpd_mid_s = (_exit_sig[sym].get("price", 0.0) or 0.0)
+        _mpd_sp_s  = (_exit_sig[sym].get("spread_pct", 0.0) or 0.0)
+        _mpd_pip_s = _live_pip_sizes.get(sym, _LIVE_FX_PIP)
+        _mpd_spn_s = _mpd_mid_s * _mpd_sp_s / 100.0         # spread in native price units
+        _mpd_slp_s = _MPD_SLIPPAGE_PIPS * _mpd_pip_s         # slippage buffer (native)
+        _mpd_mgp_s = _MPD_MIN_PROFIT_PIPS * _mpd_pip_s       # min guaranteed profit (native)
+        _mpd_fric_s = (_mpd_spn_s + _mpd_slp_s + _mpd_mgp_s) / _mpd_fp  # as pnl_pct
+        if _mpd_fric_s > 0 and pnl_pct >= _mpd_fric_s:
+            _p_stop_s   = (_mpd_spn_s + _mpd_mgp_s) / _mpd_fp  # P_stop as pnl_pct
+            _cur_dsl_s  = pos.get("defensive_stop_level_pct", None)
+            if _cur_dsl_s is None or _p_stop_s > _cur_dsl_s:   # ratchet: only raise
+                _sim["open_position"]["defensive_stop_active"]    = True
+                _sim["open_position"]["defensive_stop_level_pct"] = _p_stop_s
+                pos = _sim["open_position"]
+                _sim_log(
+                    f"\U0001f6e1\ufe0f [PROFIT DEFENSE] {sym}: Micro-profit floor armed at "
+                    f"{_p_stop_s*100:.3f}% P&L"
+                )
+        if pos.get("defensive_stop_active"):
+            _dsl_s = pos.get("defensive_stop_level_pct", 0.0)
+            if _dsl_s and pnl_pct < _dsl_s:
+                _sim_close_position(prices, "mpd_floor")
+                return
+
     # Hard exits — instrument-calibrated thresholds (stored at entry, fallback to live calc)
     stop_pct = pos.get("stop_pct", _sim_get_dynamic_stop(sym))
     if pnl_pct <= -stop_pct:
@@ -5445,6 +5474,9 @@ _LIVE_SKIM_HALF_MIN_GAP   = 3600    # half-mode: don't re-flag more often than h
 # mechanically. Threshold is intentionally tighter than Miss Secretary's -10% equity floor
 # because June's CFD stops are tighter and losses compound faster at leverage.
 _LIVE_CIRCUIT_BREAKER_PCT = -0.05   # -5% daily drawdown → auto-disable kill switch
+# Micro-Profit Defense Engine — friction threshold and guaranteed floor
+_MPD_SLIPPAGE_PIPS   = 2   # extra buffer in price points (activation gate only)
+_MPD_MIN_PROFIT_PIPS = 1   # minimum guaranteed profit in points above spread
 
 # Instrument performance filter (Fix 3)
 _PERF_BLOCK_WINDOW     = 8       # rolling window of confirmed live trades
@@ -5543,6 +5575,39 @@ def _ig_live_delete(path: str, version: str = "1") -> Optional[dict]:
         return None
     except Exception as exc:
         _live_log(f"DELETE {path} error: {exc}")
+        return None
+
+
+def _ig_live_put(path: str, body: dict, version: str = "2") -> Optional[dict]:
+    """PUT to live IG account (amend position stop/limit). Returns parsed response or None.
+    Does NOT call _live_trade_guard() — callers must gate before reaching here.
+    """
+    if not _ensure_live_session():
+        return None
+    url  = f"{IG_LIVE_BASE}{path}"
+    hdrs = {
+        "X-IG-API-KEY":     IG_LIVE_KEY,
+        "CST":              _live_sess["cst"],
+        "X-SECURITY-TOKEN": _live_sess["token"],
+        "Content-Type":     "application/json; charset=UTF-8",
+        "Accept":           "application/json; charset=UTF-8",
+        "Version":          version,
+    }
+    try:
+        r = requests.put(url, headers=hdrs, json=body, timeout=15)
+        if r.status_code == 401:
+            _live_log(f"401 on PUT {path} — re-authenticating live session")
+            if not authenticate_live():
+                return None
+            hdrs["CST"]              = _live_sess["cst"]
+            hdrs["X-SECURITY-TOKEN"] = _live_sess["token"]
+            r = requests.put(url, headers=hdrs, json=body, timeout=15)
+        if r.status_code in (200, 201):
+            return r.json()
+        _live_log(f"PUT {path}: HTTP {r.status_code} {r.text[:120]}")
+        return None
+    except Exception as exc:
+        _live_log(f"PUT {path} error: {exc}")
         return None
 
 
@@ -6468,6 +6533,68 @@ def _live_check_exit(signals: dict, regime: str) -> None:
             _live_log(f'🛡️ [BREAKEVEN LOCK] {sym}: 50% TP distance reached. Stop moved to entry.')
         if _dple_sl_l is not None and pnl_pct < _dple_sl_l:
             _live_close_position('dple_trail', signals); return
+
+    # ── Micro-Profit Defense Engine (MPD) — live ─────────────────────────────────
+    # Arms once spread-adjusted exit price clears total transaction friction above entry.
+    # Attempts broker-side stop via REST PUT; falls back to software mirror (ratchet: one-way).
+    if fill_px > 0:
+        _mpd_pip_l  = _live_pip_sizes.get(sym, _LIVE_FX_PIP)
+        _mpd_spn_l  = _half_sp * 2.0                          # spread in native price units
+        _mpd_slp_l  = _MPD_SLIPPAGE_PIPS * _mpd_pip_l         # slippage buffer (native)
+        _mpd_mgp_l  = _MPD_MIN_PROFIT_PIPS * _mpd_pip_l       # min guaranteed profit (native)
+        _mpd_fric_l = _mpd_spn_l + _mpd_slp_l + _mpd_mgp_l   # total friction (native)
+        _mpd_act    = (
+            (dirn == "long"  and _exit_px - fill_px >= _mpd_fric_l) or
+            (dirn == "short" and fill_px - _exit_px >= _mpd_fric_l)
+        )
+        if _mpd_act:
+            _p_stop_l = (
+                fill_px + _mpd_spn_l + _mpd_mgp_l if dirn == "long"
+                else fill_px - _mpd_spn_l - _mpd_mgp_l
+            )
+            _cur_dsl_l = pos.get("defensive_stop_level", None)
+            _improve_l = (
+                _cur_dsl_l is None or
+                (dirn == "long"  and _p_stop_l > _cur_dsl_l) or
+                (dirn == "short" and _p_stop_l < _cur_dsl_l)
+            )
+            if _improve_l:
+                _live["open_position"]["defensive_stop_active"] = True
+                _live["open_position"]["defensive_stop_level"]  = _p_stop_l
+                pos = _live["open_position"]
+                # Try broker-side stop update; fall back to software mirror if too close
+                _mpd_dist_l = abs(mid - _p_stop_l)
+                _mpd_min_l  = max(4, int(_mpd_spn_l / _mpd_pip_l + 1)) * _mpd_pip_l
+                _mpd_synced = False
+                if _mpd_dist_l >= _mpd_min_l:
+                    _put_r = _ig_live_put(
+                        f"/positions/otc/{pos.get('deal_id', '')}",
+                        {"stopLevel": round(_p_stop_l, 5), "guaranteedStop": False},
+                        version="2",
+                    )
+                    if _put_r:
+                        _mpd_synced = True
+                        _live["open_position"]["defensive_soft_sl"] = None
+                    else:
+                        _live["open_position"]["defensive_soft_sl"] = _p_stop_l
+                else:
+                    _live["open_position"]["defensive_soft_sl"] = _p_stop_l
+                pos = _live["open_position"]
+                _live_log(
+                    f"\U0001f6e1\ufe0f [PROFIT DEFENSE] {sym}: Micro-profit lock at "
+                    f"{_p_stop_l:.5f} | friction {_mpd_fric_l:.5f} | "
+                    f"broker_sync={_mpd_synced}"
+                )
+                _live_save_state()
+        if pos.get("defensive_stop_active"):
+            _dsl_l = pos.get("defensive_soft_sl") or pos.get("defensive_stop_level", 0.0)
+            if _dsl_l:
+                if dirn == "long"  and _exit_px < _dsl_l:
+                    _live_close_position("mpd_floor", signals)
+                    return
+                if dirn == "short" and _exit_px > _dsl_l:
+                    _live_close_position("mpd_floor", signals)
+                    return
 
     stop_pct = pos.get("stop_pct", _sim_get_dynamic_stop(sym))
     tp_pct   = pos.get("tp_pct",   _sim_get_tp(sym, dirn, pos.get("conviction", 5)))
