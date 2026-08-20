@@ -3633,7 +3633,9 @@ def _sim_apply_pos_adjust() -> None:
     TP: either direction within [_SIM_TP_FLOOR, _SIM_TP_CAP].
     """
     try:
-        raw = _redis().get(_BARBIE_POS_ADJUST_KEY)
+        # GETDEL: atomic read-and-delete prevents a Barbie NX write racing the
+        # old GET+DELETE window. If nothing is pending, returns None immediately.
+        raw = _redis().getdel(_BARBIE_POS_ADJUST_KEY)
         if not raw:
             return
         adj     = json.loads(raw)
@@ -3738,7 +3740,7 @@ def _sim_apply_pos_adjust() -> None:
                 )
                 live_changed = True
 
-        _redis().delete(_BARBIE_POS_ADJUST_KEY)   # consumed -- remove regardless
+        # Key already deleted by GETDEL above — no second delete needed
         if sim_changed:
             _sim_save_state()
         if live_changed:
@@ -5474,6 +5476,7 @@ _LIVE_SKIM_HALF_MIN_GAP   = 3600    # half-mode: don't re-flag more often than h
 # mechanically. Threshold is intentionally tighter than Miss Secretary's -10% equity floor
 # because June's CFD stops are tighter and losses compound faster at leverage.
 _LIVE_CIRCUIT_BREAKER_PCT = -0.05   # -5% daily drawdown → auto-disable kill switch
+_LIVE_CB_FLOOR_USD        = 20.0    # min dollar loss before CB fires — prevents micro-account starvation
 # Micro-Profit Defense Engine — friction threshold and guaranteed floor
 _MPD_SLIPPAGE_PIPS   = 2   # extra buffer in price points (activation gate only)
 _MPD_MIN_PROFIT_PIPS = 1   # minimum guaranteed profit in points above spread
@@ -5807,8 +5810,13 @@ def _live_check_circuit_breaker() -> None:
     current   = _live.get("balance_total", 0.0)
     if day_start <= 0 or current <= 0:
         return   # balance not yet fetched — no baseline to compare
-    drawdown = (current - day_start) / day_start
-    if drawdown > _LIVE_CIRCUIT_BREAKER_PCT:
+    # Dollar-floor CB: effective loss buffer = max($20 floor, 5% of day-start).
+    # Prevents micro-account starvation where 5% of $35 = $1.75 — too tight for
+    # a single CFD spread. Floor naturally yields to pct logic above ~$400.
+    dollar_loss      = day_start - current
+    effective_buffer = max(_LIVE_CB_FLOOR_USD, abs(_LIVE_CIRCUIT_BREAKER_PCT) * day_start)
+    drawdown         = (current - day_start) / day_start
+    if dollar_loss < effective_buffer:
         return   # within daily tolerance
     # Threshold breached — disable kill switch via Redis + module flag
     try:
@@ -5820,10 +5828,11 @@ def _live_check_circuit_breaker() -> None:
     try:
         import datetime as _dt2, json as _json2
         _alert_payload = _json2.dumps({
-            "fired_at":     _dt2.datetime.utcnow().isoformat(),
-            "day_start":    round(day_start, 2),
-            "current":      round(current, 2),
-            "drawdown_pct": round(drawdown * 100, 2),
+            "fired_at":        _dt2.datetime.utcnow().isoformat(),
+            "day_start":       round(day_start, 2),
+            "current":         round(current, 2),
+            "drawdown_pct":    round(drawdown * 100, 2),
+            "effective_buffer": round(effective_buffer, 2),
         })
         _redis().set("june_circuit_breaker_alert", _alert_payload, ex=48 * 3600)
     except Exception:
@@ -5833,7 +5842,7 @@ def _live_check_circuit_breaker() -> None:
         f"  Day-start balance : ${day_start:.2f}\n"
         f"  Current balance   : ${current:.2f}\n"
         f"  Drawdown          : {drawdown:+.2%}\n"
-        f"  Threshold         : {_LIVE_CIRCUIT_BREAKER_PCT:+.2%}\n"
+        f"  Effective buffer  : ${effective_buffer:.2f} (floor=${_LIVE_CB_FLOOR_USD:.0f}, pct={abs(_LIVE_CIRCUIT_BREAKER_PCT):.0%})\n"
         f"  Re-enable requires: redis-cli SET june_live_enabled true (after review)"
     )
 
