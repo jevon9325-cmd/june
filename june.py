@@ -5631,7 +5631,8 @@ def _live_poll_balance() -> None:
         if acct.get("preferred") or acct.get("accountType") == "CFD":
             bal = acct.get("balance", {})
             _live["balance"]           = float(bal.get("available", 0.0))
-            _live["balance_total"]     = float(bal.get("balance", 0.0))
+            _live["balance_pnl"]       = float(bal.get("profitLoss", 0.0))
+            _live["balance_total"]     = float(bal.get("balance", 0.0)) + _live["balance_pnl"]
             _live["balance_margin"]    = float(bal.get("deposit", 0.0))
             _live["balance_fetched_at"] = int(now)
             _live_balance_polled_at    = now
@@ -6252,6 +6253,19 @@ def _live_open_position(sym: str, direction: str, signals: dict,
         f"conviction {conviction}/10 lev {leverage}:1 | "
         f"stop {stop_pct*100:.2f}% ({stop_dist}pts) TP {tp_pct*100:.2f}%"
     )
+
+    # Commission gate: equity CFDs (MU, INTC, AAPL etc) cost $9/side = $18 round-trip.
+    # Block any trade where TP expected gross < $18 — structurally guaranteed to lose.
+    if sym in _live_equity_cfd:
+        _exp_gross = actual_n * tp_pct
+        _rt_comm   = _IG_EQUITY_COMMISSION_USD * 2
+        if _exp_gross < _rt_comm:
+            _live_log(
+                f"🚫 COMMISSION GATE: {sym} blocked — "
+                f"expected gross ${_exp_gross:.2f} < ${_rt_comm:.2f} round-trip "
+                f"commission (notional ${actual_n:.2f} TP {tp_pct*100:.2f}%)."
+            )
+            return
 
     if not _live_trade_guard():  # ← structural gate: no order without this passing
         return
