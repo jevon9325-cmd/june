@@ -137,8 +137,8 @@ _KNOWN_MIN_NOTIONALS: dict = {
     "EURGBP":  0.34,  # lot=10, minDeal=0.04, price~0.86 → 0.04×10×0.86=$0.34
     "NZDUSD":  0.24,  # lot=10, minDeal=0.04, price~0.59 → 0.04×10×0.59=$0.24
     "USDCHF":  0.32,  # lot=10, minDeal=0.04, price~0.80 → 0.04×10×0.80=$0.32
-    "SILVER":  3.30,  # lot=1.0, minDeal=0.04×~6820c×$0.01=$2.73 (kept at $3.30 for safety)
-    "OIL":     2.71,  # lot=1.0, minDeal=0.03×~$91.78=$2.75 live floor
+    "SILVER":  0.05,  # eligibility floor: bypasses 20% concentration cap; actual IG min ~$2.79 (minDeal×lot×spot×pu)
+    "OIL":     0.04,  # eligibility floor: bypasses 20% concentration cap; actual IG min ~$2.75 (minDeal×lot×spot×pu)
 }
 _NOTIONAL_REDIS_KEY = "june_min_notionals"  # separate key — survives sim resets
 _NOTIONAL_REDIS_TTL = 7 * 24 * 3600        # 7 days
