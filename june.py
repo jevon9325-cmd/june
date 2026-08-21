@@ -6793,6 +6793,13 @@ def _live_try_entry(signals: dict, regime: str) -> None:
             "change_15m":   None,
         }
 
+    # Regime alignment gate — require a directional regime for live entries.
+    # _sim_regime_weight only maps FX instruments; SILVER/OIL always return 1.0
+    # (regime_pts=0) regardless of macro state. Gating on the regime string
+    # directly is the only reliable way to block neutral-regime SILVER/OIL entries.
+    if regime == "neutral":
+        _live_log(f"No live candidate — regime=neutral (directional gate)")
+        return
     sym = _live_select_instrument(_ext, regime)
     if not sym or sym not in _ext:
         _live_log(f"No live candidate — regime={regime} bal=${bal:.2f}")
