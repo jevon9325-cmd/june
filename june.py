@@ -345,6 +345,7 @@ _live_pip_sizes: dict = {}   # sym -> pip size in price units from LIVE API (pop
 _live_price_unit: dict = {}  # sym -> USD-per-native-price-unit (0.01 for cents, 1.0 otherwise)
 _live_margin:    dict = {}   # sym -> IG margin rate (0.0-1.0 fraction) from LIVE API, e.g. 0.8=80%
 _live_equity_cfd: set = set() # syms whose epic ends .CASH.IP — IG size field is shares, not lots
+_IG_EQUITY_COMMISSION_USD = 9.0       # IG charges $9/side = $18 round-trip on equity CFDs
 _live_min_stop_pts: dict = {}  # sym -> minNormalStopOrLimitDistance (pts) from IG at startup
 _MACRO_STALE_SECS  = 2 * 3600   # Claudia freshness gate: beyond this treat directional bias as stale
 
@@ -6429,10 +6430,14 @@ def _live_close_position(exit_reason: str, signals: dict) -> None:
         real_pnl_p = (real_exit - fill_px) / fill_px if dirn == "long" else \
                      (fill_px - real_exit) / fill_px
         real_dollar = notional * real_pnl_p
-        won         = real_dollar > 0
+        commission  = _IG_EQUITY_COMMISSION_USD * 2 if sym in _live_equity_cfd else 0.0
+        net_dollar  = real_dollar - commission
+        won         = net_dollar > 0
         _live_log(
             f"✅ LIVE POSITION CLOSED: {sym} @ {real_exit:.5f} | "
-            f"P&L {real_pnl_p*100:+.2f}% (${real_dollar:+.2f}) | {exit_reason}"
+            f"gross {real_pnl_p*100:+.2f}% (${real_dollar:+.2f})"
+            + (f" net ${net_dollar:+.2f} after ${commission:.0f} commission" if commission else "")
+            + f" | {exit_reason}"
         )
 
         # Record trade
@@ -6444,7 +6449,8 @@ def _live_close_position(exit_reason: str, signals: dict) -> None:
             "ig_size":      ig_size,
             "notional":     round(notional, 2),
             "pnl_pct":      round(real_pnl_p, 6),
-            "dollar_pnl":   round(real_dollar, 4),
+            "dollar_pnl":   round(net_dollar, 4),
+            "commission":   round(commission, 2),
             "hold_min":     round(hold_min, 1),
             "exit_epoch":   int(time.time()),
             "exit_reason":  exit_reason,
@@ -6460,11 +6466,11 @@ def _live_close_position(exit_reason: str, signals: dict) -> None:
         _live["total_wins"]   = _live.get("total_wins", 0)   + int(won)
         _live["total_losses"] = _live.get("total_losses", 0) + int(not won)
         if dirn == "long":
-            _live["long_pnl"]    = round(_live.get("long_pnl", 0.0)  + real_dollar, 4)
+            _live["long_pnl"]    = round(_live.get("long_pnl", 0.0)  + net_dollar, 4)
             _live["long_trades"] = _live.get("long_trades", 0) + 1
             if won: _live["long_wins"] = _live.get("long_wins", 0) + 1
         else:
-            _live["short_pnl"]    = round(_live.get("short_pnl", 0.0) + real_dollar, 4)
+            _live["short_pnl"]    = round(_live.get("short_pnl", 0.0) + net_dollar, 4)
             _live["short_trades"] = _live.get("short_trades", 0) + 1
             if won: _live["short_wins"] = _live.get("short_wins", 0) + 1
 
