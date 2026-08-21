@@ -6497,12 +6497,16 @@ def _live_close_position(exit_reason: str, signals: dict) -> None:
 
         _live_update_streak(sym, dirn, won)
         _live_perf_record(sym, won, sig.get("spread_atr_ratio"))
-        # After stop_loss: block only the stopped direction for 10 min.
-        # Allows the opposing direction to evaluate immediately if technicals flip.
+        # After stop_loss: block the stopped direction for 10 min (same-dir cooldown)
+        # and block ALL directions on this instrument for 15 min (instrument cooldown).
+        # Prevents an immediate direction-flip into the same noise that stopped us out.
         if exit_reason == "stop_loss":
             _sl_exp = time.time() + 10 * 60
             _live.setdefault("pause_expiry", {})[_sim_combo_key(sym, dirn)] = _sl_exp
             _live_log(f"⏸️ [SAME-DIR COOLDOWN] {sym} {dirn} blocked for 10m. Opposing direction remains active.")
+            _instr_exp = time.time() + 15 * 60
+            _live.setdefault("instrument_cooldown", {})[sym] = _instr_exp
+            _live_log(f"⏸️ [INSTRUMENT COOLDOWN] {sym} all-direction blocked for 15m after stop-out")
     else:
         _live_log(f"close_position: confirm failed or rejected for {sym} — check IG manually")
 
@@ -6735,6 +6739,8 @@ def _live_select_instrument(signals: dict, regime: str) -> Optional[str]:
             continue
         if direction_str and _live_is_paused(_sim_combo_key(sym, direction_str)):
             continue
+        if time.time() < (_live.get("instrument_cooldown") or {}).get(sym, 0.0):
+            continue  # all-direction cooldown after stop-out
         if regime == "bull" and dirn != "bull": continue
         if regime == "bear" and dirn != "bear": continue
         if regime in ("volatile", "neutral") and dirn == "neutral": continue
