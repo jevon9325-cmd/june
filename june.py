@@ -5502,6 +5502,13 @@ _LIVE_SKIM_HALF_MIN_GAP   = 3600    # half-mode: don't re-flag more often than h
 # because June's CFD stops are tighter and losses compound faster at leverage.
 _LIVE_CIRCUIT_BREAKER_PCT = -0.05   # -5% daily drawdown → auto-disable kill switch
 _LIVE_CB_FLOOR_USD        = 20.0
+# Micro-account CB tier (<_LIVE_CB_MICRO_THRESH): tighter dollar floor so normal
+# stop-outs at ~$10 OIL/SILVER notional (0.20% cold-start stop + spread =~$2.32/trade)
+# do not trip the breaker. Allows 2 stop-outs; fires on 3rd (2x$2.32=$4.64 < $5.34;
+# 3x$2.32=$6.96 > $5.34 at $13.35). Switches to full-tier at $30+ balance.
+_LIVE_CB_MICRO_THRESH    = 30.0   # balance below this -> micro-account CB tier
+_LIVE_CB_MICRO_FLOOR_USD = 5.0    # micro floor: ~2 normal stop-outs before halt
+_LIVE_CB_MICRO_PCT       = 0.40   # micro pct: 40% daily drawdown limit
 _live_api_paused_until: float = 0.0  # epoch; set on 429; all HTTP wrappers check this
 # Micro-Profit Defense Engine — friction threshold and guaranteed floor
 _MPD_SLIPPAGE_PIPS   = 2   # extra buffer in price points (activation gate only)
@@ -5841,11 +5848,15 @@ def _live_check_circuit_breaker() -> None:
     current   = _live.get("balance_total", 0.0)
     if day_start <= 0 or current <= 0:
         return   # balance not yet fetched — no baseline to compare
-    # Dollar-floor CB: effective loss buffer = max($20 floor, 5% of day-start).
-    # Prevents micro-account starvation where 5% of $35 = $1.75 — too tight for
-    # a single CFD spread. Floor naturally yields to pct logic above ~$400.
-    dollar_loss      = day_start - current
-    effective_buffer = max(_LIVE_CB_FLOOR_USD, abs(_LIVE_CIRCUIT_BREAKER_PCT) * day_start)
+    # Two-tier CB buffer.
+    # Micro tier (<$30): 40% drawdown / $5 floor — room for 2 normal stop-outs
+    # (~$2.32 each at $10 OIL/SILVER with 0.20% stop + spread); fires on 3rd.
+    # Full tier ($30+): $20 floor + 5% rule (unchanged; dominant below ~$400).
+    dollar_loss = day_start - current
+    if day_start < _LIVE_CB_MICRO_THRESH:
+        effective_buffer = max(_LIVE_CB_MICRO_FLOOR_USD, _LIVE_CB_MICRO_PCT * day_start)
+    else:
+        effective_buffer = max(_LIVE_CB_FLOOR_USD, abs(_LIVE_CIRCUIT_BREAKER_PCT) * day_start)
     drawdown         = (current - day_start) / day_start
     if dollar_loss < effective_buffer:
         return   # within daily tolerance
@@ -5873,7 +5884,7 @@ def _live_check_circuit_breaker() -> None:
         f"  Day-start balance : ${day_start:.2f}\n"
         f"  Current balance   : ${current:.2f}\n"
         f"  Drawdown          : {drawdown:+.2%}\n"
-        f"  Effective buffer  : ${effective_buffer:.2f} (floor=${_LIVE_CB_FLOOR_USD:.0f}, pct={abs(_LIVE_CIRCUIT_BREAKER_PCT):.0%})\n"
+        f"  Effective buffer  : ${effective_buffer:.2f} ({'micro' if day_start < _LIVE_CB_MICRO_THRESH else 'full'} tier)\n"
         f"  Re-enable requires: redis-cli SET june_live_enabled true (after review)"
     )
 
