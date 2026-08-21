@@ -6855,12 +6855,12 @@ def _live_try_entry(signals: dict, regime: str) -> None:
         lev = _ig_margin_to_max_lev(_mr, lev)
 
     # Sizing — use pct_10 targeting (10% of live balance, minimum $10)
-    pos_size = max(10.0, round(bal * 0.10, 2))
+    pos_size = max(2.0, round(bal * 0.10, 2))
     # Proportional size reduction when spread is wide relative to ATR
     _sar_live = sig.get("spread_atr_ratio")
     if sig.get("spread_atr_wide") and _sar_live:
         _scale = min(1.0, (SPREAD_ATR_THRESHOLD / _sar_live) ** 0.5)
-        pos_size = max(10.0, round(pos_size * _scale, 2))
+        pos_size = max(2.0, round(pos_size * _scale, 2))
         _live_log(
             f"  📐 Spread/ATR={_sar_live:.1%}: position scaled ×{_scale:.2f} → ${pos_size:.2f}"
         )
@@ -6869,7 +6869,7 @@ def _live_try_entry(signals: dict, regime: str) -> None:
     # Macro confluence — scale pos_size by Claudia directional alignment
     _macro_scale, _claudia_dir, _conf_note, _compress_sl = _live_macro_confluence(sym, direction)
     if _macro_scale < 1.0:
-        pos_size = max(10.0, round(pos_size * _macro_scale, 2))
+        pos_size = max(2.0, round(pos_size * _macro_scale, 2))
         notional = pos_size * lev
     _claudia_label = "Bullish" if _claudia_dir == 1 else ("Bearish" if _claudia_dir == -1 else "Neutral")
     _live_log(
@@ -6880,11 +6880,11 @@ def _live_try_entry(signals: dict, regime: str) -> None:
     # Check IG minimum feasibility
     if not _sim_check_min_feasible(sym, pos_size, lev):
         # Try with $10 fixed if pct_10 too small
-        if not _sim_check_min_feasible(sym, 10.0, lev):
+        if not _sim_check_min_feasible(sym, 2.0, lev):
             _live_log(f"skip {sym}: notional ${notional:.2f} < IG min "
                       f"${_sim_min_notional.get(sym, 0):.2f}")
             return
-        pos_size = 10.0
+        pos_size = 2.0
         notional = pos_size * lev
 
     _live_log(
