@@ -6142,7 +6142,7 @@ def _live_compute_ig_size(sym: str, desired_notional_usd: float, mid_price: floa
     return max(min_deal, sized)
 
 
-def _live_compute_stop_pts(sym: str, stop_pct: float) -> int:
+def _live_compute_stop_pts(sym: str, stop_pct: float, mid_price: float = 0.0) -> int:
     """Convert fractional stop loss to IG stop distance in points.
 
     Points = price x stop_pct / pip_size, where pip_size is per-instrument
@@ -6152,7 +6152,7 @@ def _live_compute_stop_pts(sym: str, stop_pct: float) -> int:
     """
     pip_sz     = _live_pip_sizes.get(sym, _LIVE_FX_PIP)
     price_unit = _live_price_unit.get(sym, 1.0)
-    ref_price  = _live_entry_price_ref(sym)  # native price units (cents for Silver)
+    ref_price  = mid_price if mid_price > 0 else _live_entry_price_ref(sym)
     pts        = int(ref_price * price_unit * stop_pct / pip_sz)
     return max(_live_min_stop_pts.get(sym, 4) + 1, pts)
 
@@ -6288,7 +6288,7 @@ def _live_open_position(sym: str, direction: str, signals: dict,
     if stop_mult != 1.0:
         stop_pct = round(stop_pct * stop_mult, 6)  # counter-trend SL compression
     tp_pct    = _sim_get_tp(sym, direction, conviction)
-    stop_dist = _live_compute_stop_pts(sym, stop_pct)
+    stop_dist = _live_compute_stop_pts(sym, stop_pct, mid_price)
 
     ig_direction = "BUY" if direction == "long" else "SELL"
     epic         = INSTRUMENTS.get(sym, "")
