@@ -2636,8 +2636,8 @@ _WKND_CACHE_TTL   = 300    # re-read Redis at most every 5 min
 _SIM_THRESH_BASE     = 0.05   # minimum vol threshold (%) — safety floor only
 _SIM_THRESH_BASE_FX  = 0.02   # lower floor for FX pairs — spread gate handles noise
 _FX_INSTRUMENTS      = frozenset({  # FX pairs use lower vol/direction thresholds
-    EURUSD, GBPUSD, USDJPY, AUDUSD,
-    USDCAD, EURGBP, NZDUSD, USDCHF,
+    "EURUSD", "GBPUSD", "USDJPY", "AUDUSD",
+    "USDCAD", "EURGBP", "NZDUSD", "USDCHF",
 })
 _SIM_THRESH_CAP      = 0.50   # maximum vol threshold (%)
 _SIM_THRESH_MULT     = 1.5    # std-dev multiplier for threshold calc
