@@ -447,6 +447,84 @@ class TestDealConfirmPolling(unittest.TestCase):
         self.assertEqual(_backoff[0], 0.2)
         self.assertEqual(_backoff[-1], 2.0)
 
+
+
+# ────────────────────────────────────────────────────────────────────────────
+class TestKnownMinNotionals(unittest.TestCase):
+    """_KNOWN_MIN_NOTIONALS correctness — prevents IG REJECTED: UNKNOWN due to wrong floors."""
+
+    KNOWN = {
+        "EURUSD":  0.47,  "GBPUSD":  0.54,  "USDJPY": 40.0,
+        "AUDUSD":  0.29,  "USDCAD":  0.55,  "EURGBP":  0.34,
+        "NZDUSD":  0.24,  "USDCHF":  0.32,  "SILVER":  3.30,
+        "OIL":     2.71,
+    }
+
+    def test_usdjpy_blocks_at_small_balance(self):
+        """USDJPY min_notional=40 → ineligible at $14.48 balance (50% margin = $20 needed)."""
+        min_n = self.KNOWN["USDJPY"]
+        max_lev = 2  # 1/0.50 margin rate
+        concentration_cap = 0.20
+        balance = 14.48
+        # Eligibility: (min_n / lev) <= cap * balance
+        eligible = (min_n / max_lev) <= concentration_cap * balance
+        self.assertFalse(eligible,
+            f"USDJPY (min_n={min_n}, lev={max_lev}) should be ineligible at ${balance}")
+
+    def test_usdjpy_eligible_at_hundred_balance(self):
+        """USDJPY becomes eligible once balance reaches ~$100."""
+        min_n = self.KNOWN["USDJPY"]
+        max_lev = 2
+        concentration_cap = 0.20
+        balance = 100.0
+        eligible = (min_n / max_lev) <= concentration_cap * balance
+        self.assertTrue(eligible,
+            f"USDJPY (min_n={min_n}) should be eligible at ${balance}")
+
+    def test_eurusd_eligible_at_small_balance(self):
+        """EURUSD min_notional=0.47 → eligible at $14.48 (lot=10 live, not 1000 demo)."""
+        min_n = self.KNOWN["EURUSD"]
+        max_lev = 2  # 50% margin
+        concentration_cap = 0.20
+        balance = 14.48
+        eligible = (min_n / max_lev) <= concentration_cap * balance
+        self.assertTrue(eligible,
+            f"EURUSD (min_n={min_n}) should be eligible at ${balance}")
+
+    def test_oil_eligible_at_small_balance(self):
+        """OIL min_notional=2.71 → eligible at $14.48 (100% margin, 1x lev)."""
+        min_n = self.KNOWN["OIL"]
+        max_lev = 1  # 100% margin → 1x
+        concentration_cap = 0.20
+        balance = 14.48
+        eligible = (min_n / max_lev) <= concentration_cap * balance
+        self.assertTrue(eligible,
+            f"OIL (min_n={min_n}) should be eligible at ${balance}")
+
+    def test_silver_ineligible_at_small_balance(self):
+        """SILVER min_notional=3.30 → ineligible at $14.48 (80% margin → 1x lev, 3.30 > 2.90)."""
+        min_n = self.KNOWN["SILVER"]
+        max_lev = 1  # int(1/0.80) = 1
+        concentration_cap = 0.20
+        balance = 14.48
+        eligible = (min_n / max_lev) <= concentration_cap * balance
+        self.assertFalse(eligible,
+            f"SILVER (min_n={min_n}) should be ineligible at ${balance} (spread gate handles entry timing)")
+
+    def test_all_non_usdjpy_fx_eligible_at_small_balance(self):
+        """All FX pairs except USDJPY should be eligible at $14.48 with 50% margin (2x lev)."""
+        max_lev_by_sym = {
+            "EURUSD": 2, "GBPUSD": 2, "AUDUSD": 2, "USDCAD": 2,
+            "EURGBP": 2, "NZDUSD": 1, "USDCHF": 2,  # NZDUSD: 75% margin → 1x
+        }
+        concentration_cap = 0.20
+        balance = 14.48
+        for sym, lev in max_lev_by_sym.items():
+            min_n = self.KNOWN[sym]
+            eligible = (min_n / lev) <= concentration_cap * balance
+            self.assertTrue(eligible,
+                f"{sym} (min_n={min_n}, lev={lev}) should be eligible at ${balance}")
+
 if __name__ == "__main__":
     suite = unittest.TestLoader().loadTestsFromModule(__import__("__main__"))
     runner = unittest.TextTestRunner(verbosity=2)

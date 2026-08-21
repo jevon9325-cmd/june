@@ -128,9 +128,17 @@ DIRECT_CFD_CONFIRMED_MISS_TTL = 24 * 3600  # 24h after all search strategies exh
 # Minimum notional values for core instruments — confirmed from IG API 2026-07-14.
 # Pre-populated in sim_startup() so FX + Silver trade immediately without /markets/ calls.
 _KNOWN_MIN_NOTIONALS: dict = {
-    "EURUSD": 11.44, "GBPUSD":  0.54, "USDJPY":  1.23, "SILVER":   3.30,  # BMU: minDeal=0.05 lots x lot=1.0 x ~6600c x $0.01 = $3.30 real IG floor
-    "AUDUSD":  6.0,  "USDCAD": 14.0,  "EURGBP": 11.0,  "NZDUSD":  6.0,  "USDCHF": 9.0,
-    "OIL": 2.71,  # BMU: live minDeal=0.03 x lot=1.0 x ~$90.22/barrel = $2.71
+    # Derived from LIVE API startup data (lot x minDeal x price x price_unit):
+    "EURUSD":  0.47,  # lot=10, minDeal=0.04, price~1.17 → 0.04×10×1.17=$0.47
+    "GBPUSD":  0.54,  # lot=10, minDeal=0.04, price~1.36 → 0.04×10×1.36=$0.54 (confirmed)
+    "USDJPY": 40.0,   # lot=1000 (USD base), minDeal=0.04 → 0.04×1000=$40 USD min; 50% margin=$20; eligible at ~$100 balance
+    "AUDUSD":  0.29,  # lot=10, minDeal=0.04, price~0.71 → 0.04×10×0.71=$0.28
+    "USDCAD":  0.55,  # lot=10, minDeal=0.04, price~1.38 → 0.04×10×1.38=$0.55
+    "EURGBP":  0.34,  # lot=10, minDeal=0.04, price~0.86 → 0.04×10×0.86=$0.34
+    "NZDUSD":  0.24,  # lot=10, minDeal=0.04, price~0.59 → 0.04×10×0.59=$0.24
+    "USDCHF":  0.32,  # lot=10, minDeal=0.04, price~0.80 → 0.04×10×0.80=$0.32
+    "SILVER":  3.30,  # lot=1.0, minDeal=0.04×~6820c×$0.01=$2.73 (kept at $3.30 for safety)
+    "OIL":     2.71,  # lot=1.0, minDeal=0.03×~$91.78=$2.75 live floor
 }
 _NOTIONAL_REDIS_KEY = "june_min_notionals"  # separate key — survives sim resets
 _NOTIONAL_REDIS_TTL = 7 * 24 * 3600        # 7 days
