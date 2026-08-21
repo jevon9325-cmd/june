@@ -1308,11 +1308,12 @@ def compute_signal(sym: str, price: dict, spread_alert: bool = False) -> dict:
     px15       = _price_n_minutes_ago(sym, 15)
     change_5m  = ((mid - px5)  / px5  * 100.0) if px5  is not None else None
     change_15m = ((mid - px15) / px15 * 100.0) if px15 is not None else None
+    _dir_thresh = 0.02 if sym in _FX_INSTRUMENTS else 0.05
     if change_5m is None:
         direction = "no_history"
-    elif change_5m >  0.05:
+    elif change_5m >  _dir_thresh:
         direction = "bull"
-    elif change_5m < -0.05:
+    elif change_5m < -_dir_thresh:
         direction = "bear"
     else:
         direction = "neutral"
@@ -2633,6 +2634,11 @@ _WKND_CACHE_TTL   = 300    # re-read Redis at most every 5 min
 
 # ── Dynamic threshold / streak parameters ────────────────────────────────────
 _SIM_THRESH_BASE     = 0.05   # minimum vol threshold (%) — safety floor only
+_SIM_THRESH_BASE_FX  = 0.02   # lower floor for FX pairs — spread gate handles noise
+_FX_INSTRUMENTS      = frozenset({  # FX pairs use lower vol/direction thresholds
+    EURUSD, GBPUSD, USDJPY, AUDUSD,
+    USDCAD, EURGBP, NZDUSD, USDCHF,
+})
 _SIM_THRESH_CAP      = 0.50   # maximum vol threshold (%)
 _SIM_THRESH_MULT     = 1.5    # std-dev multiplier for threshold calc
 _SIM_THRESH_MIN_HIST = 10     # min vol history samples before dynamic thresh
@@ -3187,7 +3193,8 @@ def _sim_get_threshold(sym: str, direction: str = "", low_tier: bool = False) ->
         n = len(hist)
         mean = sum(hist) / n
         var = sum((x - mean) ** 2 for x in hist) / (n - 1) if n > 1 else 0.0
-        base_thresh = max(_SIM_THRESH_BASE, min(_SIM_THRESH_CAP, var ** 0.5 * mult))
+        _floor = _SIM_THRESH_BASE_FX if sym in _FX_INSTRUMENTS else _SIM_THRESH_BASE
+        base_thresh = max(_floor, min(_SIM_THRESH_CAP, var ** 0.5 * mult))
     if direction:
         combo = _sim_combo_key(sym, direction)
         if _sim_has_boost(combo):
@@ -6774,6 +6781,7 @@ def _live_try_entry(signals: dict, regime: str) -> None:
 
     sym = _live_select_instrument(_ext, regime)
     if not sym or sym not in _ext:
+        _live_log(f"No live candidate — regime={regime} bal=${bal:.2f}")
         return
 
     sig       = _ext[sym]
