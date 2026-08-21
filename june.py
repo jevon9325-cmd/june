@@ -5521,6 +5521,7 @@ _PERF_BLOCK_WINDOW     = 8       # rolling window of confirmed live trades
 _PERF_BLOCK_WR_THRESH  = 0.30    # block if win rate < 30% over window
 _PERF_BLOCK_SAR_THRESH = 0.50    # block if avg Spread/ATR ratio > 50% over window
 _PERF_BLOCK_TTL        = 86400   # 24-hour block duration (seconds)
+_LIVE_MIN_CONVICTION   = 4       # minimum conviction score for live entries; sim unaffected
 
 
 def _live_log(msg: str) -> None:
@@ -6849,6 +6850,9 @@ def _live_try_entry(signals: dict, regime: str) -> None:
     weight  = _sim_regime_weight(sym, direction)
     conv    = _sim_conviction_gauge(sym, direction, vol, thresh, weight, combo,
                                     gate_mode, rel_score)
+    if conv < _LIVE_MIN_CONVICTION:
+        _live_log(f"skip {sym}: conviction {conv}/10 below live floor {_LIVE_MIN_CONVICTION}/10")
+        return
     lev     = _sim_conviction_leverage("sprout", conv)
 
     # Cap leverage at IG's real margin rate — prevents INSUFFICIENT_FUNDS rejection
