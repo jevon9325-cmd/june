@@ -6537,7 +6537,8 @@ def _live_close_position(exit_reason: str, signals: dict) -> None:
         real_dollar = notional * real_pnl_p
         commission  = _IG_EQUITY_COMMISSION_USD * 2 if sym in _live_equity_cfd else 0.0
         net_dollar  = real_dollar - commission
-        won         = net_dollar > 0
+        _partial_pnl_c = pos.get("partial_dollar_pnl", 0.0)
+        won         = (net_dollar + _partial_pnl_c) > 0
         _live_log(
             f"✅ LIVE POSITION CLOSED: {sym} @ {real_exit:.5f} | "
             f"gross {real_pnl_p*100:+.2f}% (${real_dollar:+.2f})"
@@ -6612,6 +6613,121 @@ def _live_close_position(exit_reason: str, signals: dict) -> None:
 
     _live["open_position"] = None
     _live_save_state()
+
+
+# ── Partial TP exit (live mirror of _sim_partial_tp_exit) ──────────────────────
+
+def _live_partial_tp_exit(signals: dict) -> None:
+    """Close 50% of live position at TP; let remaining 50% run with breakeven stop.
+
+    Balance-gated: checks that half the current ig_size still clears the instrument's
+    real minDeal (from _live_min_deal, populated at startup from IG API). If either
+    half would be below minDeal, falls back to a full close at take_profit.
+
+    Sim equivalent: _sim_partial_tp_exit(). Called from _live_check_exit when
+    pnl_pct >= tp_pct and partial_exit_done is not yet set on the position.
+    """
+    pos = (_live.get("open_position") or {}).copy()
+    if not pos:
+        return
+
+    sym     = pos["instrument"]
+    dirn    = pos["direction"]
+    ig_sz   = pos["ig_size"]
+    fill_px = pos.get("fill_price", 0.0)
+    deal_id = pos.get("deal_id", "")
+
+    min_deal = _live_min_deal.get(sym, 1.0)
+    half_sz  = round(ig_sz / 2, 4)
+    # Both the close leg and the residual position must clear minDeal.
+    if half_sz < min_deal or round(ig_sz - half_sz, 4) < min_deal:
+        _live_log(
+            f"⚠️ {sym}: partial TP not feasible "
+            f"(ig_size {ig_sz:.4f} < 2×minDeal {2*min_deal:.4f}) — full close"
+        )
+        _live_close_position("take_profit", signals)
+        return
+
+    sig    = signals.get(sym, {})
+    mid    = sig.get("price", fill_px)
+    sp_pct = sig.get("spread_pct", 0.0)
+    half_sp = mid * sp_pct / 200.0
+    exit_px = (mid - half_sp) if dirn == "long" else (mid + half_sp)
+    partial_pnl_pct = (
+        (exit_px - fill_px) / fill_px if dirn == "long"
+        else (fill_px - exit_px) / fill_px
+    )
+
+    lot_sz     = _live_lot_sizes.get(sym, _LIVE_LOT_SIZE_FX)
+    price_unit = _live_price_unit.get(sym, 1.0)
+    if sym in _live_equity_cfd:
+        partial_notional = half_sz * mid * price_unit
+    else:
+        partial_notional = half_sz * lot_sz * mid * price_unit
+
+    close_dir = "SELL" if dirn == "long" else "BUY"
+    epic      = INSTRUMENTS.get(sym, "")
+
+    _live_log(
+        f"✂️ LIVE PARTIAL TP: {sym} — closing {half_sz} of {ig_sz} lots "
+        f"@ ~{exit_px:.5f} ({partial_pnl_pct*100:+.3f}%) | "
+        f"remaining {round(ig_sz - half_sz, 4)} | minDeal check OK ({min_deal})"
+    )
+
+    if not _live_trade_guard():
+        return
+
+    close_body = {
+        "epic":          epic,
+        "expiry":        "-",
+        "direction":     close_dir,
+        "size":          half_sz,
+        "orderType":     "MARKET",
+        "timeInForce":   "FILL_OR_KILL",
+        "forceOpen":     False,
+        "guaranteedStop": False,
+        "currencyCode":  "USD",
+        "dealId":        deal_id,
+    }
+    resp = _ig_live_post("/positions/otc", close_body, version="1")
+    if not resp:
+        _live_log(f"partial_tp: POST failed for {sym} — falling back to full close")
+        _live_close_position("take_profit", signals)
+        return
+
+    deal_ref = resp.get("dealReference", "")
+    confirm  = _live_confirm_deal(deal_ref) if deal_ref else None
+
+    if confirm and confirm.get("dealStatus") == "ACCEPTED":
+        real_exit    = float(confirm.get("level", exit_px))
+        real_pnl_p   = (
+            (real_exit - fill_px) / fill_px if dirn == "long"
+            else (fill_px - real_exit) / fill_px
+        )
+        partial_dollar_pnl = partial_notional * real_pnl_p
+
+        # Tighten stop to breakeven (entry ± spread floor, so worst case ~flat).
+        # Mirror of sim: _sim["open_position"]["stop_pct"] = _spread_flr
+        _spread_flr = _sim_get_spread_floor(sym)
+
+        remaining_sz = round(ig_sz - half_sz, 4)
+        _live["open_position"]["ig_size"]            = remaining_sz
+        _live["open_position"]["stop_pct"]           = _spread_flr
+        _live["open_position"]["initial_sl_pct"]     = _spread_flr
+        _live["open_position"]["partial_exit_done"]  = True
+        _live["open_position"]["partial_dollar_pnl"] = partial_dollar_pnl
+        _live["open_position"]["breakeven_locked"]   = True
+        _live["open_position"]["dple_effective_sl"]  = -_spread_flr
+
+        _live_log(
+            f"✅ LIVE PARTIAL TP CONFIRMED: {sym} closed {half_sz} @ {real_exit:.5f} "
+            f"({real_pnl_p*100:+.3f}%) partial=${partial_dollar_pnl:+.4f} | "
+            f"remaining {remaining_sz} lots | stop -> breakeven ({_spread_flr*100:.3f}%)"
+        )
+        _live_save_state()
+    else:
+        _live_log(f"partial_tp: confirm failed for {sym} — falling back to full close")
+        _live_close_position("take_profit", signals)
 
 
 # ── Exit checks (Part 5 — mirrors _sim_check_exit) ───────────────────────────
@@ -6785,7 +6901,10 @@ def _live_check_exit(signals: dict, regime: str) -> None:
         _live_close_position("stop_loss", signals)
         return
     if pnl_pct >= tp_pct:
-        _live_close_position("take_profit", signals)
+        if not pos.get("partial_exit_done"):
+            _live_partial_tp_exit(signals)
+        else:
+            _live_close_position("take_profit", signals)
         return
 
     # Asymmetric reversal — mirrors sim logic including Barbie reversal_confirm_secs override
