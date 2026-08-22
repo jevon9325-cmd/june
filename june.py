@@ -5852,8 +5852,8 @@ def _live_check_circuit_breaker() -> None:
     if day_start <= 0 or current <= 0:
         return   # balance not yet fetched — no baseline to compare
     # Two-tier CB buffer.
-    # Micro tier (<$30): 40% drawdown / $5 floor — room for 2 normal stop-outs
-    # (~$2.32 each at $10 OIL/SILVER with 0.20% stop + spread); fires on 3rd.
+    # Micro tier (<$30): 30% drawdown / $2 floor — room for 2–3 stop-outs.
+    # At $7.99 day_start: buffer = max($2.00, 30% x $7.99) = $2.40; fires below $5.59.
     # Full tier ($30+): $20 floor + 5% rule (unchanged; dominant below ~$400).
     dollar_loss = day_start - current
     if day_start < _LIVE_CB_MICRO_THRESH:
