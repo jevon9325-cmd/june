@@ -6899,16 +6899,24 @@ def _live_try_entry(signals: dict, regime: str) -> None:
             "change_15m":   None,
         }
 
-    # Regime alignment gate — require a directional regime for live entries.
+    # Regime gate — applied only in DEFENSIVE mode.
+    # In NORMAL mode, neutral-regime entries are permitted (CFD speed preserved).
+    # In DEFENSIVE mode, require a directional regime before instrument selection.
     # _sim_regime_weight only maps FX instruments; SILVER/OIL always return 1.0
-    # (regime_pts=0) regardless of macro state. Gating on the regime string
-    # directly is the only reliable way to block neutral-regime SILVER/OIL entries.
-    if regime == "neutral":
-        _live_log(f"No live candidate — regime=neutral (directional gate)")
+    # regardless of macro state, so gating on the string is the reliable path.
+    _gmode = _live.get("global_mode", "normal")
+    if _gmode == "defensive" and regime == "neutral":
+        _live_log(f"No live candidate — global DEFENSIVE + regime=neutral")
         return
     sym = _live_select_instrument(_ext, regime)
     if not sym or sym not in _ext:
         _live_log(f"No live candidate — regime={regime} bal=${bal:.2f}")
+        return
+
+    # Per-instrument defensive mode regime check (applied after selection)
+    _imode = (_live.get("instrument_mode") or {}).get(sym, "normal")
+    if _imode == "defensive" and regime == "neutral":
+        _live_log(f"skip {sym}: instrument DEFENSIVE + regime=neutral")
         return
 
     sig       = _ext[sym]
@@ -6963,8 +6971,14 @@ def _live_try_entry(signals: dict, regime: str) -> None:
     weight  = _sim_regime_weight(sym, direction)
     conv    = _sim_conviction_gauge(sym, direction, vol, thresh, weight, combo,
                                     gate_mode, rel_score)
-    if conv < _LIVE_MIN_CONVICTION:
-        _live_log(f"skip {sym}: conviction {conv}/10 below live floor {_LIVE_MIN_CONVICTION}/10")
+    # Conviction floor — applied only in DEFENSIVE mode (global or instrument-level).
+    # In NORMAL mode, all conviction levels are permitted.
+    _in_defensive = (_gmode == "defensive" or _imode == "defensive")
+    if _in_defensive and conv < _LIVE_MIN_CONVICTION:
+        _live_log(
+            f"skip {sym}: conviction {conv}/10 below DEFENSIVE floor "
+            f"{_LIVE_MIN_CONVICTION}/10 [global={_gmode} instr={_imode}]"
+        )
         return
     lev     = _sim_conviction_leverage("sprout", conv)
 
