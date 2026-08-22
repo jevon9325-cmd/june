@@ -5523,6 +5523,20 @@ _PERF_BLOCK_SAR_THRESH = 0.50    # block if avg Spread/ATR ratio > 50% over wind
 _PERF_BLOCK_TTL        = 86400   # 24-hour block duration (seconds)
 _LIVE_MIN_CONVICTION   = 4       # minimum conviction score for live entries; sim unaffected
 
+# Tiered defensive mode (NORMAL -> DEFENSIVE -> CB HALT) -------
+# Middle layer between normal operation and the CB killswitch.
+# Global trigger: half the CB buffer (fires after ~1 stop-out at micro-balance).
+# Per-instrument trigger: 2 stop-outs on same instrument today.
+# Recovery: balance_total returns to entry level (global) / win on sym (instrument),
+#           OR 30-min time gate elapses -- whichever comes first.
+# Sim path completely unaffected -- state lives in _live[], not _sim[].
+_LIVE_DEF_MICRO_FLOOR_USD  = 1.00   # global defensive (micro <$30): half CB floor ($2)
+_LIVE_DEF_MICRO_PCT        = 0.15   # global defensive (micro <$30): half CB pct (30%->15%)
+_LIVE_DEF_FLOOR_USD        = 10.00  # global defensive (full >=30): half CB floor ($20)
+_LIVE_DEF_PCT              = 0.025  # global defensive (full >=30): half CB pct (5%->2.5%)
+_LIVE_DEF_INSTR_STOPOUTS   = 2      # stop-outs on one instrument before instrument-defensive
+_LIVE_DEF_TIMEOUT_SECS     = 1800   # 30-min safety valve (recovery time gate)
+
 
 def _live_log(msg: str) -> None:
     print(f"[{_ts()}] 🟢 LIVE: {msg}", flush=True)
@@ -5549,6 +5563,68 @@ def _live_load_state() -> bool:
     except Exception:
         pass
     return False
+
+
+def _live_update_defensive_mode() -> None:
+    """Check and update global and per-instrument defensive mode each cycle.
+
+    Global defensive: fires when balance_total has fallen more than half the CB
+    threshold below day_start. Lifts when balance_total recovers to the level it
+    was when defensive was entered, OR 30-min time gate elapses.
+
+    Per-instrument defensive: fires after _LIVE_DEF_INSTR_STOPOUTS (2) stop-outs
+    on the same instrument today. Lifts when a WIN closes on that instrument after
+    entry, OR 30-min time gate elapses.
+
+    Sim path completely unaffected. Called from run_live_step after CB check.
+    """
+    now       = time.time()
+    day_start = _live.get("balance_day_start", 0.0)
+    current   = _live.get("balance_total", 0.0)
+
+    # Global defensive mode
+    if day_start > 0 and current > 0:
+        if day_start < _LIVE_CB_MICRO_THRESH:
+            def_buf = max(_LIVE_DEF_MICRO_FLOOR_USD, _LIVE_DEF_MICRO_PCT * day_start)
+        else:
+            def_buf = max(_LIVE_DEF_FLOOR_USD, _LIVE_DEF_PCT * day_start)
+        dollar_loss = day_start - current
+        gmode = _live.get("global_mode", "normal")
+        if gmode == "normal" and dollar_loss >= def_buf:
+            _live["global_mode"]            = "defensive"
+            _live["global_mode_bal_entry"]  = current
+            _live["global_mode_entered_at"] = now
+            _live_log(
+                f"⛔️ [DEFENSIVE] Global: NORMAL -> DEFENSIVE "
+                f"(loss ${dollar_loss:.2f} >= threshold ${def_buf:.2f}; "
+                f"day_start=${day_start:.2f})"
+            )
+        elif gmode == "defensive":
+            entry_bal  = _live.get("global_mode_bal_entry", current)
+            entered_at = _live.get("global_mode_entered_at", now)
+            recovered_pnl  = current >= entry_bal
+            recovered_time = (now - entered_at) >= _LIVE_DEF_TIMEOUT_SECS
+            if recovered_pnl or recovered_time:
+                _live["global_mode"] = "normal"
+                why = "P&L recovered" if recovered_pnl else "30-min gate elapsed"
+                _live_log(f"🟢 [DEFENSIVE] Global: DEFENSIVE -> NORMAL ({why})")
+
+    # Per-instrument defensive mode recovery
+    instr_mode    = _live.setdefault("instrument_mode", {})
+    entered_at_m  = _live.setdefault("instrument_mode_entered_at", {})
+    won_after_def = _live.setdefault("instrument_won_after_def", {})
+
+    for sym, imode in list(instr_mode.items()):
+        if imode != "defensive":
+            continue
+        ienter = entered_at_m.get(sym, now)
+        recovered_win  = bool(won_after_def.get(sym))
+        recovered_time = (now - ienter) >= _LIVE_DEF_TIMEOUT_SECS
+        if recovered_win or recovered_time:
+            instr_mode[sym] = "normal"
+            why = "win recorded" if recovered_win else "30-min gate elapsed"
+            _live_log(f"🟢 [DEFENSIVE] {sym}: DEFENSIVE -> NORMAL ({why})")
+            won_after_def.pop(sym, None)
 
 
 # ── IG live POST / DELETE wrappers ────────────────────────────────────────────
@@ -5702,6 +5778,14 @@ def _live_poll_balance() -> None:
                     _live_log(f"Day-start balance recorded: ${_cash_only:.2f} (cash only, excl unrealized P&L) ({_today_utc})")
                 _live["balance_day_start"]      = _cash_only
                 _live["balance_day_start_date"] = _today_utc
+                # New UTC day -- reset defensive modes and per-instrument counters
+                _live["global_mode"]               = "normal"
+                _live["global_mode_bal_entry"]     = 0.0
+                _live["global_mode_entered_at"]    = 0.0
+                _live["instrument_mode"]           = {}
+                _live["instrument_mode_entered_at"] = {}
+                _live["instrument_stopouts_today"] = {}
+                _live["instrument_won_after_def"]  = {}
             _live_log(f"Balance: ${_live['balance']:.2f} available, "
                       f"${_live['balance_margin']:.2f} in margin")
             _live_save_state()
@@ -6507,6 +6591,22 @@ def _live_close_position(exit_reason: str, signals: dict) -> None:
             _instr_exp = time.time() + 15 * 60
             _live.setdefault("instrument_cooldown", {})[sym] = _instr_exp
             _live_log(f"⏸️ [INSTRUMENT COOLDOWN] {sym} all-direction blocked for 15m after stop-out")
+            # Track stop-outs per instrument for per-instrument defensive mode
+            _so_ct = _live.setdefault("instrument_stopouts_today", {})
+            _so_ct[sym] = _so_ct.get(sym, 0) + 1
+            if _so_ct[sym] >= _LIVE_DEF_INSTR_STOPOUTS:
+                _imd = _live.setdefault("instrument_mode", {})
+                if _imd.get(sym) != "defensive":
+                    _imd[sym] = "defensive"
+                    _live.setdefault("instrument_mode_entered_at", {})[sym] = time.time()
+                    _live_log(
+                        f"⛔️ [DEFENSIVE] {sym}: NORMAL -> DEFENSIVE "
+                        f"({_so_ct[sym]} stop-outs today >= {_LIVE_DEF_INSTR_STOPOUTS})"
+                    )
+        # Record wins on instruments in defensive mode (enables P&L recovery condition)
+        if won and (_live.get("instrument_mode") or {}).get(sym) == "defensive":
+            _live.setdefault("instrument_won_after_def", {})[sym] = 1
+            _live_log(f"📈 [DEFENSIVE] {sym}: win recorded in defensive mode (recovery pending)")
     else:
         _live_log(f"close_position: confirm failed or rejected for {sym} — check IG manually")
 
@@ -6958,6 +7058,10 @@ def run_live_step(signals: dict) -> None:
     if not _june_live_trading_enabled:
         return   # new-trade authority OFF — no entry attempts
 
+    # Update tiered defensive mode (middle layer between NORMAL and CB HALT).
+    # Runs after CB check — if CB fired above, we already returned.
+    _live_update_defensive_mode()
+
     if _live.get("balance", 0.0) <= 0:
         _live_log("balance $0 or unavailable — skipping entry logic")
         return
@@ -7015,6 +7119,14 @@ def _live_startup() -> None:
         "pause_expiry":         {},
         "streak_state":         {},
         "trade_history":        [],
+        # Tiered defensive mode state
+        "global_mode":               "normal",
+        "global_mode_bal_entry":     0.0,
+        "global_mode_entered_at":    0.0,
+        "instrument_mode":           {},
+        "instrument_mode_entered_at": {},
+        "instrument_stopouts_today": {},
+        "instrument_won_after_def":  {},
     }
     for k, v in defaults.items():
         _live.setdefault(k, v)
