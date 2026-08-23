@@ -89,6 +89,8 @@ WEEKEND_OPEN_MIN  = 21 * 60        # Sunday 21:00 UTC — superseded; kept for r
 # IG forex-specific hours: open Sunday 21:00 UK local, close Friday 22:00 UK local.
 # Europe/London handles BST (UTC+1 summer) and GMT (UTC+0 winter) automatically.
 _UK_TZ = ZoneInfo("Europe/London")
+# DST-aware US timezone for metals (COMEX/CME) weekend gate — see _is_metals_weekend_closure().
+_US_EAST_TZ = ZoneInfo("America/New_York")
 
 # Overnight window used for baseline tracking and gap detection
 OVERNIGHT_START_MIN   = 21 * 60       # 21:00 UTC — after NY close
@@ -346,6 +348,7 @@ _live_price_unit: dict = {}  # sym -> USD-per-native-price-unit (0.01 for cents,
 _live_margin:    dict = {}   # sym -> IG margin rate (0.0-1.0 fraction) from LIVE API, e.g. 0.8=80%
 _live_equity_cfd: set = set() # syms whose epic ends .CASH.IP — IG size field is shares, not lots
 _live_fx_instruments: set = set() # syms whose epic matches CS.D.*.CFD.IP — FX pairs (correct sizing: lot_sz/pip_sz)
+_METALS_INSTRUMENTS: frozenset = frozenset({"SILVER", "OIL"})  # CME/COMEX-linked; separate weekend gate from FX
 _IG_EQUITY_COMMISSION_USD = 9.0       # IG charges $9/side = $18 round-trip on equity CFDs
 _live_min_stop_pts: dict = {}  # sym -> minNormalStopOrLimitDistance (pts) from IG at startup
 _live_elig_publish_next: float = 0.0  # rate-limiter for barbie_june_eligible_instruments (1h)
@@ -880,6 +883,28 @@ def is_weekend_closure() -> bool:
     if dow == 4 and uk_h >= 22.0:       # Friday after 22:00 UK (IG forex close)
         return True
     if dow == 6 and uk_h < 21.0:        # Sunday before 21:00 UK (IG forex open)
+        return True
+    return False
+
+
+def _is_metals_weekend_closure() -> bool:
+    """True during CME metals weekend closure: Fri 17:00 ET -> Sun 18:00 ET.
+
+    COMEX/CME precious metals (SILVER) and IG Brent crude (OIL) follow the
+    US market calendar. IG CFDs reopen Sunday 18:00 ET, roughly 2 hours after
+    forex (21:00 UK local). Using America/New_York for DST-aware conversion:
+      EDT (UTC-4, summer): 18:00 ET = 22:00 UTC = 17:00 Jamaica
+      EST (UTC-5, winter): 18:00 ET = 23:00 UTC = 18:00 Jamaica
+    Mirrors the is_weekend_closure() pattern using Europe/London.
+    """
+    now_et = datetime.now(_US_EAST_TZ)
+    dow    = now_et.weekday()            # 0=Mon ... 4=Fri, 5=Sat, 6=Sun
+    et_h   = now_et.hour + now_et.minute / 60.0
+    if dow == 5:                         # full Saturday
+        return True
+    if dow == 4 and et_h >= 17.0:        # Friday after 17:00 ET (CME metals close)
+        return True
+    if dow == 6 and et_h < 18.0:         # Sunday before 18:00 ET (CME metals open)
         return True
     return False
 
@@ -7163,6 +7188,12 @@ def _live_try_entry(signals: dict, regime: str) -> None:
     _imode = (_live.get("instrument_mode") or {}).get(sym, "normal")
     if _imode == "defensive" and regime == "neutral":
         _live_log(f"skip {sym}: instrument DEFENSIVE + regime=neutral")
+        return
+
+    # Metals session gate: SILVER/OIL follow CME Sunday 18:00 ET reopen,
+    # 2h after FX (21:00 UK). Silently skip — no cooldown, no log spam.
+    if sym in _METALS_INSTRUMENTS and _is_metals_weekend_closure():
+        _live_log(f"⏳ {sym}: CME metals not yet open (Sun 18:00 ET) — skipping")
         return
 
     sig       = _ext[sym]
