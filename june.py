@@ -6100,6 +6100,23 @@ def _ig_margin_to_max_lev(margin_rate: float, ceiling: int) -> int:
         return min(ceiling, max(1, int(100.0 / margin_rate)))
 
 
+def _real_margin_fraction(sym: str, margin_raw: float) -> float:
+    """Return the margin as a fraction of USD notional (may exceed 1.0 for weekend uplift).
+
+    IG uses two scales:
+      FX / equity CFDs                 : percentage scale  (2.0 -> 2%, 5.0 -> 5%)
+      Commodities / metals (non-FX)    : decimal fraction  (0.8 -> 80%, 10.0 -> 1000%)
+
+    Weekend margin uplift for SILVER/OIL pushes margin_raw from 0.8/1.0 to 10.0 — still
+    in the decimal scale. _ig_margin_to_max_lev routes >1.0 to the percentage branch
+    (10.0 -> 10% margin) which is wrong for these instruments. This function gives the
+    correct fraction used for pre-order and eligibility balance checks.
+    """
+    if sym in _live_equity_cfd or sym in _live_fx_instruments:
+        return max(0.0, margin_raw / 100.0)   # percentage scale: 5.0=5%, 2.0=2%
+    return max(0.0, margin_raw)               # decimal scale: 0.8=80%, 10.0=1000%
+
+
 def _live_publish_eligible_instruments(signals: dict) -> None:
     """Compute and publish barbie_june_eligible_instruments to Redis (2h TTL).
 
@@ -6150,7 +6167,7 @@ def _live_publish_eligible_instruments(signals: dict) -> None:
         price_usd    = price * price_unit
         min_notional = (min_deal * price_usd) if is_equity else (min_deal * lot_sz * price_usd)
         margin_rate  = max(0.0, min(1.0, margin_raw))
-        min_margin   = min_notional * margin_rate
+        min_margin   = min_notional * _real_margin_fraction(sym, margin_raw)
 
         # FX sizing formula bug: if min_notional < $1 on a non-equity instrument
         # with real margin data, lot_sz from IG API is likely a contract multiplier
@@ -6557,6 +6574,22 @@ def _live_open_position(sym: str, direction: str, signals: dict,
                 f"🚫 COMMISSION GATE: {sym} blocked — "
                 f"expected gross ${_exp_gross:.2f} < ${_rt_comm:.2f} round-trip "
                 f"commission (notional ${actual_n:.2f} TP {tp_pct*100:.2f}%)."
+            )
+            return
+
+    # Pre-order margin check — catches weekend-uplifted margins that slip past eligibility filter.
+    # FX excluded: tiny notional sizes make INSUFFICIENT_FUNDS structurally impossible there.
+    _margin_raw = _live_margin.get(sym, 0.0)
+    if _margin_raw > 0 and sym not in _live_fx_instruments:
+        _mfrac  = _real_margin_fraction(sym, _margin_raw)
+        _usd_n  = (ig_size * mid_price * price_unit if sym in _live_equity_cfd
+                   else ig_size * lot_sz * mid_price * price_unit)
+        _req_mg = _usd_n * _mfrac
+        _avail  = _live.get("balance_total", 0.0)
+        if _req_mg > _avail:
+            _live_log(
+                f"🚫 MARGIN GATE: {sym} skip — est. margin ${_req_mg:.2f} "
+                f"> balance ${_avail:.2f} (rate={_margin_raw:.0%}) — no cooldown"
             )
             return
 
