@@ -147,8 +147,11 @@ _NOTIONAL_REDIS_TTL = 7 * 24 * 3600        # 7 days
 
 DIRECT_CFD_REDIS_TTL       = 24 * 3600 # Redis TTL for june_direct_cfd_map
 NAV_CACHE_TTL              = 6 * 3600  # Redis TTL for june_market_nav_cache
-US_PREMARKET_START_MIN = 10 * 60       # 10:00 UTC = 05:00 ET (US pre-market opens)
-US_PREMARKET_END_MIN   = 14 * 60 + 30  # 14:30 UTC = 09:30 ET (US regular session)
+# US premarket window (kept for reference; is_us_premarket() now uses _US_EAST_TZ directly):
+#   EDT (UTC-4, summer): 05:00-09:30 ET = 09:00-13:30 UTC
+#   EST (UTC-5, winter): 05:00-09:30 ET = 10:00-14:30 UTC
+US_PREMARKET_START_MIN = 10 * 60       # winter (EST) anchor -- superseded by DST-aware is_us_premarket()
+US_PREMARKET_END_MIN   = 14 * 60 + 30  # winter (EST) anchor -- superseded by DST-aware is_us_premarket()
 
 # Post-filter keyword after ticker-symbol search: ticker -> lowercase fragment in IG name.
 # Rejects wrong-company hits before the detail API call
@@ -1359,9 +1362,16 @@ def compute_signal(sym: str, price: dict, spread_alert: bool = False) -> dict:
 # ── Direct CFD discovery and gap detection ────────────────────────────────────
 
 def is_us_premarket() -> bool:
-    """True during US pre-market: 10:00–14:30 UTC (05:00–09:30 ET)."""
-    m = _now_mins()
-    return US_PREMARKET_START_MIN <= m < US_PREMARKET_END_MIN
+    """True during US pre-market: 05:00-09:30 ET (DST-aware via America/New_York).
+
+    Uses _US_EAST_TZ for DST-aware conversion, mirroring _is_metals_weekend_closure():
+      EDT (UTC-4, summer): 05:00-09:30 ET = 09:00-13:30 UTC
+      EST (UTC-5, winter): 05:00-09:30 ET = 10:00-14:30 UTC
+    Replaces hardcoded US_PREMARKET_START/END_MIN UTC constants.
+    """
+    now_et = datetime.now(_US_EAST_TZ)
+    et_h   = now_et.hour + now_et.minute / 60.0
+    return 5.0 <= et_h < 9.5
 
 
 def _load_direct_cfd_cache() -> None:
