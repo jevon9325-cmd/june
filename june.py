@@ -6815,7 +6815,7 @@ def _live_partial_tp_exit(signals: dict) -> None:
     if sym in _live_equity_cfd:
         partial_notional = half_sz * mid * price_unit
     else:
-        partial_notional = half_sz * lot_sz * mid * price_unit
+        partial_notional = half_sz * lot_sz * mid              # native-price notional; pnl_pct uses same native prices, price_unit cancels
 
     close_dir = "SELL" if dirn == "long" else "BUY"
     epic      = INSTRUMENTS.get(sym, "")
