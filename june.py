@@ -6457,6 +6457,7 @@ def _live_open_position(sym: str, direction: str, signals: dict,
         "stop_dist":    stop_dist,
         "entry_time":   time.time(),
         "entry_vol":    abs(sig.get("change_5m", 0.0)),
+        "entry_change_15m": sig.get("change_15m") or 0.0,
         "conviction":   conviction,
         "claudia_pts":  _sim_claudia_pts(sym, direction),
         "initial_sl_pct": stop_pct,  # baseline for time-decay SL compression
@@ -6582,6 +6583,7 @@ def _live_close_position(exit_reason: str, signals: dict) -> None:
 
         _live_update_streak(sym, dirn, won)
         _live_perf_record(sym, won, sig.get("spread_atr_ratio"))
+        _sim_15m_record(sym, dirn, pos.get("entry_change_15m") or 0.0, won)
         # After stop_loss: block the stopped direction for 10 min (same-dir cooldown)
         # and block ALL directions on this instrument for 15 min (instrument cooldown).
         # Prevents an immediate direction-flip into the same noise that stopped us out.
