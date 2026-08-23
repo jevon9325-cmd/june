@@ -6496,6 +6496,9 @@ def _live_open_position(sym: str, direction: str, signals: dict,
     if stop_mult != 1.0:
         stop_pct = round(stop_pct * stop_mult, 6)  # counter-trend SL compression
     tp_pct    = _sim_get_tp(sym, direction, conviction)
+    _tp_spread_floor_l = _sim_get_spread_floor(sym) / 2
+    if tp_pct < _tp_spread_floor_l:
+        tp_pct = _tp_spread_floor_l
     stop_dist = _live_compute_stop_pts(sym, stop_pct, mid_price)
 
     ig_direction = "BUY" if direction == "long" else "SELL"
@@ -7306,6 +7309,8 @@ def run_live_step(signals: dict) -> None:
     # must be managed unconditionally so live money is never left without
     # stop/TP coverage regardless of why the kill switch was disabled.
     if _live.get("open_position"):
+        if not _sim.get("open_position"):   # sim path handles it via _sim_check_exit when sim is also open
+            _sim_apply_pos_adjust()
         _live_check_exit(signals, regime)
         if _live.get("open_position"):
             return    # still holding — skip entry logic
