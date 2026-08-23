@@ -6032,6 +6032,7 @@ def _live_fetch_market_data(sym: str, epic: str) -> bool:
     price_unit = 0.01 if (one_pip and "cent" in str(one_pip).lower()) else 1.0
     if price_unit == 1.0 and epic.upper().startswith("CC."):
         price_unit = 0.01  # CC.D.* commodity epics price in cents; "1" pip lacks "cent" keyword
+        pip_sz *= price_unit  # rescale pip_sz to USD so stop formula (price*price_unit*pct/pip_sz) is unit-consistent
     margin_rate = float(inst.get("margin") or 0.0)
     _live_lot_sizes[sym]  = lot_sz
     _live_min_deal[sym]   = min_val
