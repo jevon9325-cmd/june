@@ -347,6 +347,7 @@ _live_margin:    dict = {}   # sym -> IG margin rate (0.0-1.0 fraction) from LIV
 _live_equity_cfd: set = set() # syms whose epic ends .CASH.IP — IG size field is shares, not lots
 _IG_EQUITY_COMMISSION_USD = 9.0       # IG charges $9/side = $18 round-trip on equity CFDs
 _live_min_stop_pts: dict = {}  # sym -> minNormalStopOrLimitDistance (pts) from IG at startup
+_live_elig_publish_next: float = 0.0  # rate-limiter for barbie_june_eligible_instruments (1h)
 _MACRO_STALE_SECS  = 2 * 3600   # Claudia freshness gate: beyond this treat directional bias as stale
 
 # Rolling price history: {sym: deque([(epoch, mid), ...])}
@@ -6060,6 +6061,111 @@ def _ig_margin_to_max_lev(margin_rate: float, ceiling: int) -> int:
         return min(ceiling, max(1, int(100.0 / margin_rate)))
 
 
+def _live_publish_eligible_instruments(signals: dict) -> None:
+    """Compute and publish barbie_june_eligible_instruments to Redis (2h TTL).
+
+    For each instrument in INSTRUMENTS, determines whether a trade is actually
+    viable at the current IG balance using real per-instrument IG API data:
+      min_notional  = min_deal x lot_sz x price x price_unit
+      min_margin    = min_notional x margin_rate (clamped to [0,1])
+      lot_formula_suspect: min_notional < $1.00 on a non-equity instrument with
+        margin_rate <= 1.0 -- detects the FX lot sizing formula bug where
+        IG API returns lot_sz as a contract multiplier (~10) rather than the
+        true base-currency lot size (~100,000 for FX). Derived from live data;
+        no hardcoded instrument lists. Self-corrects if bug is fixed later.
+      commission_gate: equity CFDs where expected TP gross < $18 round-trip.
+
+    Rate-limited to once per hour. Sim state completely unaffected.
+    """
+    global _live_elig_publish_next
+    now = time.time()
+    if now < _live_elig_publish_next:
+        return
+    _live_elig_publish_next = now + 3600.0
+
+    balance = _live.get("balance_total", 0.0)
+    if balance <= 0:
+        return
+
+    _ELIG_LOT_SANITY = 1.0
+    round_trip_comm  = _IG_EQUITY_COMMISSION_USD * 2
+
+    result: dict = {}
+    for sym in list(INSTRUMENTS.keys()):
+        sig        = signals.get(sym, {})
+        price      = sig.get("price", 0.0)
+        if price <= 0:
+            continue
+
+        lot_sz     = _live_lot_sizes.get(sym, 0.0)
+        min_deal   = _live_min_deal.get(sym, 0.0)
+        price_unit = _live_price_unit.get(sym, 1.0)
+        margin_raw = _live_margin.get(sym, 0.0)
+        is_equity  = sym in _live_equity_cfd
+
+        if lot_sz <= 0 or min_deal <= 0:
+            result[sym] = {"eligible": False, "reason": "no_ig_data",
+                           "min_notional": 0.0, "min_margin": 0.0, "margin_rate": margin_raw}
+            continue
+
+        price_usd    = price * price_unit
+        min_notional = (min_deal * price_usd) if is_equity else (min_deal * lot_sz * price_usd)
+        margin_rate  = max(0.0, min(1.0, margin_raw))
+        min_margin   = min_notional * margin_rate
+
+        # FX sizing formula bug: if min_notional < $1 on a non-equity instrument
+        # with real margin data, lot_sz from IG API is likely a contract multiplier
+        # not the full base-currency lot size. Self-correcting when formula is fixed.
+        lot_formula_suspect = (
+            not is_equity and
+            margin_rate > 0 and margin_rate <= 1.0 and
+            min_notional < _ELIG_LOT_SANITY
+        )
+
+        commission_blocked = False
+        if is_equity:
+            expected_gross     = min_notional * 0.02
+            commission_blocked = expected_gross < round_trip_comm
+
+        if lot_formula_suspect:
+            eligible, reason = False, "fx_lot_formula_suspect"
+        elif commission_blocked:
+            eligible, reason = False, "commission_gate"
+        elif margin_rate > 0 and min_margin > balance:
+            eligible, reason = False, "insufficient_balance(need ${:.2f})".format(min_margin)
+        elif margin_rate == 0 and not is_equity:
+            eligible, reason = False, "no_margin_data"
+        else:
+            eligible, reason = True, None
+
+        result[sym] = {
+            "eligible":     eligible,
+            "reason":       reason,
+            "min_notional": round(min_notional, 4),
+            "min_margin":   round(min_margin, 4),
+            "margin_rate":  round(margin_raw, 4),
+        }
+
+    eligible_list = [s for s, d in result.items() if d.get("eligible")]
+    payload = {
+        "ts":               int(now),
+        "balance":          round(balance, 2),
+        "instruments":      result,
+        "eligible_list":    eligible_list,
+        "ineligible_count": len(result) - len(eligible_list),
+    }
+    try:
+        _redis().set("barbie_june_eligible_instruments", json.dumps(payload), ex=7200)
+        _live_log(
+            "\U0001f4cb Eligible instruments: {} "
+            "(bal ${:.2f}) | {} ineligible".format(
+                eligible_list or ["none"], balance, len(result) - len(eligible_list)
+            )
+        )
+    except Exception as _elig_exc:
+        _live_log("\u26a0\ufe0f barbie_june_eligible_instruments publish failed: {}".format(_elig_exc))
+
+
 def _live_is_eligible(sym: str) -> bool:
     """Eligibility check using effective live balance and IG's real per-instrument margin rate.
 
@@ -7167,6 +7273,9 @@ def run_live_step(signals: dict) -> None:
 
     # Skim check after P&L update
     _live_check_skim()
+
+    # Publish eligible instruments for Barbie supervision (rate-limited to 1h)
+    _live_publish_eligible_instruments(signals)
 
     # Read macro regime once — shared by both exit and entry checks below
     regime = "neutral"
