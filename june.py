@@ -345,6 +345,7 @@ _live_pip_sizes: dict = {}   # sym -> pip size in price units from LIVE API (pop
 _live_price_unit: dict = {}  # sym -> USD-per-native-price-unit (0.01 for cents, 1.0 otherwise)
 _live_margin:    dict = {}   # sym -> IG margin rate (0.0-1.0 fraction) from LIVE API, e.g. 0.8=80%
 _live_equity_cfd: set = set() # syms whose epic ends .CASH.IP — IG size field is shares, not lots
+_live_fx_instruments: set = set() # syms whose epic matches CS.D.*.CFD.IP — FX pairs (correct sizing: lot_sz/pip_sz)
 _IG_EQUITY_COMMISSION_USD = 9.0       # IG charges $9/side = $18 round-trip on equity CFDs
 _live_min_stop_pts: dict = {}  # sym -> minNormalStopOrLimitDistance (pts) from IG at startup
 _live_elig_publish_next: float = 0.0  # rate-limiter for barbie_june_eligible_instruments (1h)
@@ -6041,6 +6042,8 @@ def _live_fetch_market_data(sym: str, epic: str) -> bool:
     _live_min_stop_pts[sym] = max(4, int(float(_ms_obj.get("value") or 4)))
     if epic.upper().endswith(".CASH.IP"):
         _live_equity_cfd.add(sym)
+    if epic.upper().startswith("CS.D.") and epic.upper().endswith("CFD.IP"):
+        _live_fx_instruments.add(sym)
     _live_log(f"LIVE mkt: {sym} lot={lot_sz} minDeal={min_val} pip={pip_sz} unit={price_unit} margin={margin_rate:.0%}")
     return True
 
@@ -6327,6 +6330,15 @@ def _live_compute_ig_size(sym: str, desired_notional_usd: float, mid_price: floa
     if sym in _live_equity_cfd:
         # .CASH.IP equity CFDs: IG size = shares; lot_sz is pip-tick value, not a size multiplier
         sized = round(desired_notional_usd / price_usd, 2)
+    elif sym in _live_fx_instruments:
+        # FX pairs (CS.D.*.CFD.IP): IG lot_sz is pip VALUE per lot (e.g. $10/pip for EURUSD),
+        # NOT the base-currency lot size. Correct unit value = lot_sz / pip_sz = 100,000 units/lot.
+        # Using lot_sz * price gives ~10,000x underestimate -> INSUFFICIENT_FUNDS on every FX order.
+        pip_sz = _live_pip_sizes.get(sym, _LIVE_FX_PIP)
+        unit_val = lot_sz / pip_sz if pip_sz > 0 else lot_sz * price_usd
+        if unit_val <= 0:
+            return 0.0
+        sized = round(desired_notional_usd / unit_val, 2)
     else:
         unit_val = lot_sz * price_usd
         if unit_val <= 0:
@@ -6475,6 +6487,9 @@ def _live_open_position(sym: str, direction: str, signals: dict,
     price_unit = _live_price_unit.get(sym, 1.0)
     if sym in _live_equity_cfd:
         actual_n = ig_size * mid_price * price_unit          # equity CFD: size = shares
+    elif sym in _live_fx_instruments:
+        _pip_sz_n = _live_pip_sizes.get(sym, _LIVE_FX_PIP)
+        actual_n  = ig_size * (lot_sz / _pip_sz_n) if _pip_sz_n > 0 else 0.0  # FX: size × 100k
     else:
         actual_n = ig_size * lot_sz * mid_price * price_unit # USD notional
     stop_pct  = max(_sim_get_dynamic_stop(sym), _sim_get_spread_floor(sym))
