@@ -7415,6 +7415,117 @@ def run_live_step(signals: dict) -> None:
 
 # ── Startup ───────────────────────────────────────────────────────────────────
 
+
+def _live_reconcile_positions() -> None:
+    # Reconcile _live["open_position"] against IG real open positions at startup.
+    # Catches two failure modes:
+    #   Orphan: IG holds a position June does not know about (Redis state loss
+    #           or manual entry). Reconstructs minimal state so exit management
+    #           is immediately active from the next cycle.
+    #   Stale:  June state says open but IG shows nothing. Clears it.
+    data = _ig_live_get("/positions/otc", version="1")
+    if data is None:
+        _live_log("Reconciliation: could not fetch IG /positions/otc -- skipping")
+        return
+
+    ig_positions = data.get("positions", [])
+    june_pos     = _live.get("open_position")
+
+    # Clean -- neither side has a position
+    if not ig_positions and not june_pos:
+        _live_log("Reconciliation: IG flat, June flat -- state matches")
+        return
+
+    # Both sides have a position -- verify deal_id agreement
+    if ig_positions and june_pos:
+        ig_deal   = ig_positions[0].get("position", {}).get("dealId", "")
+        june_deal = june_pos.get("deal_id", "")
+        if len(ig_positions) == 1 and ig_deal and ig_deal == june_deal:
+            _live_log(
+                f"Reconciliation: deal {ig_deal} confirmed in IG -- state matches "
+                f"({june_pos['instrument']} {june_pos['direction'].upper()})"
+            )
+        else:
+            _live_log(
+                f"Reconciliation: MISMATCH -- IG has {len(ig_positions)} position(s) "
+                f"(first deal={ig_deal}), June has deal={june_deal} -- manual check needed"
+            )
+        return
+
+    # Critical: IG has position(s) but June state is None
+    if ig_positions and not june_pos:
+        ig_p       = ig_positions[0]
+        pos_info   = ig_p.get("position", {})
+        mkt_info   = ig_p.get("market", {})
+        epic       = mkt_info.get("epic", "")
+        sym        = {v: k for k, v in INSTRUMENTS.items()}.get(epic, epic)
+        ig_dir     = pos_info.get("direction", "BUY")
+        direction  = "long" if ig_dir == "BUY" else "short"
+        ig_size    = float(pos_info.get("size", 0))
+        fill_price = float(pos_info.get("level", 0.0))
+        deal_id    = pos_info.get("dealId", "")
+        deal_ref   = pos_info.get("dealReference", "")
+        entry_time = time.time()
+        try:
+            _created = pos_info.get("createdDateUTC", "")
+            if _created:
+                _clean = _created.split(".")[0]
+                entry_time = datetime.fromisoformat(_clean).replace(tzinfo=timezone.utc).timestamp()
+        except Exception:
+            pass
+        lot_sz   = _live_lot_sizes.get(sym, _LIVE_LOT_SIZE_FX)
+        notional = ig_size * lot_sz * fill_price if fill_price > 0 else 0.0
+        hold_min = (time.time() - entry_time) / 60.0
+
+        _live["open_position"] = {
+            "instrument":       sym,
+            "direction":        direction,
+            "deal_id":          deal_id,
+            "deal_ref":         deal_ref,
+            "fill_price":       fill_price,
+            "ig_size":          ig_size,
+            "pos_size":         notional,
+            "leverage":         1,
+            "notional":         notional,
+            "entry_time":       entry_time,
+            "entry_vol":        0.0,
+            "entry_change_15m": 0.0,
+            "conviction":       5,
+            "claudia_pts":      0,
+            "reversal_count":   0,
+            "reconciled":       True,
+        }
+        _live_log("=" * 58)
+        _live_log("*** ORPHAN POSITION DETECTED -- STATE RECONSTRUCTED ***")
+        _live_log(f"   Instrument : {sym} {ig_dir}  size={ig_size}  fill={fill_price}")
+        _live_log(f"   Deal ID    : {deal_id}")
+        _live_log(f"   Hold time  : ~{hold_min:.0f} min (from IG creation timestamp)")
+        _live_log(f"   Root cause : Redis state loss or manually-opened position")
+        _live_log(f"   Action     : open_position populated -- exit management ACTIVE")
+        _live_log(f"   stop/tp    : using sim calibration (conservative defaults)")
+        _live_log(f"   *** VERIFY : Check IG app -- confirm position is intentional ***")
+        _live_log("=" * 58)
+        if len(ig_positions) > 1:
+            _live_log(
+                f"Reconciliation: {len(ig_positions)} IG positions total -- only first "
+                f"(deal={deal_id}) reconstructed. Additional positions need manual management."
+            )
+        return
+
+    # Stale: June state has position but IG shows nothing
+    if not ig_positions and june_pos:
+        sym     = june_pos.get("instrument", "?")
+        deal_id = june_pos.get("deal_id", "?")
+        _live_log("=" * 58)
+        _live_log("** STALE STATE CLEARED **")
+        _live_log(f"   June state: {sym} {june_pos.get('direction','?').upper()} deal={deal_id}")
+        _live_log(f"   IG reports: no open positions")
+        _live_log(f"   Action    : open_position cleared -- June is now flat")
+        _live_log(f"   Likely    : position closed in IG app or before this restart")
+        _live_log("=" * 58)
+        _live["open_position"] = None
+
+
 def _live_startup() -> None:
     """Initialize live trading state. Called once from main() after sim_startup().
     Safe to call when live account is not available — degrades gracefully.
@@ -7497,6 +7608,9 @@ def _live_startup() -> None:
     for _lfd_sym, _lfd_epic in list(INSTRUMENTS.items()):
         _live_fetch_market_data(_lfd_sym, _lfd_epic)
         time.sleep(0.3)
+
+    # Startup reconciliation: compare June state against IG real open positions
+    _live_reconcile_positions()
 
     _live_save_state()
 
