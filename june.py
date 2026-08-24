@@ -640,7 +640,7 @@ def _ensure_live_session() -> bool:
     return True
 
 
-def _ig_live_get(path: str, params: Optional[dict] = None, version: str = "1") -> Optional[dict]:
+def _ig_live_get(path: str, params: Optional[dict] = None, version: str = "1", not_found_default: Optional[dict] = None) -> Optional[dict]:
     # GET against IG live endpoint. Intelligence-only, no orders.
     # Mirrors _ig_get() using live base URL and live session tokens.
     # 403/429 silently return None (rate-limit recovery expected).
@@ -674,6 +674,8 @@ def _ig_live_get(path: str, params: Optional[dict] = None, version: str = "1") -
             _live_api_paused_until = time.time() + 60.0
             print(f"[{_ts()}] ⚠️  LIVE GET 429 rate-limit -- API paused 60s", flush=True)
             return None
+        if r.status_code == 404 and not_found_default is not None:
+            return not_found_default
         if r.status_code not in (403,):
             print(f"[{_ts()}] ⚠️  LIVE {path}: HTTP {r.status_code} {r.text[:80]}", flush=True)
         return None
@@ -7423,9 +7425,9 @@ def _live_reconcile_positions() -> None:
     #           or manual entry). Reconstructs minimal state so exit management
     #           is immediately active from the next cycle.
     #   Stale:  June state says open but IG shows nothing. Clears it.
-    data = _ig_live_get("/positions/otc", version="1")
+    data = _ig_live_get("/positions/otc", version="1", not_found_default={"positions": []})
     if data is None:
-        _live_log("Reconciliation: could not fetch IG /positions/otc -- skipping")
+        _live_log("Reconciliation: /positions/otc error (network/auth) -- skipping")
         return
 
     ig_positions = data.get("positions", [])
