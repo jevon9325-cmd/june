@@ -6806,6 +6806,10 @@ def _live_close_position(exit_reason: str, signals: dict) -> None:
             _live_log(f"📈 [DEFENSIVE] {sym}: win recorded in defensive mode (recovery pending)")
     else:
         _live_log(f"close_position: confirm failed or rejected for {sym} — check IG manually")
+        _live_log(f"⚠️  close_position: ambiguous IG state for {sym} — running mid-cycle reconciliation")
+        _live_reconcile_positions()
+        _live_save_state()
+        return  # open_position set by reconciliation; entry guard blocks new trades if still open
 
     _live["open_position"] = None
     _live_save_state()
@@ -7418,7 +7422,8 @@ def run_live_step(signals: dict) -> None:
 
 
 def _live_reconcile_positions() -> None:
-    # Reconcile _live["open_position"] against IG real open positions at startup.
+    # Reconcile _live["open_position"] against IG real open positions.
+    # Called at startup and mid-cycle after a failed close confirmation.
     # Catches two failure modes:
     #   Orphan: IG holds a position June does not know about (Redis state loss
     #           or manual entry). Reconstructs minimal state so exit management
