@@ -5976,10 +5976,18 @@ def _live_check_circuit_breaker() -> None:
     # Two-tier CB buffer.
     # Micro tier (<$30): 30% drawdown / $2 floor — room for 2–3 stop-outs.
     # At $7.99 day_start: buffer = max($2.00, 30% x $7.99) = $2.40; fires below $5.59.
+    # Sub-floor edge case: when day_start < $2 floor, max() returns the floor which
+    # exceeds the entire account — CB becomes mathematically unreachable. Fix: use
+    # pct-only (30% x day_start) when below the floor. No change above $2.
     # Full tier ($30+): $20 floor + 5% rule (unchanged; dominant below ~$400).
     dollar_loss = day_start - current
     if day_start < _LIVE_CB_MICRO_THRESH:
-        effective_buffer = max(_LIVE_CB_MICRO_FLOOR_USD, _LIVE_CB_MICRO_PCT * day_start)
+        _pct_buf = _LIVE_CB_MICRO_PCT * day_start
+        if day_start < _LIVE_CB_MICRO_FLOOR_USD:
+            # Balance below $2: floor would exceed entire account; scale to pct only
+            effective_buffer = _pct_buf
+        else:
+            effective_buffer = max(_LIVE_CB_MICRO_FLOOR_USD, _pct_buf)  # unchanged
     else:
         effective_buffer = max(_LIVE_CB_FLOOR_USD, abs(_LIVE_CIRCUIT_BREAKER_PCT) * day_start)
     drawdown         = (current - day_start) / day_start
