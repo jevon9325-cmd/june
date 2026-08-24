@@ -5608,8 +5608,8 @@ def _live_update_defensive_mode() -> None:
     """Check and update global and per-instrument defensive mode each cycle.
 
     Global defensive: fires when balance_total has fallen more than half the CB
-    threshold below day_start. Lifts when balance_total recovers to the level it
-    was when defensive was entered, OR 30-min time gate elapses.
+    threshold below day_start. Lifts when dollar_loss drops below half the
+    defensive threshold (hysteresis band), OR 30-min time gate elapses.
 
     Per-instrument defensive: fires after _LIVE_DEF_INSTR_STOPOUTS (2) stop-outs
     on the same instrument today. Lifts when a WIN closes on that instrument after
@@ -5639,13 +5639,12 @@ def _live_update_defensive_mode() -> None:
                 f"day_start=${day_start:.2f})"
             )
         elif gmode == "defensive":
-            entry_bal  = _live.get("global_mode_bal_entry", current)
             entered_at = _live.get("global_mode_entered_at", now)
-            recovered_pnl  = current >= entry_bal
+            recovered_pnl  = (day_start - current) < (def_buf * 0.5)
             recovered_time = (now - entered_at) >= _LIVE_DEF_TIMEOUT_SECS
             if recovered_pnl or recovered_time:
                 _live["global_mode"] = "normal"
-                why = "P&L recovered" if recovered_pnl else "30-min gate elapsed"
+                why = "hysteresis cleared" if recovered_pnl else "30-min gate elapsed"
                 _live_log(f"🟢 [DEFENSIVE] Global: DEFENSIVE -> NORMAL ({why})")
 
     # Per-instrument defensive mode recovery
