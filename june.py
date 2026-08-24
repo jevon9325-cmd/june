@@ -6580,8 +6580,13 @@ def _live_open_position(sym: str, direction: str, signals: dict,
 
     # Pre-order margin check — catches weekend-uplifted margins that slip past eligibility filter.
     # FX excluded: tiny notional sizes make INSUFFICIENT_FUNDS structurally impossible there.
+    # Missing margin data (0.0) is fail-CLOSED for non-FX: blocks the trade rather than
+    # silently allowing it through unchecked. Arises from rate-limited startup fetch.
     _margin_raw = _live_margin.get(sym, 0.0)
-    if _margin_raw > 0 and sym not in _live_fx_instruments:
+    if sym not in _live_fx_instruments:
+        if _margin_raw <= 0:
+            _live_log(f"🚫 MARGIN GATE: {sym} skip — margin not loaded (fail-closed) — no cooldown")
+            return
         _mfrac  = _real_margin_fraction(sym, _margin_raw)
         _usd_n  = (ig_size * mid_price * price_unit if sym in _live_equity_cfd
                    else ig_size * lot_sz * mid_price * price_unit)
@@ -7611,9 +7616,33 @@ def _live_startup() -> None:
 
     # Fetch per-instrument lot sizes from LIVE IG API so sizing is correct
     _live_log(f"Fetching live market data for {len(INSTRUMENTS)} instruments...")
+    _mkt_failed: list = []
     for _lfd_sym, _lfd_epic in list(INSTRUMENTS.items()):
-        _live_fetch_market_data(_lfd_sym, _lfd_epic)
+        if not _live_fetch_market_data(_lfd_sym, _lfd_epic):
+            _mkt_failed.append((_lfd_sym, _lfd_epic))
         time.sleep(0.3)
+    if _mkt_failed:
+        _loaded = len(INSTRUMENTS) - len(_mkt_failed)
+        _live_log(
+            f"Market data: {_loaded}/{len(INSTRUMENTS)} loaded — "
+            f"retrying {len(_mkt_failed)} failed instrument(s) after 5s: "
+            f"{[s for s,_ in _mkt_failed]}"
+        )
+        time.sleep(5.0)
+        _still_failed: list = []
+        for _lfd_sym, _lfd_epic in _mkt_failed:
+            if not _live_fetch_market_data(_lfd_sym, _lfd_epic):
+                _still_failed.append(_lfd_sym)
+            time.sleep(0.3)
+        if _still_failed:
+            _live_log(
+                f"Market data: {len(_still_failed)} instrument(s) still missing after retry "
+                f"(margin gate will block them — fail-closed): {_still_failed}"
+            )
+        else:
+            _live_log(f"Market data retry succeeded — all {len(INSTRUMENTS)} instruments loaded")
+    else:
+        _live_log(f"Market data: all {len(INSTRUMENTS)} instruments loaded")
 
     # Startup reconciliation: compare June state against IG real open positions
     _live_reconcile_positions()
