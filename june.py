@@ -6621,9 +6621,12 @@ def _live_open_position(sym: str, direction: str, signals: dict,
         "guaranteedStop": False,
         "forceOpen":     True,
         "currencyCode":  "USD",
-        # stopDistance omitted: exits managed programmatically; attached stops
-        # were causing silent IG rejections (404 on confirms) for FX instruments
+        # stopDistance omitted for FX (CS.D.*.CFD.IP): prior 404-on-confirm rejections
+        # were caused by FX lot-formula sizing issues, not the stop field itself.
+        # Non-FX instruments (OIL, SILVER, GOLD) attach a broker-side hard stop below.
     }
+    if sym not in _live_fx_instruments:
+        order_body["stopDistance"] = stop_dist
 
     resp = _ig_live_post("/positions/otc", order_body, version="2")
     if not resp:
@@ -6649,6 +6652,22 @@ def _live_open_position(sym: str, direction: str, signals: dict,
 
     fill_price = float(confirm.get("level", mid_price))
     deal_id    = confirm.get("dealId", "")
+
+    # Verify broker-side stop was echoed in the confirm (non-FX only).
+    # IG returns stopLevel when the stop was accepted alongside the position.
+    _broker_stop_level = None
+    if sym not in _live_fx_instruments:
+        _broker_stop_level = confirm.get("stopLevel")
+        if _broker_stop_level:
+            _live_log(
+                f"🛑 Broker stop confirmed: {sym} stopLevel={_broker_stop_level} "
+                f"(sent stopDistance={stop_dist}pts)"
+            )
+        else:
+            _live_log(
+                f"⚠️  open_position: {sym} — broker stop NOT in IG confirm "
+                f"(sent {stop_dist}pts, stopLevel absent); polling-only exits active"
+            )
     _live["open_position"] = {
         "instrument":   sym,
         "direction":    direction,
@@ -6662,6 +6681,7 @@ def _live_open_position(sym: str, direction: str, signals: dict,
         "stop_pct":     stop_pct,
         "tp_pct":       tp_pct,
         "stop_dist":    stop_dist,
+        "broker_stop_level": _broker_stop_level,
         "entry_time":   time.time(),
         "entry_vol":    abs(sig.get("change_5m", 0.0)),
         "entry_change_15m": sig.get("change_15m") or 0.0,
