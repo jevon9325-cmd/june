@@ -6257,6 +6257,8 @@ def _live_is_eligible(sym: str) -> bool:
     bal     = max(0.0, total - skimmed)
     if bal <= 0:
         return False
+    if sym in _live_fx_instruments:
+        return False  # FX min_notional in _KNOWN_MIN_NOTIONALS is 10,000x too small; block until formula verified
     lev = int(_SIM_LEV_RANGES.get("sprout", (3, 10))[1])  # sim ceiling
     margin_rate = _live_margin.get(sym)
     if margin_rate and margin_rate > 0:
