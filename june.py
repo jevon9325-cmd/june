@@ -6957,6 +6957,43 @@ def _live_partial_tp_exit(signals: dict) -> None:
             f"({real_pnl_p*100:+.3f}%) partial=${partial_dollar_pnl:+.4f} | "
             f"remaining {remaining_sz} lots | stop -> breakeven ({_spread_flr*100:.3f}%)"
         )
+
+        # Broker-side stop: tighten IG stop to match the internal breakeven level set above.
+        # Protects the remaining 50% against gap-reversals regardless of whether MPD has armed.
+        # Improvement check: only PUT if tighter than any stop MPD or entry has already set.
+        _ptp_stop_level = (
+            fill_px * (1.0 - _spread_flr) if dirn == 'long'
+            else fill_px * (1.0 + _spread_flr)
+        )
+        _ptp_pip_l  = _live_pip_sizes.get(sym, _LIVE_FX_PIP)
+        _ptp_spn_l  = half_sp * 2.0
+        _ptp_cur_bk = _live['open_position'].get('defensive_stop_level') or \
+                      _live['open_position'].get('broker_stop_level')
+        _ptp_tighte = (
+            _ptp_cur_bk is None or
+            (dirn == 'long'  and _ptp_stop_level > _ptp_cur_bk) or
+            (dirn == 'short' and _ptp_stop_level < _ptp_cur_bk)
+        )
+        if _ptp_tighte:
+            _ptp_dist_l = abs(mid - _ptp_stop_level)
+            _ptp_ig_min = (_live_min_stop_pts.get(sym, 4) + 1) * _ptp_pip_l
+            _ptp_min_l  = max(_ptp_ig_min, (_ptp_spn_l / _ptp_pip_l + 1) * _ptp_pip_l)
+            _ptp_synced = False
+            if _ptp_dist_l >= _ptp_min_l:
+                _ptp_put = _ig_live_put(
+                    f"/positions/otc/{_live['open_position'].get('deal_id', '')}",
+                    {"stopLevel": round(_ptp_stop_level, 5), "guaranteedStop": False},
+                    version="2",
+                )
+                if _ptp_put:
+                    _ptp_synced = True
+                    _live['open_position']['defensive_stop_level'] = _ptp_stop_level
+                    _live['open_position']['defensive_stop_active'] = True
+            _live_log(
+                f"🔒 [PARTIAL-TP SYNC] {sym}: broker stop -> breakeven "
+                f"stopLevel={_ptp_stop_level:.5f} | broker_sync={_ptp_synced}"
+                + (" (too close — polling-only)" if not _ptp_synced else "")
+            )
         _live_save_state()
     else:
         _live_log(f"partial_tp: confirm failed for {sym} — falling back to full close")
@@ -7052,6 +7089,42 @@ def _live_check_exit(signals: dict, regime: str) -> None:
                     f'💰 [PROFIT TRAIL] {sym}: Locked in 50% of peak profit '
                     f'at {_trail_sl_l*100:.3f}%% floor'
                 )
+                # Sync improved DPLE M2 trail to IG broker stop (same PUT pattern as MPD).
+                # Only fires when new level is tighter than the current broker-side stop;
+                # if MPD's fixed level is still tighter, leave it alone.
+                _dple_pip_l  = _live_pip_sizes.get(sym, _LIVE_FX_PIP)
+                _dple_spn_l  = _half_sp * 2.0
+                _dple_sl_abs = (
+                    fill_px * (1.0 + _trail_sl_l) if dirn == 'long'
+                    else fill_px * (1.0 - _trail_sl_l)
+                )
+                _dple_cur_bk = pos.get('defensive_stop_level') or pos.get('broker_stop_level')
+                _dple_tighte = (
+                    _dple_cur_bk is None or
+                    (dirn == 'long'  and _dple_sl_abs > _dple_cur_bk) or
+                    (dirn == 'short' and _dple_sl_abs < _dple_cur_bk)
+                )
+                if _dple_tighte:
+                    _dple_dist_l = abs(mid - _dple_sl_abs)
+                    _dple_ig_min = (_live_min_stop_pts.get(sym, 4) + 1) * _dple_pip_l
+                    _dple_min_l  = max(_dple_ig_min, (_dple_spn_l / _dple_pip_l + 1) * _dple_pip_l)
+                    _dple_synced = False
+                    if _dple_dist_l >= _dple_min_l:
+                        _dple_put = _ig_live_put(
+                            f"/positions/otc/{pos.get('deal_id', '')}",
+                            {"stopLevel": round(_dple_sl_abs, 5), "guaranteedStop": False},
+                            version="2",
+                        )
+                        if _dple_put:
+                            _dple_synced = True
+                            _live['open_position']['defensive_stop_level'] = _dple_sl_abs
+                            _live['open_position']['defensive_stop_active'] = True
+                            pos = _live['open_position']
+                    _live_log(
+                        f"📈 [DPLE SYNC] {sym}: trail floor {_trail_sl_l*100:.3f}% "
+                        f"-> stopLevel={_dple_sl_abs:.5f} | broker_sync={_dple_synced}"
+                        + (" (too close — polling-only)" if not _dple_synced else "")
+                    )
         elif pnl_pct >= 0.5 * _dple_tp_l and not pos.get('breakeven_locked'):
             _spread_buf_l = _sim_get_spread_floor(sym)
             _be_sl_l = -_spread_buf_l
