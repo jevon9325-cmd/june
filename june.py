@@ -6077,7 +6077,12 @@ def _live_fetch_market_data(sym: str, epic: str) -> bool:
     if price_unit == 1.0 and epic.upper().startswith("CC."):
         price_unit = 0.01  # CC.D.* commodity epics price in cents; "1" pip lacks "cent" keyword
         pip_sz *= price_unit  # rescale pip_sz to USD so stop formula (price*price_unit*pct/pip_sz) is unit-consistent
-    margin_rate = float(inst.get("margin") or 0.0)
+    _mf      = inst.get("marginFactor")
+    _mf_unit = inst.get("marginFactorUnit", "PERCENTAGE")
+    if _mf is not None:
+        margin_rate = float(_mf) / 100.0 if _mf_unit == "PERCENTAGE" else float(_mf)
+    else:
+        margin_rate = 0.0
     _live_lot_sizes[sym]  = lot_sz
     _live_min_deal[sym]   = min_val
     _live_pip_sizes[sym]  = pip_sz
@@ -6098,8 +6103,9 @@ def _ig_margin_to_max_lev(margin_rate: float, ceiling: int) -> int:
     IG uses two scales depending on instrument category:
       0 < rate <= 1.0 : decimal fraction (0.5 -> 50% margin -> 2x leverage)
       rate > 1.0      : margin percentage (20.0 -> 20% margin -> 5x leverage)
-    Confirmed: Silver=0.8 (80% margin, real position verified); SPCX=20.0
-    (20% from live deposit bands, matches FCA 5:1 retail equity cap).
+    After _live_fetch_market_data stores decimal fractions (OIL=0.01, SILVER=0.008),
+    the <= 1.0 branch always applies: 1/0.01=100x, 1/0.008=125x. The > 1.0 branch
+    applies only if a future instrument stores a raw percentage value directly.
     """
     if not margin_rate or margin_rate <= 0:
         return ceiling
@@ -6110,20 +6116,14 @@ def _ig_margin_to_max_lev(margin_rate: float, ceiling: int) -> int:
 
 
 def _real_margin_fraction(sym: str, margin_raw: float) -> float:
-    """Return the margin as a fraction of USD notional (may exceed 1.0 for weekend uplift).
+    """Return the margin as a decimal fraction of USD notional.
 
-    IG uses two scales:
-      FX / equity CFDs                 : percentage scale  (2.0 -> 2%, 5.0 -> 5%)
-      Commodities / metals (non-FX)    : decimal fraction  (0.8 -> 80%, 10.0 -> 1000%)
-
-    Weekend margin uplift for SILVER/OIL pushes margin_raw from 0.8/1.0 to 10.0 — still
-    in the decimal scale. _ig_margin_to_max_lev routes >1.0 to the percentage branch
-    (10.0 -> 10% margin) which is wrong for these instruments. This function gives the
-    correct fraction used for pre-order and eligibility balance checks.
+    _live_fetch_market_data reads IG's marginFactor field and divides by 100
+    when marginFactorUnit=PERCENTAGE (all live instruments observed so far).
+    The stored value is already a decimal fraction for every instrument type:
+      OIL=0.01 (1%), SILVER=0.008 (0.8%), GOLD=0.005 (0.5%), FX~0.02 (2%).
     """
-    if sym in _live_equity_cfd or sym in _live_fx_instruments:
-        return max(0.0, margin_raw / 100.0)   # percentage scale: 5.0=5%, 2.0=2%
-    return max(0.0, margin_raw)               # decimal scale: 0.8=80%, 10.0=1000%
+    return max(0.0, margin_raw)
 
 
 def _live_publish_eligible_instruments(signals: dict) -> None:
