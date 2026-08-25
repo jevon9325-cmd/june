@@ -6077,7 +6077,10 @@ def _live_fetch_market_data(sym: str, epic: str) -> bool:
     if price_unit == 1.0 and epic.upper().startswith("CC."):
         price_unit = 0.01  # CC.D.* commodity epics price in cents; "1" pip lacks "cent" keyword
         pip_sz *= price_unit  # rescale pip_sz to USD so stop formula (price*price_unit*pct/pip_sz) is unit-consistent
-    _mf      = inst.get("marginFactor")
+    # v3 API: marginFactor + marginFactorUnit; v1 API: margin — both percentage scale
+    _mf_v3   = inst.get("marginFactor")
+    _mf_v1   = inst.get("margin")
+    _mf      = _mf_v3 if _mf_v3 is not None else _mf_v1
     _mf_unit = inst.get("marginFactorUnit", "PERCENTAGE")
     if _mf is not None:
         margin_rate = float(_mf) / 100.0 if _mf_unit == "PERCENTAGE" else float(_mf)
