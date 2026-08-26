@@ -5569,7 +5569,8 @@ _MPD_MIN_PROFIT_PIPS = 1   # minimum guaranteed profit in points above spread
 _PERF_BLOCK_WINDOW     = 8       # rolling window of confirmed live trades
 _PERF_BLOCK_WR_THRESH  = 0.30    # block if win rate < 30% over window
 _PERF_BLOCK_SAR_THRESH = 0.50    # block if avg Spread/ATR ratio > 50% over window
-_PERF_BLOCK_TTL        = 86400   # 24-hour block duration (seconds)
+_PERF_BLOCK_TTL           = 86400   # 24-hour block duration (seconds)
+_PERF_BLOCK_SAR_SESSION_MIN = 4       # min same-session trades before SAR block fires
 _LIVE_MIN_CONVICTION   = 4       # minimum conviction score for live entries; sim unaffected
 
 # Tiered defensive mode (NORMAL -> DEFENSIVE -> CB HALT) -------
@@ -6285,8 +6286,26 @@ def _live_is_paused(combo: str) -> bool:
 _perf_block_cache: dict = {}   # {sym: cache_expire_ts} — in-memory, refreshed from Redis
 
 
+def _perf_block_sar_ttl() -> int:
+    """Seconds until the next session boundary (21:00 UTC or 07:00 UTC).
+    Used to scope SAR perf blocks to the current trading session only.
+    """
+    now_utc = datetime.now(timezone.utc)
+    if is_overnight():
+        # Overnight (21:00-07:00 UTC): next boundary is 07:00 UTC
+        target = now_utc.replace(hour=OVERNIGHT_END_MIN // 60, minute=0, second=0, microsecond=0)
+        if now_utc.hour >= OVERNIGHT_START_MIN // 60:
+            target += timedelta(days=1)  # after 21:00: 07:00 is next day
+    else:
+        # Day session (07:00-21:00 UTC): next boundary is 21:00 UTC
+        target = now_utc.replace(hour=OVERNIGHT_START_MIN // 60, minute=0, second=0, microsecond=0)
+    return max(1, int((target - now_utc).total_seconds()))
+
+
 def _live_perf_blocked(sym: str) -> bool:
     """True if sym is blocked by the instrument performance filter.
+    Checks legacy (june_perf_block:{sym}), WR (june_perf_block_wr:{sym}),
+    and SAR (june_perf_block_sar:{sym}) keys — any active key blocks.
     Caches Redis state locally for 5 minutes per symbol to avoid per-cycle churn.
     On Redis error: permits the trade (fail-open).
     """
@@ -6294,20 +6313,24 @@ def _live_perf_blocked(sym: str) -> bool:
     if now < _perf_block_cache.get(sym, 0.0):
         return True  # still within cache window — blocked
     try:
-        val = _redis().get(f"june_perf_block:{sym}")
+        r = _redis()
+        if (r.get(f"june_perf_block:{sym}") or
+                r.get(f"june_perf_block_wr:{sym}") or
+                r.get(f"june_perf_block_sar:{sym}")):
+            _perf_block_cache[sym] = now + 300.0  # cache for 5 min
+            return True
     except Exception:
         return False  # Redis unavailable — fail open
-    if val:
-        _perf_block_cache[sym] = now + 300.0  # cache for 5 min
-        return True
     _perf_block_cache.pop(sym, None)
     return False
 
 
 def _live_perf_record(sym: str, won: bool, sar) -> None:
     """Update rolling per-instrument performance stats in Redis.
-    Applies a 24-hour live block if win rate < _PERF_BLOCK_WR_THRESH over the
-    last _PERF_BLOCK_WINDOW trades, or if avg Spread/ATR > _PERF_BLOCK_SAR_THRESH.
+    WR block: 24h if win rate < _PERF_BLOCK_WR_THRESH over _PERF_BLOCK_WINDOW trades.
+    SAR block: session-scoped if avg Spread/ATR > _PERF_BLOCK_SAR_THRESH over
+    current-session trades (min _PERF_BLOCK_SAR_SESSION_MIN). Prevents stale
+    cross-session SAR values from refiring the block after a session boundary.
     Called only after a confirmed IG position close.
     """
     try:
@@ -6316,35 +6339,43 @@ def _live_perf_record(sym: str, won: bool, sar) -> None:
         raw    = r.get(key)
         stats  = json.loads(raw) if raw else {"trades": []}
         trades = stats.get("trades", [])
-        trades.append({"won": won, "sar": round(sar or 0.0, 4)})
+        session = "overnight" if is_overnight() else "day"
+        trades.append({"won": won, "sar": round(sar or 0.0, 4), "session": session})
         if len(trades) > _PERF_BLOCK_WINDOW:
             trades = trades[-_PERF_BLOCK_WINDOW:]
         stats["trades"] = trades
         r.set(key, json.dumps(stats))
 
-        if len(trades) < _PERF_BLOCK_WINDOW:
-            return  # not enough history yet
+        # ── WR block (all trades in rolling window, 24h TTL) ────────────────────
+        if len(trades) >= _PERF_BLOCK_WINDOW:
+            win_rate = sum(1 for t in trades if t["won"]) / len(trades)
+            if win_rate < _PERF_BLOCK_WR_THRESH:
+                r.setex(f"june_perf_block_wr:{sym}", _PERF_BLOCK_TTL, "1")
+                _perf_block_cache[sym] = time.time() + 300.0
+                _live_log(
+                    f"⛔ [PERF BLOCK WR] {sym}: Win rate {win_rate:.0%} below "
+                    f"{_PERF_BLOCK_WR_THRESH:.0%} threshold "
+                    f"({_PERF_BLOCK_WINDOW} trades). Live trading suspended for 24h."
+                )
 
-        win_rate = sum(1 for t in trades if t["won"]) / len(trades)
-        sar_vals = [t["sar"] for t in trades if t["sar"] > 0]
-        avg_sar  = sum(sar_vals) / len(sar_vals) if sar_vals else 0.0
+        # ── SAR block (current-session trades only, session-scoped TTL) ───────
+        cur_session    = "overnight" if is_overnight() else "day"
+        session_trades = [t for t in trades if t.get("session") == cur_session]
+        if len(session_trades) >= _PERF_BLOCK_SAR_SESSION_MIN:
+            sar_vals = [t["sar"] for t in session_trades if t["sar"] > 0]
+            if sar_vals:
+                avg_sar = sum(sar_vals) / len(sar_vals)
+                if avg_sar > _PERF_BLOCK_SAR_THRESH:
+                    sar_ttl = _perf_block_sar_ttl()
+                    r.setex(f"june_perf_block_sar:{sym}", sar_ttl, "1")
+                    _perf_block_cache[sym] = time.time() + 300.0
+                    _live_log(
+                        f"⛔ [PERF BLOCK SAR] {sym}: Avg Spread/ATR {avg_sar:.0%} above "
+                        f"{_PERF_BLOCK_SAR_THRESH:.0%} threshold "
+                        f"({len(session_trades)} {cur_session}-session trades). "
+                        f"Suspended until next session ({sar_ttl}s)."
+                    )
 
-        if win_rate < _PERF_BLOCK_WR_THRESH:
-            r.setex(f"june_perf_block:{sym}", _PERF_BLOCK_TTL, "1")
-            _perf_block_cache[sym] = time.time() + 300.0
-            _live_log(
-                f"⛔ [PERF BLOCK] {sym}: Win rate {win_rate:.0%} below "
-                f"{_PERF_BLOCK_WR_THRESH:.0%} threshold "
-                f"({_PERF_BLOCK_WINDOW} trades). Live trading suspended for 24h."
-            )
-        elif avg_sar > _PERF_BLOCK_SAR_THRESH:
-            r.setex(f"june_perf_block:{sym}", _PERF_BLOCK_TTL, "1")
-            _perf_block_cache[sym] = time.time() + 300.0
-            _live_log(
-                f"⛔ [PERF BLOCK] {sym}: Avg Spread/ATR {avg_sar:.0%} above "
-                f"{_PERF_BLOCK_SAR_THRESH:.0%} threshold "
-                f"({_PERF_BLOCK_WINDOW} trades). Live trading suspended for 24h."
-            )
     except Exception as exc:
         _live_log(f"[perf_record] {sym}: Redis error — {exc}")
 
