@@ -6904,6 +6904,23 @@ def _live_close_position(exit_reason: str, signals: dict) -> None:
         _live_save_state()
         return  # open_position set by reconciliation; entry guard blocks new trades if still open
 
+    # Post-close verification: check IG is actually flat before clearing state.
+    # Catches the broker-stop + internal-stop race condition where June's close order
+    # arrives after IG's broker stop already fired, creating an orphan BUY position.
+    # Runs only when the account shows margin > 0 after a confirmed close.
+    time.sleep(2)
+    _post_data = _ig_live_get("/positions/otc", version="1")
+    if _post_data is not None:
+        _post_pos = _post_data.get("positions", [])
+        if _post_pos:
+            _live_log(
+                f"⚠️  POST-CLOSE VERIFICATION: IG still shows {len(_post_pos)} open position(s) "
+                f"after {sym} close confirm — possible broker-stop race condition. "
+                f"Running reconciliation to reconstruct state."
+            )
+            _live_reconcile_positions()
+            _live_save_state()
+            return  # reconciliation set open_position; do NOT clear it below
     _live["open_position"] = None
     _live_save_state()
 
@@ -7595,7 +7612,7 @@ def _live_reconcile_positions() -> None:
     #           or manual entry). Reconstructs minimal state so exit management
     #           is immediately active from the next cycle.
     #   Stale:  June state says open but IG shows nothing. Clears it.
-    data = _ig_live_get("/positions/otc", version="1", not_found_default={"positions": []})
+    data = _ig_live_get("/positions/otc", version="1")  # 404 → None → skip, not clear
     if data is None:
         _live_log("Reconciliation: /positions/otc error (network/auth) -- skipping")
         return
