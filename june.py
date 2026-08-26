@@ -6558,7 +6558,7 @@ def _live_open_position(sym: str, direction: str, signals: dict,
         _pip_sz_n = _live_pip_sizes.get(sym, _LIVE_FX_PIP)
         actual_n  = ig_size * (lot_sz / _pip_sz_n) if _pip_sz_n > 0 else 0.0  # FX: size × 100k
     else:
-        actual_n = ig_size * lot_sz * mid_price  # native-price notional; pnl_pct uses same native prices, price_unit cancels
+        actual_n = ig_size * lot_sz * mid_price * price_unit  # USD notional (price_unit converts IG native points to USD)
     stop_pct  = max(_sim_get_dynamic_stop(sym), _sim_get_spread_floor(sym))
     if stop_mult != 1.0:
         stop_pct = round(stop_pct * stop_mult, 6)  # counter-trend SL compression
@@ -6901,7 +6901,7 @@ def _live_partial_tp_exit(signals: dict) -> None:
     if sym in _live_equity_cfd:
         partial_notional = half_sz * mid * price_unit
     else:
-        partial_notional = half_sz * lot_sz * mid              # native-price notional; pnl_pct uses same native prices, price_unit cancels
+        partial_notional = half_sz * lot_sz * mid * price_unit  # USD notional (price_unit converts IG native points to USD)
 
     close_dir = "SELL" if dirn == "long" else "BUY"
     epic      = INSTRUMENTS.get(sym, "")
