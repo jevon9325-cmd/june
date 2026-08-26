@@ -5068,6 +5068,7 @@ def run_simulation_step(signals: dict) -> None:
             _fail_cal_win = dict(_sim.get("win_moves", {}))
             _fail_cal_los = dict(_sim.get("loss_moves", {}))
             _fail_cal_co  = {k: list(v) for k, v in (_sim.get("combo_outcomes") or {}).items()}
+            _fail_cal_15m = _sim.get("15m_reliability", {})
             _fail_rc      = _sim.get("reset_count", 0) + 1
             # Capture failure snapshot before _sim_stop publishes calibration
             _snap_th_f = _sim.get("trade_history", [])
@@ -5087,7 +5088,7 @@ def run_simulation_step(signals: dict) -> None:
             }
             _sim_stop(f"{stage}_stage_fail", signals)  # logs STOPPED+RECOMMENDATION, publishes results
             # Auto-restart: reset to Sprout Stage P1 without manual intervention.
-            # vol_history / win_moves / loss_moves carry forward so each retry
+            # vol_history / win_moves / loss_moves / 15m_reliability carry forward so each retry
             # starts with better-tuned stop/TP values rather than relearning blind.
             # approach_stats resets so new trial re-explores all approaches per instrument.
             # failure_snapshot persists so failure-context comparison fires after vol warmup.
@@ -5124,7 +5125,7 @@ def run_simulation_step(signals: dict) -> None:
                 "boost_expiry":         {},
                 "pause_expiry":         {},
                 "last_entry_time":      _now_r,
-                "15m_reliability":      {},
+                "15m_reliability":      _fail_cal_15m,
                 "vol_history":          _fail_cal_vol,
                 "win_moves":            _fail_cal_win,
                 "loss_moves":           _fail_cal_los,
