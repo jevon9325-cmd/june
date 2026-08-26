@@ -3106,7 +3106,10 @@ def _sim_conviction_gauge(
     if gate_mode == "strict" and rel_score is not None and rel_score > 0.5:
         rel_pts = 1.0
     elif gate_mode == "relaxed":
-        rel_pts = -0.5
+        if rel_score is not None and rel_score < 0:
+            rel_pts = min(-0.5, rel_score * 4.0)  # confirmed anti-correlated: scale with magnitude
+        else:
+            rel_pts = -0.5  # insufficient data (n<5, unknown)
     else:
         rel_pts = 0.0
     wknd_pts    = _sim_weekend_pts(sym, direction)
@@ -4176,10 +4179,11 @@ def _sim_try_entry(signals: dict, regime: str, leverage: int) -> None:
         sym, direction, vol, _cv_thresh, _cv_weight, _cv_combo, gate_mode, rel_score
     )
     _bkt_c = "H" if vol > _SIM_HIGH_VOL_THRESH else "M" if vol >= _SIM_LOW_VOL_THRESH else "L"
+    _gate_tag = "anti" if (gate_mode == "relaxed" and rel_score is not None and rel_score < 0) else gate_mode[:3]
     _sim_log(
         f"🎯 SIM: {sym} {direction.upper()} conviction {conviction}/10 "
         f"(clr={vol / _cv_thresh:.1f}x wt={_cv_weight:.2f} "
-        f"bkt={_bkt_c} 15m={gate_mode[:3]})"
+        f"bkt={_bkt_c} 15m={_gate_tag})"
     )
 
     stage     = _sim.get("stage", "sprout")
