@@ -6904,23 +6904,50 @@ def _live_close_position(exit_reason: str, signals: dict) -> None:
         _live_save_state()
         return  # open_position set by reconciliation; entry guard blocks new trades if still open
 
-    # Post-close verification: check IG is actually flat before clearing state.
-    # Catches the broker-stop + internal-stop race condition where June's close order
-    # arrives after IG's broker stop already fired, creating an orphan BUY position.
-    # Runs only when the account shows margin > 0 after a confirmed close.
-    time.sleep(2)
-    _post_data = _ig_live_get("/positions/otc", version="1")
-    if _post_data is not None:
+    # Post-close verification: confirm IG is actually flat before clearing state.
+    # On 404/None the original code fell through to clearing open_position — exactly
+    # what happened during the incident. Fix: retry up to 3 times; only clear state
+    # on an explicit 200 + empty positions list. Any ambiguous response fails safe.
+    time.sleep(2)  # initial wait for IG to settle
+    _VERIFY_MAX    = 3
+    _post_resolved = False  # True only on 200 + confirmed empty positions
+    for _vi in range(_VERIFY_MAX):
+        if _vi > 0:
+            time.sleep(3)  # 3s between retries; worst-case additional wait: 6s
+        _post_data = _ig_live_get("/positions/otc", version="1")
+        if _post_data is None:
+            # 404, network error, or auth failure: ambiguous state, retry
+            _live_log(
+                f"⚠️  POST-CLOSE VERIFY attempt {_vi + 1}/{_VERIFY_MAX}: "
+                f"/positions/otc ambiguous (None) for {sym} — retrying"
+            )
+            continue
         _post_pos = _post_data.get("positions", [])
         if _post_pos:
+            # 200 with open positions: possible orphan from broker-stop race
             _live_log(
-                f"⚠️  POST-CLOSE VERIFICATION: IG still shows {len(_post_pos)} open position(s) "
-                f"after {sym} close confirm — possible broker-stop race condition. "
-                f"Running reconciliation to reconstruct state."
+                f"⚠️  POST-CLOSE VERIFICATION: IG still shows {len(_post_pos)} open "
+                f"position(s) after {sym} close confirm — possible broker-stop race. "
+                f"Running reconciliation."
             )
             _live_reconcile_positions()
             _live_save_state()
-            return  # reconciliation set open_position; do NOT clear it below
+            return  # open_position set by reconciliation; entry guard blocks new trades
+        # 200 + empty list: IG confirmed flat
+        _post_resolved = True
+        break
+
+    if not _post_resolved:
+        # All retries exhausted without a clear signal. Fail safe: preserve
+        # open_position so the entry guard blocks new trades. Manual review required.
+        _live_log(
+            f"🚨 POST-CLOSE VERIFICATION FAILED: could not confirm IG flat after "
+            f"{_VERIFY_MAX} attempts for {sym} — open_position PRESERVED. "
+            f"Manual review required. No new entries until resolved."
+        )
+        _live_save_state()
+        return  # intentionally NOT clearing open_position
+
     _live["open_position"] = None
     _live_save_state()
 
