@@ -5254,7 +5254,7 @@ def sim_startup() -> None:
             print(
                 f"[{_ts()}] 🔄 SIM FRESH START: resetting for new session "
                 f"(saved state predates {datetime.fromtimestamp(_SIM_RESET_AFTER, tz=timezone.utc).strftime('%Y-%m-%d')} cutoff) "
-                f"— preserving vol_history, win_moves, loss_moves",
+                f"— preserving vol_history, win_moves, loss_moves, 15m_reliability",
                 flush=True,
             )
             _sim.update({
@@ -5292,7 +5292,7 @@ def sim_startup() -> None:
                 "boost_expiry":         {},
                 "pause_expiry":         {},
                 "last_entry_time":      now,
-                "15m_reliability":      {},
+                "15m_reliability":      saved.get("15m_reliability", {}),
                 "vol_history":          saved.get("vol_history", {}),
                 "win_moves":            saved.get("win_moves", {}),
                 "loss_moves":           saved.get("loss_moves", {}),
