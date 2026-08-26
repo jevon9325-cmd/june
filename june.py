@@ -1326,9 +1326,15 @@ def _compute_atr_5m(sym: str) -> tuple:
 def _spread_atr_threshold(sym: str, is_fallback: bool) -> float:
     """Tiered Spread/ATR entry threshold by asset class.
     ENERGY (OIL): 0.85 | METAL (GOLD, SILVER): 0.60 | FX/EQUITY: 0.35
+    SILVER 00:00-02:59 UTC: 0.75 (overnight window; ATR briefly expands)
     +0.15 added during 1m-ATR fallback while 5m history warms up.
     """
     tier = _SPREAD_ATR_TIERS.get(_SPREAD_ATR_ASSET_CLASS.get(sym, "FX"), 0.35)
+    # 00:00-02:59 UTC: SILVER p50 ratio reaches 74-86%, justified by real data.
+    # Raise hard-block from 0.60 to 0.75 for this window only.
+    # OIL (ENERGY 0.85) and FX (0.35) tiers are untouched.
+    if sym == "SILVER" and datetime.now(timezone.utc).hour < 3:
+        tier = 0.75
     return tier + (_SPREAD_ATR_FALLBACK_BUMP if is_fallback else 0.0)
 
 
