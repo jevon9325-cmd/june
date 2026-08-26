@@ -5588,6 +5588,7 @@ _LIVE_DEF_FLOOR_USD        = 10.00  # global defensive (full >=30): half CB floo
 _LIVE_DEF_PCT              = 0.025  # global defensive (full >=30): half CB pct (5%->2.5%)
 _LIVE_DEF_INSTR_STOPOUTS   = 2      # stop-outs on one instrument before instrument-defensive
 _LIVE_DEF_TIMEOUT_SECS     = 1800   # 30-min safety valve (recovery time gate)
+_DEAL_NOT_FOUND           = {"_not_found": True}  # sentinel: returned by _ig_live_get on 404 when used in stale-dealId guards
 
 
 def _live_log(msg: str) -> None:
@@ -6797,6 +6798,25 @@ def _live_close_position(exit_reason: str, signals: dict) -> None:
     if not _live_trade_guard():  # ← structural gate
         return
 
+    # Before sending any close order, verify the dealId still exists on IG.
+    # If the broker stop fired first and closed the deal, IG opens a NEW opposing
+    # position on POST /positions/otc with forceOpen=False and the stale dealId
+    # instead of rejecting. Each retry then creates another unintended position,
+    # turning a single missed reconciliation into a multi-position cascade.
+    if deal_id:
+        _stale_chk = _ig_live_get(
+            f"/positions/otc/{deal_id}", version="1",
+            not_found_default=_DEAL_NOT_FOUND,
+        )
+        if _stale_chk is _DEAL_NOT_FOUND:
+            _live_log(
+                f"⚠️  {sym}: dealId {deal_id} not found on IG — "
+                f"stale close suppressed. Running reconciliation."
+            )
+            _live_reconcile_positions()
+            _live_save_state()
+            return
+
     # ── Real close order ──────────────────────────────────────────────────────
     close_body = {
         "epic":        epic,
@@ -7045,6 +7065,22 @@ def _live_partial_tp_exit(signals: dict) -> None:
     if not _live_trade_guard():
         return
 
+    # Same stale-dealId guard as _live_close_position: if the broker stop already
+    # closed this deal, the partial-close POST would open a new opposing position.
+    if deal_id:
+        _ptp_stale_chk = _ig_live_get(
+            f"/positions/otc/{deal_id}", version="1",
+            not_found_default=_DEAL_NOT_FOUND,
+        )
+        if _ptp_stale_chk is _DEAL_NOT_FOUND:
+            _live_log(
+                f"⚠️  {sym}: partial TP — dealId {deal_id} not found on IG — "
+                f"stale partial-close suppressed. Running reconciliation."
+            )
+            _live_reconcile_positions()
+            _live_save_state()
+            return
+
     close_body = {
         "epic":          epic,
         "expiry":        "-",
@@ -7077,6 +7113,62 @@ def _live_partial_tp_exit(signals: dict) -> None:
         # Tighten stop to breakeven (entry ± spread floor, so worst case ~flat).
         # Mirror of sim: _sim["open_position"]["stop_pct"] = _spread_flr
         _spread_flr = _sim_get_spread_floor(sym)
+
+        # Post-confirm: verify IG shows a remaining position before updating
+        # internal state. Catches broker-stop race on the partial close — same
+        # class as the post-close verification in _live_close_position (ddb7de5).
+        # Without this, a race leaves June managing a ghost half-position.
+        time.sleep(2)
+        _ptp_post = _ig_live_get("/positions/otc", version="1")
+        if _ptp_post is None:
+            _ptp_bd  = _ig_live_get("/accounts", version="1")
+            _ptp_dep = 0.0
+            if _ptp_bd is not None:
+                for _ptp_ac in _ptp_bd.get("accounts", []):
+                    if _ptp_ac.get("preferred"):
+                        _ptp_dep = float(_ptp_ac.get("balance", {}).get("deposit", 0) or 0)
+                        break
+            if _ptp_dep == 0.0:
+                _live_log(
+                    f"⚠️  PARTIAL-TP POST-VERIFY: {sym} — IG flat after partial "
+                    f"close (position fully gone). Clearing state."
+                )
+                _live["open_position"] = None
+                _live_save_state()
+                return
+            _live_log(
+                f"⚠️  PARTIAL-TP POST-VERIFY: {sym} — /positions/otc unavailable "
+                f"(deposit={_ptp_dep:.2f}>0). Proceeding with state update."
+            )
+        else:
+            _ptp_ig_pos = _ptp_post.get("positions", [])
+            if not _ptp_ig_pos:
+                _live_log(
+                    f"⚠️  PARTIAL-TP POST-VERIFY: {sym} — IG flat after partial "
+                    f"close (position fully gone). Clearing state."
+                )
+                _live["open_position"] = None
+                _live_save_state()
+                return
+            if len(_ptp_ig_pos) > 1:
+                _live_log(
+                    f"⚠️  PARTIAL-TP POST-VERIFY: {sym} — {len(_ptp_ig_pos)} IG "
+                    f"positions after partial close. Running reconciliation."
+                )
+                _live_reconcile_positions()
+                _live_save_state()
+                return
+            _ptp_ig_deal = _ptp_ig_pos[0].get("position", {}).get("dealId", "")
+            if _ptp_ig_deal and _ptp_ig_deal != deal_id:
+                _live_log(
+                    f"⚠️  PARTIAL-TP POST-VERIFY: {sym} — unexpected dealId "
+                    f"{_ptp_ig_deal} after partial close (expected {deal_id}). "
+                    f"Running reconciliation."
+                )
+                _live_reconcile_positions()
+                _live_save_state()
+                return
+            # Single position with matching dealId confirmed — proceed with update
 
         remaining_sz = round(ig_sz - half_sz, 4)
         _live["open_position"]["ig_size"]            = remaining_sz
