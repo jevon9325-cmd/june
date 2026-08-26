@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
 """
 June — IG CFD Signal Publisher (beta v0.2)
-Observer-only: polls IG demo API 24/7 on weekdays, publishes signals to Redis.
-
-No orders. No positions. No risk management.
-June watches macro instruments and reports. Others decide.
+Live CFD trading + signal intelligence bot. Scores momentum, sizes positions,
+and executes on the IG live account when june_live_enabled=true in Redis.
+Also runs a parallel simulation layer and publishes signals to Redis.
 
 Redis keys published:
   june_signals          — continuous (TTL 120s): real-time prices + momentum alerts
@@ -7824,7 +7823,7 @@ def redis_check() -> bool:
 def main():
     print("=" * 62, flush=True)
     print("  June — IG CFD Signal Publisher  beta v0.2", flush=True)
-    print("  Observer only — no orders, no positions, no risk", flush=True)
+    print("  Live trading: active when june_live_enabled=true in Redis", flush=True)
     print("  Schedule: weekdays 24h/60s | weekends paused", flush=True)
     print("  Redis keys: june_signals · morning_baseline · premarket_gaps", flush=True)
     print("              spread_baselines · overnight_context", flush=True)
