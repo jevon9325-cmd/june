@@ -5569,8 +5569,10 @@ _MPD_MIN_PROFIT_PIPS = 1   # minimum guaranteed profit in points above spread
 _PERF_BLOCK_WINDOW     = 8       # rolling window of confirmed live trades
 _PERF_BLOCK_WR_THRESH  = 0.30    # block if win rate < 30% over window
 _PERF_BLOCK_SAR_THRESH = 0.50    # block if avg Spread/ATR ratio > 50% over window
-_PERF_BLOCK_TTL           = 86400   # 24-hour block duration (seconds)
-_PERF_BLOCK_SAR_SESSION_MIN = 4       # min same-session trades before SAR block fires
+_PERF_BLOCK_TTL             = 86400  # 24-hour block duration (seconds)
+_PERF_BLOCK_SAR_SESSION_MIN = 4      # min same-session trades before SAR block fires
+_PERF_BLOCK_RECENCY_DAYS    = 14     # only trades within this window count for WR/SAR evaluation
+_PERF_BLOCK_MIN_RECENT      = 4      # min recent trades required before WR/SAR block can fire
 _LIVE_MIN_CONVICTION   = 4       # minimum conviction score for live entries; sim unaffected
 
 # Tiered defensive mode (NORMAL -> DEFENSIVE -> CB HALT) -------
@@ -6327,10 +6329,12 @@ def _live_perf_blocked(sym: str) -> bool:
 
 def _live_perf_record(sym: str, won: bool, sar) -> None:
     """Update rolling per-instrument performance stats in Redis.
-    WR block: 24h if win rate < _PERF_BLOCK_WR_THRESH over _PERF_BLOCK_WINDOW trades.
+    Each record carries an epoch timestamp. WR/SAR evaluation filters to records
+    within _PERF_BLOCK_RECENCY_DAYS and requires >= _PERF_BLOCK_MIN_RECENT recent
+    records before any block fires — pre-deposit/pre-fix history cannot contaminate.
+    WR block: 24h if win rate < _PERF_BLOCK_WR_THRESH over recent records.
     SAR block: session-scoped if avg Spread/ATR > _PERF_BLOCK_SAR_THRESH over
-    current-session trades (min _PERF_BLOCK_SAR_SESSION_MIN). Prevents stale
-    cross-session SAR values from refiring the block after a session boundary.
+    recent current-session records (min _PERF_BLOCK_SAR_SESSION_MIN).
     Called only after a confirmed IG position close.
     """
     try:
@@ -6340,27 +6344,32 @@ def _live_perf_record(sym: str, won: bool, sar) -> None:
         stats  = json.loads(raw) if raw else {"trades": []}
         trades = stats.get("trades", [])
         session = "overnight" if is_overnight() else "day"
-        trades.append({"won": won, "sar": round(sar or 0.0, 4), "session": session})
+        trades.append({"won": won, "sar": round(sar or 0.0, 4), "session": session, "epoch": int(time.time())})
         if len(trades) > _PERF_BLOCK_WINDOW:
             trades = trades[-_PERF_BLOCK_WINDOW:]
         stats["trades"] = trades
         r.set(key, json.dumps(stats))
 
-        # ── WR block (all trades in rolling window, 24h TTL) ────────────────────
-        if len(trades) >= _PERF_BLOCK_WINDOW:
-            win_rate = sum(1 for t in trades if t["won"]) / len(trades)
+        # ── Recency filter: only evaluate trades within _PERF_BLOCK_RECENCY_DAYS ─
+        cutoff = time.time() - (_PERF_BLOCK_RECENCY_DAYS * 86400)
+        recent = [t for t in trades if t.get("epoch", 0) >= cutoff]
+
+        # ── WR block (recent trades, 24h TTL) ──────────────────────────────────
+        if len(recent) >= _PERF_BLOCK_MIN_RECENT:
+            win_rate = sum(1 for t in recent if t["won"]) / len(recent)
             if win_rate < _PERF_BLOCK_WR_THRESH:
                 r.setex(f"june_perf_block_wr:{sym}", _PERF_BLOCK_TTL, "1")
                 _perf_block_cache[sym] = time.time() + 300.0
                 _live_log(
                     f"⛔ [PERF BLOCK WR] {sym}: Win rate {win_rate:.0%} below "
                     f"{_PERF_BLOCK_WR_THRESH:.0%} threshold "
-                    f"({_PERF_BLOCK_WINDOW} trades). Live trading suspended for 24h."
+                    f"({len(recent)} recent trades, {_PERF_BLOCK_RECENCY_DAYS}d window). "
+                    f"Live trading suspended for 24h."
                 )
 
-        # ── SAR block (current-session trades only, session-scoped TTL) ───────
+        # ── SAR block (recent + current-session trades, session-scoped TTL) ──
         cur_session    = "overnight" if is_overnight() else "day"
-        session_trades = [t for t in trades if t.get("session") == cur_session]
+        session_trades = [t for t in recent if t.get("session") == cur_session]
         if len(session_trades) >= _PERF_BLOCK_SAR_SESSION_MIN:
             sar_vals = [t["sar"] for t in session_trades if t["sar"] > 0]
             if sar_vals:
@@ -6372,7 +6381,7 @@ def _live_perf_record(sym: str, won: bool, sar) -> None:
                     _live_log(
                         f"⛔ [PERF BLOCK SAR] {sym}: Avg Spread/ATR {avg_sar:.0%} above "
                         f"{_PERF_BLOCK_SAR_THRESH:.0%} threshold "
-                        f"({len(session_trades)} {cur_session}-session trades). "
+                        f"({len(session_trades)} recent {cur_session}-session trades). "
                         f"Suspended until next session ({sar_ttl}s)."
                     )
 
