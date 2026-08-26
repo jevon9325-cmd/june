@@ -6905,29 +6905,60 @@ def _live_close_position(exit_reason: str, signals: dict) -> None:
         return  # open_position set by reconciliation; entry guard blocks new trades if still open
 
     # Post-close verification: confirm IG is actually flat before clearing state.
-    # On 404/None the original code fell through to clearing open_position — exactly
-    # what happened during the incident. Fix: retry up to 3 times; only clear state
-    # on an explicit 200 + empty positions list. Any ambiguous response fails safe.
+    # /positions/otc returns 404 for BOTH "genuinely flat" AND "transitional state
+    # with orphan position" — indistinguishable on 404 alone. Use account balance
+    # as discriminator: deposit=0 means no margin in use → genuinely flat.
     time.sleep(2)  # initial wait for IG to settle
     _VERIFY_MAX    = 3
-    _post_resolved = False  # True only on 200 + confirmed empty positions
+    _post_resolved = False  # True only when flat is confirmed
+
+    def _get_preferred_deposit() -> float:
+        """Return deposit of preferred account via /accounts, or -1.0 on failure."""
+        _bd = _ig_live_get("/accounts", version="1")
+        if _bd is None:
+            return -1.0
+        for _ac in _bd.get("accounts", []):
+            if _ac.get("preferred"):
+                return float(_ac.get("balance", {}).get("deposit", 0) or 0)
+        return -1.0
+
     for _vi in range(_VERIFY_MAX):
         if _vi > 0:
-            time.sleep(3)  # 3s between retries; worst-case additional wait: 6s
+            time.sleep(3)  # 3s between retries; worst-case extra: 6s
         _post_data = _ig_live_get("/positions/otc", version="1")
         if _post_data is None:
-            # 404, network error, or auth failure: ambiguous state, retry
-            _live_log(
-                f"⚠️  POST-CLOSE VERIFY attempt {_vi + 1}/{_VERIFY_MAX}: "
-                f"/positions/otc ambiguous (None) for {sym} — retrying"
-            )
-            continue
+            # 404 / network error: use balance to disambiguate
+            _dep = _get_preferred_deposit()
+            if _dep == 0.0:
+                # Balance confirms no margin in use: genuinely flat
+                _live_log(
+                    f"\u2705 POST-CLOSE VERIFY attempt {_vi + 1}/{_VERIFY_MAX}: "
+                    f"/positions/otc 404 but balance confirms deposit=0 "
+                    f"(genuinely flat) for {sym}"
+                )
+                _post_resolved = True
+                break
+            elif _dep > 0:
+                # Margin still in use: possible orphan in transitional state
+                _live_log(
+                    f"\u26a0\ufe0f  POST-CLOSE VERIFY attempt {_vi + 1}/{_VERIFY_MAX}: "
+                    f"/positions/otc 404 but deposit={_dep:.2f}>0 for {sym} "
+                    f"\u2014 possible orphan, retrying"
+                )
+                continue
+            else:
+                # Both endpoints failed: fully ambiguous, retry
+                _live_log(
+                    f"\u26a0\ufe0f  POST-CLOSE VERIFY attempt {_vi + 1}/{_VERIFY_MAX}: "
+                    f"/positions/otc AND /accounts both failed for {sym} \u2014 retrying"
+                )
+                continue
         _post_pos = _post_data.get("positions", [])
         if _post_pos:
             # 200 with open positions: possible orphan from broker-stop race
             _live_log(
-                f"⚠️  POST-CLOSE VERIFICATION: IG still shows {len(_post_pos)} open "
-                f"position(s) after {sym} close confirm — possible broker-stop race. "
+                f"\u26a0\ufe0f  POST-CLOSE VERIFICATION: IG still shows {len(_post_pos)} open "
+                f"position(s) after {sym} close confirm \u2014 possible broker-stop race. "
                 f"Running reconciliation."
             )
             _live_reconcile_positions()
@@ -6938,11 +6969,11 @@ def _live_close_position(exit_reason: str, signals: dict) -> None:
         break
 
     if not _post_resolved:
-        # All retries exhausted without a clear signal. Fail safe: preserve
-        # open_position so the entry guard blocks new trades. Manual review required.
+        # All retries exhausted AND balance showed deposit>0 on each attempt.
+        # Fail safe: preserve open_position and block new entries.
         _live_log(
-            f"🚨 POST-CLOSE VERIFICATION FAILED: could not confirm IG flat after "
-            f"{_VERIFY_MAX} attempts for {sym} — open_position PRESERVED. "
+            f"\U0001f6a8 POST-CLOSE VERIFICATION FAILED: could not confirm IG flat after "
+            f"{_VERIFY_MAX} attempts for {sym} \u2014 open_position PRESERVED. "
             f"Manual review required. No new entries until resolved."
         )
         _live_save_state()
@@ -7641,8 +7672,27 @@ def _live_reconcile_positions() -> None:
     #   Stale:  June state says open but IG shows nothing. Clears it.
     data = _ig_live_get("/positions/otc", version="1")  # 404 → None → skip, not clear
     if data is None:
-        _live_log("Reconciliation: /positions/otc error (network/auth) -- skipping")
-        return
+        # /positions/otc returned 404 or failed. Use account balance to disambiguate:
+        # deposit=0 means no margin in use -> genuinely flat (treat as empty list).
+        # deposit>0 means margin in use -> position visible soon (transitional), skip.
+        _recon_bal = _ig_live_get("/accounts", version="1")
+        if _recon_bal is not None:
+            _recon_dep = 0.0
+            for _recon_ac in _recon_bal.get("accounts", []):
+                if _recon_ac.get("preferred"):
+                    _recon_dep = float(_recon_ac.get("balance", {}).get("deposit", 0) or 0)
+                    break
+            if _recon_dep == 0.0:
+                _live_log("Reconciliation: /positions/otc 404 but balance deposit=0 "
+                          "-- treating as flat (no margin in use)")
+                data = {"positions": []}
+            else:
+                _live_log(f"Reconciliation: /positions/otc 404 but deposit={_recon_dep:.2f}>0 "
+                          f"-- possible transitional state, skipping to preserve state")
+                return
+        else:
+            _live_log("Reconciliation: /positions/otc AND /accounts both failed -- skipping")
+            return
 
     ig_positions = data.get("positions", [])
     june_pos     = _live.get("open_position")
