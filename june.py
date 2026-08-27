@@ -6809,13 +6809,75 @@ def _live_close_position(exit_reason: str, signals: dict) -> None:
             not_found_default=_DEAL_NOT_FOUND,
         )
         if _stale_chk is _DEAL_NOT_FOUND:
-            _live_log(
-                f"⚠️  {sym}: dealId {deal_id} not found on IG — "
-                f"stale close suppressed. Running reconciliation."
-            )
-            _live_reconcile_positions()
-            _live_save_state()
-            return
+            # Per-deal 404: check deposit to distinguish genuine stale (deal gone)
+            # from IG transitional state (position open but per-deal endpoint broken
+            # immediately after a DPLE stop-sync PUT).
+            _xc_acct = _ig_live_get("/accounts", version="1")
+            _xc_dep  = 0.0
+            if _xc_acct is not None:
+                for _xc_ac in _xc_acct.get("accounts", []):
+                    if _xc_ac.get("preferred"):
+                        _xc_dep = float(_xc_ac.get("balance", {}).get("deposit", 0) or 0)
+                        break
+            if _xc_dep == 0.0:
+                # Deposit zero — deal genuinely gone. Suppress and reconcile.
+                _live_log(
+                    f"⚠️  {sym}: dealId {deal_id} not found + deposit=0 — "
+                    f"stale close suppressed. Running reconciliation."
+                )
+                _live_reconcile_positions()
+                _live_save_state()
+                return
+            # Deposit >0 — position still open financially. Query positions list
+            # to check whether IG reassigned the dealId (happens after stop mods).
+            _xc_list = _ig_live_get("/positions/otc", version="1")
+            if _xc_list is None:
+                _live_log(
+                    f"⚠️  {sym}: dealId {deal_id} not found, deposit={_xc_dep:.2f}>0 "
+                    f"but list unavailable — preserving state."
+                )
+                return
+            _xc_pos = [
+                p for p in _xc_list.get("positions", [])
+                if p.get("market", {}).get("epic", "") == epic
+            ]
+            if len(_xc_pos) == 1:
+                _xc_new_id = _xc_pos[0].get("position", {}).get("dealId", "")
+                if _xc_new_id and _xc_new_id != deal_id:
+                    # IG reassigned the dealId (e.g. after stop modification).
+                    _live_log(
+                        f"⚠️  {sym}: IG reassigned dealId — "
+                        f"was {deal_id}, now {_xc_new_id}. Updating and proceeding."
+                    )
+                    _live["open_position"]["deal_id"] = _xc_new_id
+                    deal_id = _xc_new_id
+                    # Fall through to close with corrected dealId.
+                elif _xc_new_id == deal_id:
+                    # Same ID in list — per-deal endpoint temporarily broken.
+                    _live_log(
+                        f"⚠️  {sym}: per-deal 404 but position confirmed in list "
+                        f"(same ID, transitional) — proceeding with close."
+                    )
+                    # Fall through to close.
+                else:
+                    _live_log(
+                        f"⚠️  {sym}: dealId {deal_id} not found, list position has "
+                        f"empty dealId — preserving state."
+                    )
+                    return
+            else:
+                if not _xc_list.get("positions"):
+                    _live_log(
+                        f"⚠️  {sym}: dealId {deal_id} not found, list empty but "
+                        f"deposit={_xc_dep:.2f}>0 — transitional, preserving state."
+                    )
+                else:
+                    _xc_cnt = len(_xc_list.get("positions", []))
+                    _live_log(
+                        f"⚠️  {sym}: dealId {deal_id} not found, {_xc_cnt} IG position(s) "
+                        f"(no epic={epic} match) — ambiguous, preserving state."
+                    )
+                return
 
     # ── Real close order ──────────────────────────────────────────────────────
     close_body = {
@@ -7073,13 +7135,70 @@ def _live_partial_tp_exit(signals: dict) -> None:
             not_found_default=_DEAL_NOT_FOUND,
         )
         if _ptp_stale_chk is _DEAL_NOT_FOUND:
-            _live_log(
-                f"⚠️  {sym}: partial TP — dealId {deal_id} not found on IG — "
-                f"stale partial-close suppressed. Running reconciliation."
-            )
-            _live_reconcile_positions()
-            _live_save_state()
-            return
+            # Per-deal 404: same cross-check as _live_close_position.
+            _pxc_acct = _ig_live_get("/accounts", version="1")
+            _pxc_dep  = 0.0
+            if _pxc_acct is not None:
+                for _pxc_ac in _pxc_acct.get("accounts", []):
+                    if _pxc_ac.get("preferred"):
+                        _pxc_dep = float(_pxc_ac.get("balance", {}).get("deposit", 0) or 0)
+                        break
+            if _pxc_dep == 0.0:
+                # Deposit zero — deal genuinely gone. Suppress and reconcile.
+                _live_log(
+                    f"⚠️  {sym}: partial TP — dealId {deal_id} not found + deposit=0 — "
+                    f"stale partial-close suppressed. Running reconciliation."
+                )
+                _live_reconcile_positions()
+                _live_save_state()
+                return
+            # Deposit >0 — position still open. Check for dealId reassignment.
+            _pxc_list = _ig_live_get("/positions/otc", version="1")
+            if _pxc_list is None:
+                _live_log(
+                    f"⚠️  {sym}: partial TP — dealId {deal_id} not found, "
+                    f"deposit={_pxc_dep:.2f}>0 but list unavailable — preserving state."
+                )
+                return
+            _pxc_pos = [
+                p for p in _pxc_list.get("positions", [])
+                if p.get("market", {}).get("epic", "") == epic
+            ]
+            if len(_pxc_pos) == 1:
+                _pxc_new_id = _pxc_pos[0].get("position", {}).get("dealId", "")
+                if _pxc_new_id and _pxc_new_id != deal_id:
+                    _live_log(
+                        f"⚠️  {sym}: partial TP — IG reassigned dealId — "
+                        f"was {deal_id}, now {_pxc_new_id}. Updating and proceeding."
+                    )
+                    _live["open_position"]["deal_id"] = _pxc_new_id
+                    deal_id = _pxc_new_id
+                    # Fall through to partial close with corrected dealId.
+                elif _pxc_new_id == deal_id:
+                    _live_log(
+                        f"⚠️  {sym}: partial TP — per-deal 404 but position confirmed in list "
+                        f"(same ID, transitional) — proceeding with partial close."
+                    )
+                    # Fall through to partial close.
+                else:
+                    _live_log(
+                        f"⚠️  {sym}: partial TP — dealId {deal_id} not found, list position has "
+                        f"empty dealId — preserving state."
+                    )
+                    return
+            else:
+                if not _pxc_list.get("positions"):
+                    _live_log(
+                        f"⚠️  {sym}: partial TP — dealId {deal_id} not found, list empty but "
+                        f"deposit={_pxc_dep:.2f}>0 — transitional, preserving state."
+                    )
+                else:
+                    _pxc_cnt = len(_pxc_list.get("positions", []))
+                    _live_log(
+                        f"⚠️  {sym}: partial TP — dealId {deal_id} not found, {_pxc_cnt} IG position(s) "
+                        f"(no epic={epic} match) — ambiguous, preserving state."
+                    )
+                return
 
     close_body = {
         "epic":          epic,
