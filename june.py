@@ -43,6 +43,7 @@ from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
 from typing import Optional
 
+import threading
 import requests
 import redis as redis_lib
 
@@ -342,6 +343,15 @@ _THREE_WAY_GROUPS = [
 _sess: dict      = {"cst": None, "token": None, "born": 0.0}
 _live_sess: dict = {"cst": None, "token": None, "born": 0.0}
 _live_available: bool = False  # True after successful live account auth
+
+# ── Lightstreamer Phase 1 state ───────────────────────────────────────────────
+_ls_client:          object = None           # LightstreamerClient instance (or None)
+_ls_account_id:      str    = ""             # live account ID from API response
+_ls_account:         dict   = {}             # latest ACCOUNT subscription fields
+_ls_account_lock            = threading.Lock()
+_ls_connected:       bool   = False          # True when LS status starts with CONNECTED
+_ls_confirms_closed: set    = set()          # deal_ids confirmed FULLY_CLOSED via TRADE stream
+_ls_confirms_lock           = threading.Lock()
 _june_live_trading_enabled: bool = False  # kill switch: must be True via Redis to place live orders
 _live_lot_sizes: dict = {}   # sym -> IG lotSize from LIVE API (populated in _live_startup)
 _live_min_deal:  dict = {}   # sym -> minDealSize.value from LIVE API (populated in _live_startup)
@@ -604,6 +614,10 @@ def authenticate_live() -> bool:
             _live_sess["born"]  = time.time()
             _live_available = True
             acct_id   = data.get("currentAccountId", "?")
+            # Lightstreamer: start ACCOUNT+TRADE subscriptions
+            _ls_ep = data.get("lightstreamerEndpoint", "")
+            if _ls_ep and acct_id and acct_id != "?":
+                _ls_init_session(_ls_ep, _live_sess["cst"], _live_sess["token"], acct_id)
             acct_type = data.get("accountType", "?")
             avail     = data.get("accountInfo", {}).get("available", 0)
             ccy       = data.get("currencyIsoCode", "USD")
@@ -6760,6 +6774,193 @@ def _live_open_position(sym: str, direction: str, signals: dict,
     _live_save_state()
 
 
+# ── Lightstreamer Phase 1: session + dual-system position guard ───────────────
+
+def _ls_init_session(endpoint: str, cst: str, xst: str, account_id: str) -> None:
+    """Initialize or reinitialize Lightstreamer ACCOUNT+TRADE subscriptions.
+
+    Called from authenticate_live() on login and on 6h session token refresh.
+    Safe to call multiple times — disconnects old client before creating new one.
+    DISCONNECTED:WILL-RETRY is handled automatically by the LS library.
+    Terminal DISCONNECTED is resolved on the next authenticate_live() call.
+    """
+    global _ls_client, _ls_connected, _ls_account, _ls_confirms_closed, _ls_account_id
+    if not endpoint or not account_id:
+        print(f"[{_ts()}] [LS] skipped -- missing endpoint or account_id", flush=True)
+        return
+    try:
+        from lightstreamer.client import LightstreamerClient, Subscription
+    except ImportError:
+        print(f"[{_ts()}] [LS] lightstreamer-client-lib not installed -- LS disabled", flush=True)
+        return
+
+    if _ls_client is not None:
+        try:
+            _ls_client.disconnect()
+        except Exception:
+            pass
+    _ls_client     = None
+    _ls_connected  = False
+    _ls_account_id = account_id
+    with _ls_confirms_lock:
+        _ls_confirms_closed.clear()
+
+    client = LightstreamerClient(endpoint, "DEFAULT")
+    client.connectionDetails.setUser(account_id)
+    client.connectionDetails.setPassword("CST-" + cst + "|XST-" + xst)
+
+    class _ConnListener:
+        def onStatusChange(self, status: str) -> None:
+            global _ls_connected
+            _ls_connected = status.startswith("CONNECTED")
+            print(f"[{_ts()}] [LS] {status}", flush=True)
+        def onPropertyChange(self, prop: str) -> None: pass
+        def onServerError(self, code: int, msg: str) -> None:
+            print(f"[{_ts()}] [LS] server error {code}: {msg}", flush=True)
+        def onListenStart(self) -> None: pass
+        def onListenEnd(self) -> None: pass
+
+    class _AccountListener:
+        _FIELDS = ("PNL", "DEPOSIT", "AVAILABLE_CASH", "MARGIN", "EQUITY")
+        def onItemUpdate(self, update) -> None:
+            changed = {fld: update.getValue(fld)
+                       for fld in self._FIELDS if update.getValue(fld) is not None}
+            with _ls_account_lock:
+                _ls_account.update(changed)
+            parts = " ".join(k + "=" + str(v) for k, v in changed.items())
+            print(f"[{_ts()}] [LS ACCT] {parts}", flush=True)
+        def onSubscription(self) -> None:
+            print(f"[{_ts()}] [LS] ACCOUNT:{account_id} subscribed", flush=True)
+        def onUnsubscription(self) -> None: pass
+        def onSubscriptionError(self, code: int, msg: str) -> None:
+            print(f"[{_ts()}] [LS] ACCOUNT sub error {code}: {msg}", flush=True)
+        def onEndOfSnapshot(self, item: str, pos: int) -> None: pass
+        def onListenStart(self, sub) -> None: pass
+        def onListenEnd(self, sub) -> None: pass
+        def onClearSnapshot(self, item: str, pos: int) -> None: pass
+        def onLostUpdates(self, item: str, pos: int, count: int) -> None: pass
+        def onRealMaxFrequency(self, freq) -> None: pass
+
+    class _TradeListener:
+        def onItemUpdate(self, update) -> None:
+            raw = update.getValue("CONFIRMS")
+            if not raw:
+                return
+            try:
+                payload = json.loads(raw)
+                for deal in payload.get("affectedDeals") or []:
+                    if deal.get("status") == "FULLY_CLOSED":
+                        closed_id = deal.get("dealId") or ""
+                        if closed_id:
+                            with _ls_confirms_lock:
+                                _ls_confirms_closed.add(closed_id)
+                            print(
+                                f"[{_ts()}] [LS TRADE] CONFIRMS FULLY_CLOSED: {closed_id}"
+                                f" epic={payload.get('epic')} profit={payload.get('profit')}",
+                                flush=True,
+                            )
+            except (json.JSONDecodeError, AttributeError) as exc:
+                print(f"[{_ts()}] [LS TRADE] CONFIRMS parse error: {exc}", flush=True)
+        def onSubscription(self) -> None:
+            print(f"[{_ts()}] [LS] TRADE:{account_id} subscribed", flush=True)
+        def onUnsubscription(self) -> None: pass
+        def onSubscriptionError(self, code: int, msg: str) -> None:
+            print(f"[{_ts()}] [LS] TRADE sub error {code}: {msg}", flush=True)
+        def onEndOfSnapshot(self, item: str, pos: int) -> None:
+            print(f"[{_ts()}] [LS] TRADE snapshot complete", flush=True)
+        def onListenStart(self, sub) -> None: pass
+        def onListenEnd(self, sub) -> None: pass
+        def onClearSnapshot(self, item: str, pos: int) -> None: pass
+        def onLostUpdates(self, item: str, pos: int, count: int) -> None: pass
+        def onRealMaxFrequency(self, freq) -> None: pass
+
+    client.addListener(_ConnListener())
+
+    acct_sub = Subscription("MERGE", ["ACCOUNT:" + account_id],
+                            ["PNL", "DEPOSIT", "AVAILABLE_CASH", "MARGIN", "EQUITY"])
+    acct_sub.addListener(_AccountListener())
+    client.subscribe(acct_sub)
+
+    trade_sub = Subscription("DISTINCT", ["TRADE:" + account_id], ["CONFIRMS", "OPU", "WOU"])
+    trade_sub.addListener(_TradeListener())
+    client.subscribe(trade_sub)
+
+    client.connect()
+    _ls_client = client
+    print(f"[{_ts()}] [LS] initialized: ACCOUNT+TRADE for {account_id} @ {endpoint}", flush=True)
+
+
+def _ls_get_margin() -> Optional[float]:
+    """Real-time MARGIN from LS ACCOUNT subscription, or None if not connected/received."""
+    if not _ls_connected:
+        return None
+    with _ls_account_lock:
+        raw = _ls_account.get("MARGIN")
+    if raw is None:
+        return None
+    try:
+        return float(raw)
+    except (ValueError, TypeError):
+        return None
+
+
+def _ls_deal_closed(deal_id: str) -> bool:
+    """True if LS TRADE stream confirmed deal_id as FULLY_CLOSED."""
+    with _ls_confirms_lock:
+        return deal_id in _ls_confirms_closed
+
+
+def _ls_position_guard_check(sym: str, deal_id: str) -> tuple:
+    """Dual-system pre-send guard: LS primary, REST fallback, disagreement detection.
+
+    Always runs both systems when LS is live so disagreements surface immediately.
+    On disagreement: sets manual_review_required and returns (True, "DISAGREEMENT").
+
+    Return codes:
+      (True/False, "LS+REST")       both agree
+      (True/False, "LS-only")       LS live, REST unavailable
+      (True/False, "REST-fallback") LS offline, REST answered
+      (True,       "DISAGREEMENT")  systems disagree -- manual_review_required set
+      (None,       "unavailable")   both systems failed
+    """
+    ls_margin = _ls_get_margin()
+
+    # Always run REST too when LS is live -- needed for disagreement detection
+    rest_dep: Optional[float] = None
+    _acct_data = _ig_live_get("/accounts", version="1")
+    if _acct_data is not None:
+        for _ac in _acct_data.get("accounts", []):
+            if _ac.get("preferred"):
+                rest_dep = float(_ac.get("balance", {}).get("deposit", 0) or 0)
+                break
+
+    if ls_margin is not None and rest_dep is not None:
+        ls_open   = ls_margin > 0
+        rest_open = rest_dep  > 0
+        if ls_open != rest_open:
+            _live_log(
+                f"POSITION GUARD DISAGREEMENT [{sym}]: "
+                f"LS margin={ls_margin:.2f} ({'open' if ls_open else 'flat'}) "
+                f"vs REST deposit={rest_dep:.2f} ({'open' if rest_open else 'flat'}) "
+                f"-- treating as OPEN (cautious). Setting manual_review_required."
+            )
+            _live["manual_review_required"] = True
+            _live_save_state()
+            return (True, "DISAGREEMENT")
+        return (ls_open, "LS+REST")
+
+    if ls_margin is not None:
+        return (ls_margin > 0, "LS-only")
+
+    if rest_dep is not None:
+        _live_log(
+            f"[{sym}] [guard] LS offline -- deposit REST fallback (deposit={rest_dep:.2f})"
+        )
+        return (rest_dep > 0, "REST-fallback")
+
+    return (None, "unavailable")
+
+
 def _live_close_position(exit_reason: str, signals: dict) -> None:
     """Close the current live position via an opposing IG market order.
 
@@ -6811,26 +7012,25 @@ def _live_close_position(exit_reason: str, signals: dict) -> None:
                 f"reconciliation (cascade protection). No orders until IG flat confirmed."
             )
             return
-        _pre_acct = _ig_live_get("/accounts", version="1")
-        if _pre_acct is None:
+        _guard_open, _guard_src = _ls_position_guard_check(sym, deal_id)
+        if _guard_src == "DISAGREEMENT":
+            return  # manual_review_required already set inside _ls_position_guard_check
+        if _guard_open is None:
             _live_log(
-                f"⚠️  {sym}: /accounts unavailable before close — preserving state (cautious)."
+                f"⚠️  {sym}: both LS and /accounts unavailable before close — "
+                f"preserving state (cautious)."
             )
             return
-        _pre_dep = 0.0
-        for _pre_ac in _pre_acct.get("accounts", []):
-            if _pre_ac.get("preferred"):
-                _pre_dep = float(_pre_ac.get("balance", {}).get("deposit", 0) or 0)
-                break
-        if _pre_dep == 0.0:
+        if not _guard_open:
             _live_log(
-                f"⚠️  {sym}: deposit=0 before close — "
-                f"position already gone. Suppressed. Reconciling."
+                f"⚠️  {sym}: position already gone [{_guard_src}] — "
+                f"suppressed. Reconciling."
             )
             _live_reconcile_positions()
             _live_save_state()
             return
-        # Deposit > 0 → margin in use → position is open. Proceed with close.
+        _live_log(f"[pre-send guard: position open [{_guard_src}]] proceeding with close")
+        # Position confirmed open. Proceed with close order.
 
     # ── Real close order ──────────────────────────────────────────────────────
     close_body = {
@@ -7093,27 +7293,25 @@ def _live_partial_tp_exit(signals: dict) -> None:
                 f"blocked pending reconciliation."
             )
             return
-        _ptp_pre_acct = _ig_live_get("/accounts", version="1")
-        if _ptp_pre_acct is None:
+        _ptp_guard_open, _ptp_guard_src = _ls_position_guard_check(sym, deal_id)
+        if _ptp_guard_src == "DISAGREEMENT":
+            return  # manual_review_required already set
+        if _ptp_guard_open is None:
             _live_log(
-                f"⚠️  {sym}: partial TP — /accounts unavailable before close — "
+                f"⚠️  {sym}: partial TP — both LS and /accounts unavailable — "
                 f"preserving state."
             )
             return
-        _ptp_pre_dep = 0.0
-        for _ptp_pre_ac in _ptp_pre_acct.get("accounts", []):
-            if _ptp_pre_ac.get("preferred"):
-                _ptp_pre_dep = float(_ptp_pre_ac.get("balance", {}).get("deposit", 0) or 0)
-                break
-        if _ptp_pre_dep == 0.0:
+        if not _ptp_guard_open:
             _live_log(
-                f"⚠️  {sym}: partial TP — deposit=0 before close — "
-                f"position already gone. Suppressed. Reconciling."
+                f"⚠️  {sym}: partial TP — position already gone [{_ptp_guard_src}] — "
+                f"suppressed. Reconciling."
             )
             _live_reconcile_positions()
             _live_save_state()
             return
-        # Deposit > 0 → position is open. Proceed with partial close.
+        _live_log(f"[partial TP guard: position open [{_ptp_guard_src}]] proceeding")
+        # Position confirmed open. Proceed with partial close.
 
     close_body = {
         "epic":          epic,
