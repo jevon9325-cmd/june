@@ -6457,7 +6457,9 @@ def _live_compute_ig_size(sym: str, desired_notional_usd: float, mid_price: floa
             return 0.0
         sized = round(desired_notional_usd / unit_val, 2)
     else:
-        unit_val = lot_sz * price_usd
+        # IG P&L uses native price points; price_unit in denominator gives 100x over-sizing for
+        # OIL/SILVER where pip_sz=0.01 (ratio = desired_notional * stop_pct / pip_sz vs intended = * stop_pct).
+        unit_val = lot_sz * mid_price
         if unit_val <= 0:
             return 0.0
         sized = round(desired_notional_usd / unit_val, 2)
