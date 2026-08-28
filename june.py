@@ -6341,14 +6341,136 @@ def _live_perf_blocked(sym: str) -> bool:
     return False
 
 
-def _live_perf_record(sym: str, won: bool, sar) -> None:
+def _live_get_observer(sym: str):
+    """Return 'light', 'moderate', or None."""
+    try:
+        v = _redis().get(f"june_observer:{sym}")
+        return v.decode() if v else None
+    except Exception:
+        return None
+
+def _live_set_observer(sym: str, tier: str) -> None:
+    try:
+        _redis().set(f"june_observer:{sym}", tier)
+    except Exception as exc:
+        _live_log(f"[observer_set] {sym}: Redis error — {exc}")
+
+def _live_clear_observer(sym: str) -> None:
+    try:
+        _redis().delete(f"june_observer:{sym}")
+    except Exception as exc:
+        _live_log(f"[observer_clear] {sym}: Redis error — {exc}")
+
+def _live_perf_last_won(sym: str) -> bool:
+    """Return True if the most recent recorded live trade for sym was a win."""
+    try:
+        import json as _json
+        raw = _redis().get(f"june_perf_stats:{sym}")
+        if raw:
+            trades = _json.loads(raw).get("trades", [])
+            if trades:
+                return bool(trades[-1].get("won", False))
+    except Exception:
+        pass
+    return False
+
+def _live_migrate_perf_blocks() -> None:
+    """On startup: re-evaluate all instruments under new severity tiers.
+    Clears old 24h WR blocks that do not meet hard-block criteria.
+    Sets observer keys for instruments that qualify as observer tiers.
+    """
+    import json as _json, time as _time
+    r = _redis()
+    try:
+        keys = r.keys("june_perf_block_wr:*")
+    except Exception as exc:
+        _live_log(f"[migrate_perf] Redis error listing keys: {exc}")
+        return
+
+    for key in keys:
+        sym = key.decode().split(":", 1)[1] if isinstance(key, bytes) else key.split(":", 1)[1]
+        try:
+            raw = r.get(f"june_perf_stats:{sym}")
+            trades = _json.loads(raw).get("trades", []) if raw else []
+        except Exception:
+            trades = []
+
+        cutoff = _time.time() - _PERF_BLOCK_RECENCY_DAYS * 86400
+        recent = [t for t in trades if t.get("epoch", 0) >= cutoff]
+        n = len(recent)
+        wins = sum(1 for t in recent if t.get("won"))
+        wr = wins / n if n > 0 else 1.0
+        net_loss_dollar = sum(
+            abs(t.get("pnl_dollar", 0.0))
+            for t in recent if t.get("pnl_dollar", 0.0) < 0
+        )
+
+        try:
+            bal_raw = r.get("june_balance")
+            balance = float(bal_raw) if bal_raw else 1000.0
+        except Exception:
+            balance = 1000.0
+        loss_pct = net_loss_dollar / balance if balance > 0 else 0.0
+
+        qualifies_hard = (
+            n >= _PERF_BLOCK_HARD_MIN_TRADES
+            and wr < _PERF_BLOCK_HARD_WR_THRESH
+            and loss_pct > _PERF_BLOCK_HARD_LOSS_PCT
+        )
+        qualifies_obs_moderate = (
+            n >= _PERF_BLOCK_MIN_RECENT
+            and wr < _PERF_BLOCK_WR_THRESH
+            and loss_pct >= _PERF_BLOCK_OBS_LIGHT_PCT
+        )
+        qualifies_obs_light = (
+            n >= _PERF_BLOCK_MIN_RECENT
+            and wr < _PERF_BLOCK_WR_THRESH
+            and loss_pct > 0
+        )
+
+        if qualifies_hard:
+            r.expire(key, _PERF_BLOCK_HARD_TTL)
+            _live_log(
+                f"[migrate_perf] {sym}: old WR block KEPT as HARD "
+                f"(n={n}, WR={wr:.0%}, loss={loss_pct:.1%}), TTL reset to 12h"
+            )
+        else:
+            try:
+                r.delete(key)
+            except Exception:
+                pass
+            existing_obs = _live_get_observer(sym)
+            if existing_obs:
+                _live_log(
+                    f"[migrate_perf] {sym}: old WR block cleared; "
+                    f"observer-{existing_obs} already set"
+                )
+            elif qualifies_obs_moderate:
+                _live_set_observer(sym, "moderate")
+                _live_log(
+                    f"[migrate_perf] {sym}: old WR block cleared -> observer-MODERATE "
+                    f"(n={n}, WR={wr:.0%}, loss={loss_pct:.1%})"
+                )
+            elif qualifies_obs_light:
+                _live_set_observer(sym, "light")
+                _live_log(
+                    f"[migrate_perf] {sym}: old WR block cleared -> observer-LIGHT "
+                    f"(n={n}, WR={wr:.0%}, loss={loss_pct:.1%})"
+                )
+            else:
+                _live_log(
+                    f"[migrate_perf] {sym}: old WR block cleared — no observer tier qualifies "
+                    f"(n={n}, WR={wr:.0%}, loss={loss_pct:.1%})"
+                )
+
+def _live_perf_record(sym: str, won: bool, sar, pnl_dollar: float = 0.0) -> None:
     """Update rolling per-instrument performance stats in Redis.
-    Each record carries an epoch timestamp. WR/SAR evaluation filters to records
-    within _PERF_BLOCK_RECENCY_DAYS and requires >= _PERF_BLOCK_MIN_RECENT recent
-    records before any block fires — pre-deposit/pre-fix history cannot contaminate.
-    WR block: 24h if win rate < _PERF_BLOCK_WR_THRESH over recent records.
-    SAR block: session-scoped if avg Spread/ATR > _PERF_BLOCK_SAR_THRESH over
-    recent current-session records (min _PERF_BLOCK_SAR_SESSION_MIN).
+    Each record carries epoch timestamp and dollar P&L.
+    Severity tiers keyed to % of current balance lost:
+      Observer Light    -- WR < 30%, >= 8 recent, net loss > 0% (< 3%)
+      Observer Moderate -- WR < 30%, >= 8 recent, net loss >= 3%
+      Hard Block        -- WR < 20%, >= 12 recent, net loss > 7%, 12h TTL
+    SAR block logic unchanged.
     Called only after a confirmed IG position close.
     """
     try:
@@ -6358,30 +6480,65 @@ def _live_perf_record(sym: str, won: bool, sar) -> None:
         stats  = json.loads(raw) if raw else {"trades": []}
         trades = stats.get("trades", [])
         session = "overnight" if is_overnight() else "day"
-        trades.append({"won": won, "sar": round(sar or 0.0, 4), "session": session, "epoch": int(time.time())})
-        if len(trades) > _PERF_BLOCK_WINDOW:
-            trades = trades[-_PERF_BLOCK_WINDOW:]
+        trades.append({
+            "won": won,
+            "sar": round(sar or 0.0, 4),
+            "session": session,
+            "epoch": int(time.time()),
+            "pnl_dollar": round(pnl_dollar, 4),
+        })
+        keep = max(_PERF_BLOCK_WINDOW, _PERF_BLOCK_HARD_MIN_TRADES)
+        if len(trades) > keep:
+            trades = trades[-keep:]
         stats["trades"] = trades
         r.set(key, json.dumps(stats))
 
-        # ── Recency filter: only evaluate trades within _PERF_BLOCK_RECENCY_DAYS ─
+        # ── Recency filter ─────────────────────────────────────────────────────────────────────────
         cutoff = time.time() - (_PERF_BLOCK_RECENCY_DAYS * 86400)
         recent = [t for t in trades if t.get("epoch", 0) >= cutoff]
+        n = len(recent)
+        wins = sum(1 for t in recent if t.get("won"))
+        wr = wins / n if n > 0 else 1.0
 
-        # ── WR block (recent trades, 24h TTL) ──────────────────────────────────
-        if len(recent) >= _PERF_BLOCK_MIN_RECENT:
-            win_rate = sum(1 for t in recent if t["won"]) / len(recent)
-            if win_rate < _PERF_BLOCK_WR_THRESH:
-                r.setex(f"june_perf_block_wr:{sym}", _PERF_BLOCK_TTL, "1")
+        # Net loss in dollars over recent window
+        net_loss_dollar = sum(
+            abs(t.get("pnl_dollar", 0.0))
+            for t in recent if t.get("pnl_dollar", 0.0) < 0
+        )
+        try:
+            bal_raw = r.get("june_balance")
+            balance = float(bal_raw) if bal_raw else 1000.0
+        except Exception:
+            balance = 1000.0
+        loss_pct = net_loss_dollar / balance if balance > 0 else 0.0
+
+        # ── WR severity tiers ─────────────────────────────────────────────────────────────────────────────
+        if n >= _PERF_BLOCK_MIN_RECENT and wr < _PERF_BLOCK_WR_THRESH:
+            if (n >= _PERF_BLOCK_HARD_MIN_TRADES
+                    and wr < _PERF_BLOCK_HARD_WR_THRESH
+                    and loss_pct > _PERF_BLOCK_HARD_LOSS_PCT):
+                r.setex(f"june_perf_block_wr:{sym}", _PERF_BLOCK_HARD_TTL, "hard")
+                _live_clear_observer(sym)
                 _perf_block_cache[sym] = time.time() + 300.0
                 _live_log(
-                    f"⛔ [PERF BLOCK WR] {sym}: Win rate {win_rate:.0%} below "
-                    f"{_PERF_BLOCK_WR_THRESH:.0%} threshold "
-                    f"({len(recent)} recent trades, {_PERF_BLOCK_RECENCY_DAYS}d window). "
-                    f"Live trading suspended for 24h."
+                    f"⛔ [PERF HARD BLOCK] {sym}: WR {wr:.0%} < {_PERF_BLOCK_HARD_WR_THRESH:.0%}, "
+                    f"loss {loss_pct:.1%} > {_PERF_BLOCK_HARD_LOSS_PCT:.0%} "
+                    f"({n} recent trades). Suspended 12h."
+                )
+            elif loss_pct >= _PERF_BLOCK_OBS_LIGHT_PCT:
+                _live_set_observer(sym, "moderate")
+                _live_log(
+                    f"🟡 [OBSERVER MODERATE] {sym}: WR {wr:.0%}, "
+                    f"loss {loss_pct:.1%} ({n} trades). Conviction floor x2, size x0.7."
+                )
+            else:
+                _live_set_observer(sym, "light")
+                _live_log(
+                    f"🟠 [OBSERVER LIGHT] {sym}: WR {wr:.0%}, "
+                    f"loss {loss_pct:.1%} ({n} trades). Conviction floor x1.5."
                 )
 
-        # ── SAR block (recent + current-session trades, session-scoped TTL) ──
+        # ── SAR block (session-scoped TTL) ───────────────────────────────────────────────────────────
         cur_session    = "overnight" if is_overnight() else "day"
         session_trades = [t for t in recent if t.get("session") == cur_session]
         if len(session_trades) >= _PERF_BLOCK_SAR_SESSION_MIN:
@@ -6401,7 +6558,6 @@ def _live_perf_record(sym: str, won: bool, sar) -> None:
 
     except Exception as exc:
         _live_log(f"[perf_record] {sym}: Redis error — {exc}")
-
 
 def _live_has_boost(combo: str) -> bool:
     """Live-specific boost tracking — separate from sim's boost_expiry."""
@@ -7104,7 +7260,7 @@ def _live_close_position(exit_reason: str, signals: dict) -> None:
             if won: _live["short_wins"] = _live.get("short_wins", 0) + 1
 
         _live_update_streak(sym, dirn, won)
-        _live_perf_record(sym, won, sig.get("spread_atr_ratio"))
+        _live_perf_record(sym, won, sig.get("spread_atr_ratio"), pnl_dollar=net_dollar)
         _sim_15m_record(sym, dirn, pos.get("entry_change_15m") or 0.0, won)
         # After stop_loss: block the stopped direction for 10 min (same-dir cooldown)
         # and block ALL directions on this instrument for 15 min (instrument cooldown).
@@ -7927,10 +8083,25 @@ def _live_try_entry(signals: dict, regime: str) -> None:
     # Conviction floor — applied only in DEFENSIVE mode (global or instrument-level).
     # In NORMAL mode, all conviction levels are permitted.
     _in_defensive = (_gmode == "defensive" or _imode == "defensive")
-    if _in_defensive and conv < _LIVE_MIN_CONVICTION:
+    _observer_key = _live_get_observer(sym)
+    _observer_mult = {"light": 1.5, "moderate": 2.0}.get(_observer_key, 0.0)
+    _obs_floor = (_LIVE_MIN_CONVICTION * _observer_mult) if _observer_mult > 0 else 0.0
+    _def_floor = _LIVE_MIN_CONVICTION if _in_defensive else 0.0
+    _eff_conv_floor = max(_obs_floor, _def_floor)
+    # Dynamic exit: score clears raised observer floor AND last trade was a win
+    if _observer_key and _obs_floor > 0 and conv >= _obs_floor:
+        if _live_perf_last_won(sym):
+            _live_clear_observer(sym)
+            _observer_key = None
+            _eff_conv_floor = _def_floor
+            _live_log(f"🟢 [OBSERVER LIFTED] {sym}: score {conv}/10 cleared floor, last trade won")
+    if _eff_conv_floor > 0 and conv < _eff_conv_floor:
+        _floor_parts = []
+        if _observer_key: _floor_parts.append(f"observer-{_observer_key}")
+        if _in_defensive: _floor_parts.append(f"defensive[g={_gmode} i={_imode}]")
         _live_log(
-            f"skip {sym}: conviction {conv}/10 below DEFENSIVE floor "
-            f"{_LIVE_MIN_CONVICTION}/10 [global={_gmode} instr={_imode}]"
+            f"skip {sym}: conviction {conv}/10 below floor {_eff_conv_floor:.0f}/10 "
+            f"[{'+'.join(_floor_parts)}]"
         )
         return
     lev     = _sim_conviction_leverage("sprout", conv)
@@ -7962,6 +8133,13 @@ def _live_try_entry(signals: dict, regime: str) -> None:
         f"🤝 [CONFLUENCE] {sym}: Local={direction}, Macro={_claudia_label}"
         f" ({_conf_note}) | Sizing scaled to {_macro_scale}x"
     )
+
+    # Observer Moderate: reduce position size 0.7x (light does not affect size)
+    if _observer_key == "moderate":
+        pos_size = max(2.0, round(pos_size * 0.7, 2))
+        notional = pos_size * lev
+        _live_log(f"  📉 Observer MODERATE: position scaled x0.70 -> ${pos_size:.2f}")
+
 
     # Check IG minimum feasibility
     if not _sim_check_min_feasible(sym, pos_size, lev):
@@ -8289,6 +8467,7 @@ def _live_startup() -> None:
 
     # Startup reconciliation: compare June state against IG real open positions
     _live_reconcile_positions()
+    _live_migrate_perf_blocks()
 
     _live_save_state()
 
