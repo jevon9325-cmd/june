@@ -6410,11 +6410,9 @@ def _live_migrate_perf_blocks() -> None:
             for t in recent if t.get("pnl_dollar", 0.0) < 0
         )
 
-        try:
-            bal_raw = r.get("june_balance")
-            balance = float(bal_raw) if bal_raw else 1000.0
-        except Exception:
-            balance = 1000.0
+        balance = _live.get("balance", 0.0)
+        if balance <= 0:
+            _live_log(f"[migrate_perf] {sym}: live balance unavailable — loss_pct unknown, pnl_known_count guards observer tier")
         loss_pct = net_loss_dollar / balance if balance > 0 else 0.0
 
         qualifies_hard = (
@@ -6512,11 +6510,9 @@ def _live_perf_record(sym: str, won: bool, sar, pnl_dollar: float = 0.0) -> None
             abs(t.get("pnl_dollar", 0.0))
             for t in recent if t.get("pnl_dollar", 0.0) < 0
         )
-        try:
-            bal_raw = r.get("june_balance")
-            balance = float(bal_raw) if bal_raw else 1000.0
-        except Exception:
-            balance = 1000.0
+        balance = _live.get("balance", 0.0)
+        if balance <= 0:
+            _live_log(f"[perf_record] {sym}: live balance unavailable — loss_pct unknown, pnl_known_count guards observer tier")
         loss_pct = net_loss_dollar / balance if balance > 0 else 0.0
 
         # ── WR severity tiers ─────────────────────────────────────────────────────────────────────────────
