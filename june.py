@@ -5586,7 +5586,7 @@ _PERF_BLOCK_SAR_THRESH = 0.50    # block if avg Spread/ATR ratio > 50% over wind
 _PERF_BLOCK_TTL             = 86400  # 24-hour block duration (seconds)
 _PERF_BLOCK_SAR_SESSION_MIN = 4      # min same-session trades before SAR block fires
 _PERF_BLOCK_RECENCY_DAYS    = 14     # only trades within this window count for WR/SAR evaluation
-_PERF_BLOCK_MIN_RECENT      = 4      # min recent trades required before WR/SAR block can fire
+_PERF_BLOCK_MIN_RECENT      = 8      # min recent trades required before WR block can fire (= full rolling window)
 _LIVE_MIN_CONVICTION   = 4       # minimum conviction score for live entries; sim unaffected
 
 # Tiered defensive mode (NORMAL -> DEFENSIVE -> CB HALT) -------
