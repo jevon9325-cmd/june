@@ -7146,6 +7146,7 @@ def _live_close_position(exit_reason: str, signals: dict) -> None:
     time.sleep(2)  # initial wait for IG to settle
     _VERIFY_MAX    = 3
     _post_resolved = False  # True only when flat is confirmed
+    _pv_deal_id    = deal_id  # captured for LS confirms check inside loop
 
     def _get_preferred_deposit() -> float:
         """Return deposit of preferred account via /accounts, or -1.0 on failure."""
@@ -7157,37 +7158,84 @@ def _live_close_position(exit_reason: str, signals: dict) -> None:
                 return float(_ac.get("balance", {}).get("deposit", 0) or 0)
         return -1.0
 
+    def _post_dual_verify(_vi_n: int) -> Optional[bool]:
+        """Dual-system flat check (LS + REST) for post-close 404 disambiguation.
+
+        Mirrors _ls_position_guard_check philosophy: always run both when LS is
+        live so disagreements surface immediately. Routes disagreement into the
+        existing manual_review_required path rather than building new logic.
+
+        Returns True=flat confirmed, False=blocked (disagreement), None=retry.
+        """
+        _ls_m  = _ls_get_margin()
+        _ls_cl = _ls_deal_closed(_pv_deal_id) if _pv_deal_id else False
+        _dep   = _get_preferred_deposit()
+        _ls_ok = _ls_m is not None
+        _rs_ok = _dep >= 0.0
+        _ls_flat = _ls_ok and (_ls_m == 0.0 or _ls_cl)
+        _rs_flat = _rs_ok and _dep == 0.0
+        if _ls_ok and _rs_ok:
+            if _ls_flat and _rs_flat:
+                _live_log(
+                    f"\u2705 POST-CLOSE VERIFY {_vi_n}/{_VERIFY_MAX}: "
+                    f"LS+REST agree flat (margin={_ls_m:.2f}, deposit={_dep:.2f}) for {sym}"
+                )
+                return True
+            if not _ls_flat and not _rs_flat:
+                _live_log(
+                    f"\u26a0\ufe0f  POST-CLOSE VERIFY {_vi_n}/{_VERIFY_MAX}: "
+                    f"LS+REST both open (margin={_ls_m:.2f}, deposit={_dep:.2f}) for {sym}"
+                    f" \u2014 retrying"
+                )
+                return None
+            # Disagreement \u2014 route into existing manual_review_required path
+            _live_log(
+                f"\U0001f6a8 POST-CLOSE VERIFY {_vi_n}/{_VERIFY_MAX}: LS/REST DISAGREEMENT "
+                f"margin={_ls_m:.2f} closed={_ls_cl} vs deposit={_dep:.2f} [{sym}]"
+                f" \u2014 setting manual_review_required (cautious)."
+            )
+            _live["manual_review_required"] = True
+            _live_save_state()
+            return False
+        if _ls_ok:
+            if _ls_flat:
+                _live_log(
+                    f"\u2705 POST-CLOSE VERIFY {_vi_n}/{_VERIFY_MAX}: "
+                    f"LS-only flat (margin={_ls_m:.2f}, REST unavailable) for {sym}"
+                )
+                return True
+            return None
+        if _rs_ok:
+            if _rs_flat:
+                _live_log(
+                    f"\u2705 POST-CLOSE VERIFY {_vi_n}/{_VERIFY_MAX}: "
+                    f"REST deposit=0 flat confirm for {sym}"
+                )
+                return True
+            _live_log(
+                f"\u26a0\ufe0f  POST-CLOSE VERIFY {_vi_n}/{_VERIFY_MAX}: "
+                f"deposit={_dep:.2f}>0 for {sym} \u2014 retrying"
+            )
+            return None
+        _live_log(
+            f"\u26a0\ufe0f  POST-CLOSE VERIFY {_vi_n}/{_VERIFY_MAX}: "
+            f"LS AND REST both failed for {sym} \u2014 retrying"
+        )
+        return None
+
     for _vi in range(_VERIFY_MAX):
         if _vi > 0:
             time.sleep(3)  # 3s between retries; worst-case extra: 6s
         _post_data = _ig_live_get("/positions/otc", version="1")
         if _post_data is None:
-            # 404 / network error: use balance to disambiguate
-            _dep = _get_preferred_deposit()
-            if _dep == 0.0:
-                # Balance confirms no margin in use: genuinely flat
-                _live_log(
-                    f"\u2705 POST-CLOSE VERIFY attempt {_vi + 1}/{_VERIFY_MAX}: "
-                    f"/positions/otc 404 but balance confirms deposit=0 "
-                    f"(genuinely flat) for {sym}"
-                )
+            # 404 / network error: dual-system disambiguation (LS primary + REST fallback)
+            _pv_r = _post_dual_verify(_vi + 1)
+            if _pv_r is True:
                 _post_resolved = True
                 break
-            elif _dep > 0:
-                # Margin still in use: possible orphan in transitional state
-                _live_log(
-                    f"\u26a0\ufe0f  POST-CLOSE VERIFY attempt {_vi + 1}/{_VERIFY_MAX}: "
-                    f"/positions/otc 404 but deposit={_dep:.2f}>0 for {sym} "
-                    f"\u2014 possible orphan, retrying"
-                )
-                continue
-            else:
-                # Both endpoints failed: fully ambiguous, retry
-                _live_log(
-                    f"\u26a0\ufe0f  POST-CLOSE VERIFY attempt {_vi + 1}/{_VERIFY_MAX}: "
-                    f"/positions/otc AND /accounts both failed for {sym} \u2014 retrying"
-                )
-                continue
+            if _pv_r is False:
+                return  # manual_review_required already set inside _post_dual_verify
+            continue
         _post_pos = _post_data.get("positions", [])
         if _post_pos:
             # 200 with open positions: possible orphan from broker-stop race
@@ -7472,6 +7520,21 @@ def _live_check_exit(signals: dict, regime: str) -> None:
     sym       = pos["instrument"]
     hold_sec  = time.time() - pos.get("entry_time", time.time())
     dirn      = pos["direction"]
+
+    # ── Proactive LS broker-stop detection ───────────────────────────────────
+    # TRADE stream fires FULLY_CLOSED on broker stop/TP — detect it here so
+    # state is reconciled in the same cycle instead of waiting for the next
+    # REST-based detection pass. _ls_deal_closed() is a lock-protected set
+    # lookup (no I/O) so this adds negligible overhead every cycle.
+    _ls_chk_id = pos.get("deal_id", "")
+    if _ls_chk_id and _ls_deal_closed(_ls_chk_id):
+        _live_log(
+            f"[LS] {sym}: TRADE stream confirmed FULLY_CLOSED deal={_ls_chk_id} "
+            f"— reconciling state (broker stop/TP detected proactively)"
+        )
+        _live_reconcile_positions()
+        _live_save_state()
+        return
 
     # Max hold — always fires regardless of price availability
     if hold_sec >= _SIM_MAX_HOLD_SECS:
