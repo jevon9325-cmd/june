@@ -6422,10 +6422,11 @@ def _live_migrate_perf_blocks() -> None:
             and wr < _PERF_BLOCK_WR_THRESH
             and loss_pct >= _PERF_BLOCK_OBS_LIGHT_PCT
         )
+        pnl_known_count = sum(1 for t in recent if "pnl_dollar" in t)
         qualifies_obs_light = (
             n >= _PERF_BLOCK_MIN_RECENT
             and wr < _PERF_BLOCK_WR_THRESH
-            and loss_pct > 0
+            and (loss_pct > 0 or pnl_known_count == 0)
         )
 
         if qualifies_hard:
@@ -6453,9 +6454,10 @@ def _live_migrate_perf_blocks() -> None:
                 )
             elif qualifies_obs_light:
                 _live_set_observer(sym, "light")
+                _note = " [loss unknown — pre-fix records]" if pnl_known_count == 0 else f" loss={loss_pct:.1%}"
                 _live_log(
                     f"[migrate_perf] {sym}: old WR block cleared -> observer-LIGHT "
-                    f"(n={n}, WR={wr:.0%}, loss={loss_pct:.1%})"
+                    f"(n={n}, WR={wr:.0%},{_note})"
                 )
             else:
                 _live_log(
