@@ -5587,6 +5587,11 @@ _PERF_BLOCK_TTL             = 86400  # 24-hour block duration (seconds)
 _PERF_BLOCK_SAR_SESSION_MIN = 4      # min same-session trades before SAR block fires
 _PERF_BLOCK_RECENCY_DAYS    = 14     # only trades within this window count for WR/SAR evaluation
 _PERF_BLOCK_MIN_RECENT      = 8      # min recent trades required before WR block can fire (= full rolling window)
+_PERF_BLOCK_HARD_MIN_TRADES = 12     # stricter minimum for hard 12h block
+_PERF_BLOCK_HARD_WR_THRESH  = 0.20   # hard block if WR < 20%
+_PERF_BLOCK_HARD_LOSS_PCT   = 0.07   # hard block if net dollar loss > 7% of balance
+_PERF_BLOCK_HARD_TTL        = 43200  # 12-hour hard block duration
+_PERF_BLOCK_OBS_LIGHT_PCT   = 0.03   # observer-moderate threshold: net loss >= 3% of balance
 _LIVE_MIN_CONVICTION   = 4       # minimum conviction score for live entries; sim unaffected
 
 # Tiered defensive mode (NORMAL -> DEFENSIVE -> CB HALT) -------
