@@ -6160,13 +6160,21 @@ def _live_fetch_market_data(sym: str, epic: str) -> bool:
     _live_pip_sizes[sym]  = pip_sz
     _live_price_unit[sym] = price_unit
     _live_margin[sym]     = margin_rate
-    _ms_obj = deal.get("minNormalStopOrLimitDistance") or {}
-    _live_min_stop_pts[sym] = max(4, int(float(_ms_obj.get("value") or 4)))
+    _ms_obj  = deal.get("minNormalStopOrLimitDistance") or {}
+    _ms_unit = _ms_obj.get("unit", "POINTS")
+    _ms_val  = float(_ms_obj.get("value") or 4.0)
+    if _ms_unit == "PERCENTAGE":
+        # PERCENTAGE unit would need a price reference to convert to points;
+        # all live instruments observed use POINTS — log and use safe fallback.
+        _live_log(f"\u26a0\ufe0f  {sym}: minStop unit=PERCENTAGE, expected POINTS "
+                  f"— using 4pt fallback instead of {_ms_val}")
+        _ms_val = 4.0
+    _live_min_stop_pts[sym] = max(1, int(_ms_val))  # real IG value; +1 buffer in _live_compute_stop_pts
     if epic.upper().endswith(".CASH.IP"):
         _live_equity_cfd.add(sym)
     if epic.upper().startswith("CS.D.") and epic.upper().endswith("CFD.IP"):
         _live_fx_instruments.add(sym)
-    _live_log(f"LIVE mkt: {sym} lot={lot_sz} minDeal={min_val} pip={pip_sz} unit={price_unit} margin={margin_rate:.0%}")
+    _live_log(f"LIVE mkt: {sym} lot={lot_sz} minDeal={min_val} pip={pip_sz} unit={price_unit} margin={margin_rate:.0%} min_stop={_live_min_stop_pts[sym]}pts")
     return True
 
 
@@ -6826,6 +6834,21 @@ def _live_open_position(sym: str, direction: str, signals: dict,
     _log_n = (actual_n * price_unit
                if sym not in _live_equity_cfd and sym not in _live_fx_instruments
                else actual_n)
+    # Equity CFD leverage gate — minDeal = 1 share inflates effective leverage when
+    # account is too small for pos_size × leverage to cover one share. Block cleanly
+    # rather than allow effective leverage to silently exceed the phase ceiling.
+    # Not triggered for SILVER/OIL (not in _live_equity_cfd).
+    if sym in _live_equity_cfd and pos_size > 0:
+        _eff_lev = _log_n / pos_size
+        if _eff_lev > leverage + 0.5:  # 0.5 tolerance for float rounding at exact boundary
+            _live_log(
+                f"\U0001f6ab EQUITY LEV GATE: {sym} blocked — minDeal clamp produced "
+                f"{_eff_lev:.1f}\u00d7 effective leverage "
+                f"(${_log_n:.2f} actual / ${pos_size:.2f} pos) "
+                f"vs intended {leverage}:1 — account too small to size one share "
+                f"within phase leverage control"
+            )
+            return
     stop_pct  = max(_sim_get_dynamic_stop(sym), _sim_get_spread_floor(sym))
     if stop_mult != 1.0:
         stop_pct = round(stop_pct * stop_mult, 6)  # counter-trend SL compression
