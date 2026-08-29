@@ -7791,6 +7791,29 @@ def _live_check_exit(signals: dict, regime: str) -> None:
     pnl_pct  = (_exit_px - fill_px) / fill_px if dirn == "long" else (fill_px - _exit_px) / fill_px
     sig_dir  = sig.get("direction", "neutral")
 
+    # [BLOCK OPEN] observational audit log — no behavior change.
+    # Fires once per open position the first time a perf-block is active for this
+    # instrument, logging block type and P&L state for the positions-gap evidence trail.
+    if _live_perf_blocked(sym) and not pos.get("block_open_logged"):
+        try:
+            _r = _redis()
+            _blk_wr  = bool(_r.get(f"june_perf_block_wr:{sym}"))
+            _blk_sar = bool(_r.get(f"june_perf_block_sar:{sym}"))
+            _blk_obs = _live_get_observer(sym)
+            _blk_parts = []
+            if _blk_wr:  _blk_parts.append("WR-hard")
+            if _blk_sar: _blk_parts.append("SAR")
+            if _blk_obs: _blk_parts.append(f"observer-{_blk_obs}")
+            _blk_type = "/".join(_blk_parts) if _blk_parts else "unknown"
+        except Exception:
+            _blk_type = "unknown"
+        _live_log(
+            f"[BLOCK OPEN] {sym}: instrument perf-blocked ({_blk_type}) "
+            f"while position is open | pnl {pnl_pct*100:+.3f}% | {dirn} "
+            f"| hold {hold_sec/60:.0f}min — observational only, no action taken"
+        )
+        _live["open_position"]["block_open_logged"] = True
+
     # ── Time-Decay Exit Compression (live mirror) ─────────────────────────────
     age_min_l = hold_sec / 60.0
     _tdec_windows = 0
