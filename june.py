@@ -8237,7 +8237,8 @@ def _live_add_pyramid_leg(signals: dict) -> None:
     total    = _live.get("balance_total", 0.0)
     skimmed  = _live.get("skimmed_total", 0.0)
     bal      = max(0.0, total - skimmed)
-    notional = pos_sz * lev if pos_sz > 0 else bal * 0.10 * lev
+    _pyr_base = min(10.0, bal) if bal < 100.0 else round(bal * 0.10, 2)
+    notional = pos_sz * lev if pos_sz > 0 else max(2.0, _pyr_base) * lev
     ig_size  = _live_compute_ig_size(sym, notional, mid)
     if ig_size <= 0:
         _live_log(f"[PYRAMID] {sym}: ig_size=0 -- addon aborted")
@@ -8497,8 +8498,10 @@ def _live_try_entry(signals: dict, regime: str) -> None:
     if _mr and _mr > 0:
         lev = _ig_margin_to_max_lev(_mr, lev)
 
-    # Sizing — use pct_10 targeting (10% of live balance, minimum $10)
-    pos_size = max(2.0, round(bal * 0.10, 2))
+    # Sizing — flat $10 target below $100 balance, 10%-of-balance above.
+    # Crossover is continuous: 10% of $100 = $10 exactly (no jump).
+    # $2 floor and downstream minDeal clamp apply unchanged.
+    pos_size = max(2.0, min(10.0, bal) if bal < 100.0 else round(bal * 0.10, 2))
     # Proportional size reduction when spread is wide relative to ATR
     _sar_live = sig.get("spread_atr_ratio")
     if sig.get("spread_atr_wide") and _sar_live:
