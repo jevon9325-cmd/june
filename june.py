@@ -5556,6 +5556,7 @@ _LIVE_SKIM_PHASE1_TRIGGER = 300.0   # first skim fires at $300 cumulative earned
 _LIVE_SKIM_PHASE1_AMOUNT  = 100.0   # $100 increments until $500
 _LIVE_SKIM_PHASE2_TRIGGER = 500.0   # switch to half-mode at $500
 _LIVE_SKIM_HALF_MIN_GAP   = 3600    # half-mode: don't re-flag more often than hourly
+_SKIM_ENABLED             = False   # kill-switch: set True to re-enable skim (re-evaluate at ~$443 sizing crossover)
 
 # Daily drawdown circuit breaker for the live account.
 # Derivation: max per-trade loss = 10% position × 10× leverage × 0.5% max stop = 0.5%/trade.
@@ -5930,6 +5931,8 @@ def _live_check_skim() -> None:
     When the switch is OFF, skim thresholds are logged but not flagged, so Jevon
     reviews the decision before enabling real execution.
     """
+    if not _SKIM_ENABLED:
+        return  # skim disabled; skimmed_total stays flat, downstream bal formula unaffected
     earned = _live.get("cumulative_earned_pnl", 0.0)
     phase  = _live.get("skim_phase", "pre300")
 
