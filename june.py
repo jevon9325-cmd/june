@@ -2669,6 +2669,19 @@ _SIM_P2_TO_P3_PNL      = 0.05   # +5% from phase entry balance required
 _SIM_PHASE_DROP_LOSSES = 5
 _SIM_PHASE_DROP_PNL    = -0.05
 
+# == Live leverage phase system (separate from sim — different track records) ===
+_LIVE_PHASE_GATE_BAL         = 200.0  # below: dormant (minDeal floor renders lev differentiation moot)
+_LIVE_PHASE_CONSERVATIVE_LEV = 3      # Phase 1 ceiling (matches _SIM_CONSERVATIVE_LEV)
+_LIVE_PHASE2_LEV             = 5      # Phase 2 ceiling
+_LIVE_PHASE3_LEV             = 10     # Phase 3 ceiling (matches _SIM_AGGRESSIVE_LEV)
+_LIVE_P1_TO_P2_TRADES        = 10
+_LIVE_P1_TO_P2_WR            = 0.50
+_LIVE_P2_TO_P3_TRADES        = 20
+_LIVE_P2_TO_P3_WR            = 0.55
+_LIVE_P2_TO_P3_PNL           = 0.05   # +5% from phase entry balance
+_LIVE_PHASE_DROP_LOSSES      = 5      # consecutive losses triggers drop-back
+_LIVE_PHASE_DROP_PNL         = -0.05  # -5% from phase entry triggers drop-back
+
 # ── Sprout sizing rotation ─────────────────────────────────────────────────────
 _SIM_SIZING_ORDER        = ["fixed_5", "fixed_10", "pct_5", "pct_10"]
 _SIM_MIN_APPROACH_TRADES = 5    # min per-instrument trades before approach is trusted
@@ -7289,6 +7302,18 @@ def _live_close_position(exit_reason: str, signals: dict) -> None:
         _live_update_streak(sym, dirn, won)
         _live_perf_record(sym, won, sig.get("spread_atr_ratio"), pnl_dollar=net_dollar)
         _sim_15m_record(sym, dirn, pos.get("entry_change_15m") or 0.0, won)
+        # Live phase stat update — only counted when above balance gate
+        if _live.get("balance", 0.0) >= _LIVE_PHASE_GATE_BAL:
+            _live["live_phase_trades"]  = _live.get("live_phase_trades", 0) + 1
+            _live["live_phase_wins"]    = _live.get("live_phase_wins", 0) + int(won)
+            _live["live_phase_losses"]  = _live.get("live_phase_losses", 0) + int(not won)
+            if won:
+                _live["live_phase_consec_losses"] = 0
+            else:
+                _live["live_phase_consec_losses"] = _live.get("live_phase_consec_losses", 0) + 1
+            if _live.get("live_phase_entry_balance") is None:
+                _live["live_phase_entry_balance"] = _live.get("balance", 0.0)
+            _live_check_phase()
         # After stop_loss: block the stopped direction for 10 min (same-dir cooldown)
         # and block ALL directions on this instrument for 15 min (instrument cooldown).
         # Prevents an immediate direction-flip into the same noise that stopped us out.
@@ -8366,6 +8391,75 @@ def _live_add_pyramid_leg(signals: dict) -> None:
 # == End pyramid management ===================================================
 
 
+def _live_phase_leverage(phase: int) -> int:
+    """Leverage ceiling for the given live phase."""
+    if phase == 1: return _LIVE_PHASE_CONSERVATIVE_LEV
+    if phase == 2: return _LIVE_PHASE2_LEV
+    return _LIVE_PHASE3_LEV
+
+
+def _live_check_phase() -> None:
+    """Performance-gated phase advancement and drop-back for live trading.
+    Only activates above _LIVE_PHASE_GATE_BAL — below that, minDeal floor
+    dominates and leverage differentiation has no practical effect.
+    Mirror of _sim_check_phase() reading _live[] not _sim[]."""
+    bal     = _live.get("balance", 0.0)
+    if bal < _LIVE_PHASE_GATE_BAL:
+        return
+    phase   = _live.get("live_phase", 1)
+    n       = _live.get("live_phase_trades", 0)
+    wins    = _live.get("live_phase_wins", 0)
+    wr      = wins / n if n else 0.0
+    entry_b = _live.get("live_phase_entry_balance") or bal
+    pnl_pct = (bal - entry_b) / entry_b if entry_b > 0 else 0.0
+    consec  = _live.get("live_phase_consec_losses", 0)
+    # Drop-back runs first — catches losing streaks before advancement check
+    if phase > 1:
+        if consec >= _LIVE_PHASE_DROP_LOSSES or pnl_pct <= _LIVE_PHASE_DROP_PNL:
+            new_phase = phase - 1
+            reason    = (f"{consec} consecutive losses"
+                         if consec >= _LIVE_PHASE_DROP_LOSSES
+                         else f"P&L {pnl_pct:+.1%} from phase entry")
+            _live["live_phase"]               = new_phase
+            _live["live_phase_entry_balance"] = bal
+            _live["live_phase_consec_losses"] = 0
+            _live["live_phase_trades"]        = 0
+            _live["live_phase_wins"]          = 0
+            _live["live_phase_losses"]        = 0
+            _live_log(
+                f"\U0001f4c9 LIVE: Phase {phase} \u2192 Phase {new_phase} "
+                f"({_live_phase_leverage(new_phase)}:1) "
+                f"\u2014 {reason} \u2014 leverage ceiling lowered"
+            )
+            _live_save_state()
+            return
+    # Advancement
+    if phase == 1 and n >= _LIVE_P1_TO_P2_TRADES and wr >= _LIVE_P1_TO_P2_WR and pnl_pct > 0:
+        _live["live_phase"]               = 2
+        _live["live_phase_entry_balance"] = bal
+        _live["live_phase_consec_losses"] = 0
+        _live["live_phase_trades"]        = 0
+        _live["live_phase_wins"]          = 0
+        _live["live_phase_losses"]        = 0
+        _live_log(
+            f"\U0001f4c8 LIVE: Phase 1 \u2192 Phase 2 (5:1) "
+            f"\u2014 {n} trades, {wr:.0%} WR, +${bal - entry_b:.2f} P&L \u2014 criteria met"
+        )
+        _live_save_state()
+    elif phase == 2 and n >= _LIVE_P2_TO_P3_TRADES and wr >= _LIVE_P2_TO_P3_WR and pnl_pct >= _LIVE_P2_TO_P3_PNL:
+        _live["live_phase"] = 3
+        _live["live_phase_entry_balance"] = bal
+        _live["live_phase_consec_losses"] = 0
+        _live["live_phase_trades"]        = 0
+        _live["live_phase_wins"]          = 0
+        _live["live_phase_losses"]        = 0
+        _live_log(
+            f"\U0001f4c8 LIVE: Phase 2 \u2192 Phase 3 (10:1) "
+            f"\u2014 {n} trades, {wr:.0%} WR, +${bal - entry_b:.2f} P&L \u2014 criteria met"
+        )
+        _live_save_state()
+
+
 def _live_try_entry(signals: dict, regime: str) -> None:
     """Evaluate entry for live trading. Reuses all sim decision functions.
     Calls _live_open_position which is the only place orders are placed.
@@ -8502,7 +8596,18 @@ def _live_try_entry(signals: dict, regime: str) -> None:
             f"[{'+'.join(_floor_parts)}]"
         )
         return
-    lev     = _sim_conviction_leverage("sprout", conv)
+    _cv_lev = _sim_conviction_leverage("sprout", conv)
+    # Phase system: cap conviction-based lev at current phase ceiling.
+    # Dormant below _LIVE_PHASE_GATE_BAL — lev passes through unchanged.
+    if bal >= _LIVE_PHASE_GATE_BAL:
+        _phase_ceil = _live_phase_leverage(_live.get("live_phase", 1))
+        lev = min(_cv_lev, _phase_ceil)
+        _live_log(
+            f"  [LIVE P{_live.get('live_phase', 1)}] conviction lev {_cv_lev}:1 "
+            f"→ phase-capped {lev}:1 (bal ${bal:.2f} ≥ gate ${_LIVE_PHASE_GATE_BAL:.0f})"
+        )
+    else:
+        lev = _cv_lev
 
     # Cap leverage at IG's real margin rate — prevents INSUFFICIENT_FUNDS rejection
     _mr = _live_margin.get(sym)
@@ -8838,6 +8943,13 @@ def _live_startup() -> None:
         "instrument_won_after_def":  {},
         "pyramid_legs":              [],   # addon legs for no-decay pyramid
         "pyramid_agg_stop_level":    None, # aggregate stop level when pyramid active
+        # Live performance-gated phase system (separate from sim's phase tracking)
+        "live_phase":                1,    # 1=3:1  2=5:1  3=10:1
+        "live_phase_trades":         0,
+        "live_phase_wins":           0,
+        "live_phase_losses":         0,
+        "live_phase_consec_losses":  0,
+        "live_phase_entry_balance":  None, # set on first activation or phase change
     }
     for k, v in defaults.items():
         _live.setdefault(k, v)
