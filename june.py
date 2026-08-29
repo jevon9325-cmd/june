@@ -113,7 +113,7 @@ MOMENTUM_PCT        = 0.30   # |change_5m| % to flag in momentum_alerts
 
 SPREAD_HISTORY_LEN  = 60     # readings kept per instrument (~1h at 60s)
 SPREAD_ALERT_FACTOR  = 3.0    # current spread > 3× avg → spread_alert: True
-SPREAD_ATR_THRESHOLD = 0.35   # spread > 35% of 14-period ATR → boundary warning + rank/size penalty
+SPREAD_ATR_THRESHOLD = 1.00   # spread > 100% of 14-period ATR → rank/size penalty (breakeven: spread=ATR). Calibrated at minDeal floor ($49 bal, $2.78 SILVER notional, $0.0016/trade spread cost = 0.008% of $20 CFD allocation). Re-derive when computed position size exceeds minDeal floor (~$280 account for SILVER ig_size>0.04).
 ATR_PERIOD           = 14     # periods for ATR from rolling mid-price history
 # Hybrid tiered Spread/ATR thresholds — per asset class, used by entry gate with 5m ATR
 _SPREAD_ATR_TIERS:        dict  = {"FX": 0.35, "METAL": 0.60, "ENERGY": 0.85}
@@ -8087,7 +8087,7 @@ def _live_try_entry(signals: dict, regime: str) -> None:
     # In NORMAL mode, all conviction levels are permitted.
     _in_defensive = (_gmode == "defensive" or _imode == "defensive")
     _observer_key = _live_get_observer(sym)
-    _observer_mult = {"light": 1.5, "moderate": 2.0}.get(_observer_key, 0.0)
+    _observer_mult = {"light": 1.25, "moderate": 2.0}.get(_observer_key, 0.0)  # light=5.0 floor (allows 5/10, SILVER ceiling); moderate=8.0 (de-facto block for low-ceiling instruments)
     _obs_floor = (_LIVE_MIN_CONVICTION * _observer_mult) if _observer_mult > 0 else 0.0
     _def_floor = _LIVE_MIN_CONVICTION if _in_defensive else 0.0
     _eff_conv_floor = max(_obs_floor, _def_floor)
