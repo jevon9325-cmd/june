@@ -3115,7 +3115,17 @@ def _sim_conviction_gauge(
     + streak (0-1) + 15m reliability (-0.5 to +1). Clamped to [1, 10]."""
     clearance  = min(vol / thresh, 5.0) if thresh > 0 else 1.0
     regime_pts = max(-1.0, min(2.0, (weight - 1.0) * 4.0))
-    bucket_pts = 2.0 if vol > _SIM_HIGH_VOL_THRESH else 1.0 if vol >= _SIM_LOW_VOL_THRESH else 0.0
+    # Graduated ramp — piecewise linear through old calibration anchors.
+    # (0%, 0pt) → (LOW_THRESH=0.20%, 1pt) → (HIGH_THRESH=0.50%, 2pt).
+    # Eliminates the hard cliff at 0.20% without reducing any existing signal.
+    if vol <= 0.0:
+        bucket_pts = 0.0
+    elif vol < _SIM_LOW_VOL_THRESH:
+        bucket_pts = round(vol / _SIM_LOW_VOL_THRESH, 2)
+    elif vol < _SIM_HIGH_VOL_THRESH:
+        bucket_pts = round(1.0 + (vol - _SIM_LOW_VOL_THRESH) / (_SIM_HIGH_VOL_THRESH - _SIM_LOW_VOL_THRESH), 2)
+    else:
+        bucket_pts = 2.0
     streak_pts = 1.0 if _sim_has_boost(combo) else 0.0
     if gate_mode == "strict" and rel_score is not None and rel_score > 0.5:
         rel_pts = 1.0
@@ -4628,7 +4638,8 @@ def _sim_hourly_log() -> None:
             stk   = streak_sa.get(combo_sa, 0)
             gmode_sa, grel_sa = _sim_15m_gate_mode(sym_sa, dir_sa)
             grel_str = f"{grel_sa:.2f}" if grel_sa is not None else "cold"
-            gate_tag = f"15m:{gmode_sa}/{grel_str}"
+            _15m_n   = len((_sim.get("15m_reliability") or {}).get(sym_sa, {}).get(dir_sa, {}).get("history", []))
+            gate_tag = f"15m:{gmode_sa}/{grel_str}(n={_15m_n})"
             if now_sa < p_exp:
                 res = datetime.fromtimestamp(p_exp, tz=timezone.utc).strftime("%H:%M UTC")
                 parts.append(f"{dir_sa}:PAUSED(resume {res})[{gate_tag}]")
