@@ -5558,6 +5558,16 @@ _LIVE_SKIM_PHASE2_TRIGGER = 500.0   # switch to half-mode at $500
 _LIVE_SKIM_HALF_MIN_GAP   = 3600    # half-mode: don't re-flag more often than hourly
 _SKIM_ENABLED             = False   # kill-switch: set True to re-enable skim (re-evaluate at ~$443 sizing crossover)
 
+# == Pyramid configuration ==================================================
+# No-decay pyramid: all legs same minDeal-clamped size.
+# Profit gate 0.15%: ~10pts SILVER = 2.5x spread (4pt). Real profit confirmed.
+# Aggregate stop 0.5%: ~33pts SILVER. Software check every cycle (belt+suspenders).
+# Max legs 2 = 1 primary + 1 addon. 2 deal_ids tracked; margin ~$4.34 of $49.
+# Extend to 3 only after live validation of the 2-leg design.
+_PYRAMID_MAX_LEGS        = 2       # 1 primary + 1 addon (2 total legs max)
+_PYRAMID_PROFIT_GATE_PCT = 0.0015  # +0.15% from fill before adding leg 2
+_PYRAMID_AGG_STOP_PCT    = 0.005   # 0.5% from blended entry -- aggregate stop
+
 # Daily drawdown circuit breaker for the live account.
 # Derivation: max per-trade loss = 10% position × 10× leverage × 0.5% max stop = 0.5%/trade.
 # Reaching -5% needs 10 consecutive max-stop exits — structurally impossible in one session
@@ -7974,6 +7984,376 @@ def _live_select_instrument(signals: dict, regime: str) -> Optional[str]:
 
 # ── Entry logic (Part 5 — mirrors _sim_try_entry) ─────────────────────────────
 
+
+# == Pyramid management (no-decay 2-leg cap) =================================
+
+def _live_close_addon_leg(leg: dict, exit_reason: str, signals: dict) -> None:
+    # Close one pyramid addon leg. Removes from pyramid_legs on confirmed close.
+    sym       = leg.get("instrument", "")
+    dirn      = leg.get("direction", "long")
+    ig_size   = leg.get("ig_size", 0.0)
+    deal_id   = leg.get("deal_id", "")
+    fill_px   = leg.get("fill_price", 0.0)
+    sig       = signals.get(sym, {})
+    mid       = sig.get("price", fill_px)
+    close_dir = "SELL" if dirn == "long" else "BUY"
+    epic      = INSTRUMENTS.get(sym, "")
+    pnl_pct   = (mid - fill_px) / fill_px if dirn == "long" else (fill_px - mid) / fill_px
+    _live_log(
+        f"[PYRAMID CLOSE] leg {leg.get('leg_index', 2)} {sym} {close_dir} | "
+        f"P&L ~{pnl_pct*100:+.2f}% | reason={exit_reason}"
+    )
+    if not _live_trade_guard():
+        return
+    if deal_id:
+        if _live.get("manual_review_required"):
+            _live_log(f"[PYRAMID] {sym}: manual_review_required -- addon close blocked")
+            return
+        _g_open, _g_src = _ls_position_guard_check(sym, deal_id)
+        if _g_src == "DISAGREEMENT":
+            return
+        if _g_open is None:
+            _live_log(f"[PYRAMID] {sym}: both LS and /accounts unavailable -- preserving addon")
+            return
+        if not _g_open:
+            _live_log(f"[PYRAMID] {sym}: addon already gone [{_g_src}] -- clearing tracking")
+            _live["pyramid_legs"] = [l for l in _live.get("pyramid_legs", [])
+                                     if l.get("deal_id") != deal_id]
+            if not _live.get("pyramid_legs"):
+                _live["pyramid_agg_stop_level"] = None
+            _live_save_state()
+            return
+    close_body = {
+        "epic":           epic,
+        "expiry":         "-",
+        "direction":      close_dir,
+        "size":           ig_size,
+        "orderType":      "MARKET",
+        "timeInForce":    "FILL_OR_KILL",
+        "forceOpen":      False,
+        "guaranteedStop": False,
+        "currencyCode":   "USD",
+        "dealId":         deal_id,
+    }
+    resp = _ig_live_post("/positions/otc", close_body, version="1")
+    if not resp:
+        _live_log(f"[PYRAMID] {sym}: addon close POST failed -- state preserved")
+        return
+    deal_ref = resp.get("dealReference", "")
+    confirm  = _live_confirm_deal(deal_ref) if deal_ref else None
+    if confirm and confirm.get("dealStatus") == "ACCEPTED":
+        real_exit  = float(confirm.get("level", mid))
+        real_pnl_p = (real_exit - fill_px) / fill_px if dirn == "long" else (fill_px - real_exit) / fill_px
+        _live_log(
+            f"✅ PYRAMID LEG CLOSED: {sym} @ {real_exit:.5f} "
+            f"({real_pnl_p*100:+.3f}%) | {exit_reason}"
+        )
+        _live["pyramid_legs"] = [l for l in _live.get("pyramid_legs", [])
+                                  if l.get("deal_id") != deal_id]
+        if not _live.get("pyramid_legs"):
+            _live["pyramid_agg_stop_level"] = None
+        _live_save_state()
+    else:
+        status = confirm.get("dealStatus", "?") if confirm else "no-confirm"
+        _live_log(f"[PYRAMID] {sym}: addon close {status} -- state preserved for retry")
+
+
+def _live_close_all_addon_legs(exit_reason: str, signals: dict) -> None:
+    # Close every pyramid addon leg. Called on orphan protection or aggregate stop.
+    for leg in list(_live.get("pyramid_legs", [])):
+        _live_close_addon_leg(leg, exit_reason, signals)
+
+
+def _live_check_pyramid_exits(signals: dict) -> None:
+    # Aggregate stop check + per-addon-leg exit management.
+    # Aggregate stop: closes ALL legs when adverse move exceeds _PYRAMID_AGG_STOP_PCT
+    # from blended entry. Fires before individual stops -> prevents orphan scenario.
+    # Per-addon: Addon SL -> close addon + primary. Addon TP -> close addon only.
+    primary    = _live.get("open_position")
+    addon_legs = _live.get("pyramid_legs", [])
+    if not primary or not addon_legs:
+        return
+    sym  = primary["instrument"]
+    dirn = primary["direction"]
+    sig  = signals.get(sym, {})
+    mid  = sig.get("price", 0.0)
+    if mid <= 0:
+        return
+    _sp_pct  = sig.get("spread_pct", 0.0)
+    _half_sp = mid * _sp_pct / 200.0
+    _exit_px = (mid - _half_sp) if dirn == "long" else (mid + _half_sp)
+
+    # Aggregate stop check
+    agg_stop = _live.get("pyramid_agg_stop_level")
+    if agg_stop is not None:
+        breached = (
+            (dirn == "long"  and _exit_px <= agg_stop) or
+            (dirn == "short" and _exit_px >= agg_stop)
+        )
+        if breached:
+            p_fill = primary.get("fill_price", mid)
+            p_pnl  = (_exit_px - p_fill) / p_fill if dirn == "long" else (p_fill - _exit_px) / p_fill
+            _live_log(
+                f"🔴 PYRAMID AGGREGATE STOP: {sym} exit_px={_exit_px:.5f} "
+                f"breached agg_stop={agg_stop:.5f} | primary P&L {p_pnl*100:+.3f}% "
+                f"-- closing ALL legs"
+            )
+            _live_close_all_addon_legs("pyramid_agg_stop", signals)
+            _live_close_position("pyramid_agg_stop", signals)
+            return
+
+    # Per-addon exits
+    for leg in list(addon_legs):
+        leg_fill = leg.get("fill_price", 0.0)
+        stop_pct = leg.get("stop_pct", 0.0)
+        tp_pct   = leg.get("tp_pct", 0.0)
+        leg_idx  = leg.get("leg_index", 2)
+        deal_id  = leg.get("deal_id", "")
+
+        # LS broker-stop detection (proactive, same pattern as _live_check_exit)
+        if deal_id and _ls_deal_closed(deal_id):
+            _live_log(f"[LS] PYRAMID leg {leg_idx}: FULLY_CLOSED by broker -- clearing")
+            _live["pyramid_legs"] = [l for l in _live["pyramid_legs"]
+                                     if l.get("deal_id") != deal_id]
+            if not _live["pyramid_legs"]:
+                _live["pyramid_agg_stop_level"] = None
+            _live_save_state()
+            continue
+
+        leg_pnl_pct = (
+            (_exit_px - leg_fill) / leg_fill if dirn == "long"
+            else (leg_fill - _exit_px) / leg_fill
+        ) if leg_fill > 0 else 0.0
+
+        if stop_pct > 0 and leg_pnl_pct <= -stop_pct:
+            _live_log(
+                f"🛑 PYRAMID LEG SL: leg {leg_idx} | pnl {leg_pnl_pct*100:.3f}% "
+                f"<= -{stop_pct*100:.3f}% -- closing addon + primary (direction failed)"
+            )
+            _live_close_addon_leg(leg, "pyramid_leg_sl", signals)
+            _live_close_position("pyramid_leg_sl_close_primary", signals)
+            return
+
+        if tp_pct > 0 and leg_pnl_pct >= tp_pct:
+            _live_log(
+                f"✅ PYRAMID LEG TP: leg {leg_idx} | pnl {leg_pnl_pct*100:.3f}% "
+                f">= {tp_pct*100:.3f}% -- closing addon only, primary continues"
+            )
+            _live_close_addon_leg(leg, "pyramid_leg_tp", signals)
+            return
+
+
+def _live_check_pyramid_entry(signals: dict, regime: str) -> None:
+    # Evaluate whether to add a pyramid leg to the existing primary position.
+    # All defensive gates explicitly checked -- mirrors _live_try_entry exactly.
+    # Profit gate: primary must show >= _PYRAMID_PROFIT_GATE_PCT spread-adjusted P&L.
+    # LS confirmation: primary deal must NOT be in _ls_confirms_closed.
+    primary = _live.get("open_position")
+    if not primary:
+        return
+    if len(_live.get("pyramid_legs", [])) >= _PYRAMID_MAX_LEGS - 1:
+        return  # already at cap
+    sym     = primary["instrument"]
+    dirn    = primary["direction"]
+    fill    = primary.get("fill_price", 0.0)
+    deal_id = primary.get("deal_id", "")
+
+    if deal_id and _ls_deal_closed(deal_id):
+        return  # primary FULLY_CLOSED per LS -- no add-on
+
+    sig = signals.get(sym, {})
+    mid = sig.get("price", 0.0)
+    if mid <= 0 or fill <= 0:
+        return
+
+    _sp_pct  = sig.get("spread_pct", 0.0)
+    _half_sp = mid * _sp_pct / 200.0
+    _exit_px = (mid - _half_sp) if dirn == "long" else (mid + _half_sp)
+    pnl_pct  = (_exit_px - fill) / fill if dirn == "long" else (fill - _exit_px) / fill
+
+    if pnl_pct < _PYRAMID_PROFIT_GATE_PCT:
+        return  # not yet at profit gate
+
+    # Defensive gates -- explicit, same as _live_try_entry
+    if not _june_live_trading_enabled:
+        return
+    _gmode = _live.get("global_mode", "normal")
+    if _gmode == "defensive" and regime == "neutral":
+        return
+    _imode = (_live.get("instrument_mode") or {}).get(sym, "normal")
+    if _imode == "defensive" and regime == "neutral":
+        return
+    if _live_perf_blocked(sym):
+        return
+    if sym in _METALS_INSTRUMENTS and _is_metals_weekend_closure():
+        return
+    pause_until = _live.get("pause_expiry", {}).get(sym, 0)
+    if time.time() < pause_until:
+        return
+    # SAR gate
+    _atr5, _atr5_fb = _compute_atr_5m(sym)
+    if _atr5 is not None and _atr5 > 0:
+        _sp_raw = (sig.get("spread_pct", 0.0) or 0.0) * (sig.get("price", 0.0) or 0.0) / 100.0
+        _sar5   = _sp_raw / _atr5
+        _thr5   = _spread_atr_threshold(sym, _atr5_fb)
+        if _sar5 > _thr5:
+            return
+
+    _live_log(
+        f"[PYRAMID] {sym}: gate passed -- primary at +{pnl_pct*100:.3f}% "
+        f"(gate={_PYRAMID_PROFIT_GATE_PCT*100:.2f}%) | adding leg 2/{_PYRAMID_MAX_LEGS}"
+    )
+    _live_add_pyramid_leg(signals)
+
+
+def _live_add_pyramid_leg(signals: dict) -> None:
+    # Open the pyramid addon leg for the existing primary position.
+    # Uses same ig_size formula as primary (minDeal-clamped, reuses pos_size/leverage).
+    # forceOpen=True REQUIRED: opens separate deal in same instrument.
+    # Sets aggregate stop on both legs after fill confirms.
+    if not _live_trade_guard():
+        return
+    primary = _live.get("open_position")
+    if not primary:
+        return
+
+    sym   = primary["instrument"]
+    dirn  = primary["direction"]
+    fill1 = primary.get("fill_price", 0.0)
+    size1 = primary.get("ig_size", 0.0)
+
+    sig = signals.get(sym, {})
+    mid = sig.get("price", 0.0)
+    if mid <= 0:
+        _live_log(f"[PYRAMID] {sym}: no price -- addon aborted")
+        return
+
+    epic   = INSTRUMENTS.get(sym, "")
+    ig_dir = "BUY" if dirn == "long" else "SELL"
+
+    # Sizing: reuse primary pos_size and leverage for exact size match
+    pos_sz   = primary.get("pos_size", 0.0)
+    lev      = primary.get("leverage", 1)
+    total    = _live.get("balance_total", 0.0)
+    skimmed  = _live.get("skimmed_total", 0.0)
+    bal      = max(0.0, total - skimmed)
+    notional = pos_sz * lev if pos_sz > 0 else bal * 0.10 * lev
+    ig_size  = _live_compute_ig_size(sym, notional, mid)
+    if ig_size <= 0:
+        _live_log(f"[PYRAMID] {sym}: ig_size=0 -- addon aborted")
+        return
+
+    stop_pct = max(_sim_get_dynamic_stop(sym), _sim_get_spread_floor(sym))
+    tp_pct   = _sim_get_tp(sym, dirn, primary.get("conviction", 5))
+
+    # Approximate aggregate stop for entry-time stop distance
+    approx_blended = (
+        (fill1 * size1 + mid * ig_size) / (size1 + ig_size)
+        if (size1 + ig_size) > 0 else mid
+    )
+    approx_agg_stop = (
+        approx_blended * (1.0 - _PYRAMID_AGG_STOP_PCT) if dirn == "long"
+        else approx_blended * (1.0 + _PYRAMID_AGG_STOP_PCT)
+    )
+    approx_stop_dist = _live_compute_stop_pts(sym, _PYRAMID_AGG_STOP_PCT, mid)
+
+    _live_log(
+        f"[PYRAMID] {'WOULD-BUY' if not _june_live_trading_enabled else 'BUY'} addon: "
+        f"{sym} {ig_dir} size={ig_size} notional~${notional:.2f} | "
+        f"stop {stop_pct*100:.2f}% TP {tp_pct*100:.2f}% | "
+        f"approx_agg_stop={approx_agg_stop:.5f} ({approx_stop_dist}pts)"
+    )
+
+    body = {
+        "epic":           epic,
+        "expiry":         "-",
+        "direction":      ig_dir,
+        "size":           ig_size,
+        "orderType":      "MARKET",
+        "timeInForce":    "FILL_OR_KILL",
+        "forceOpen":      True,         # REQUIRED: opens separate deal in same instrument
+        "guaranteedStop": False,
+        "currencyCode":   "USD",
+        "stopDistance":   approx_stop_dist,
+    }
+    resp = _ig_live_post("/positions/otc", body, version="1")
+    if not resp:
+        _live_log(f"[PYRAMID] {sym}: POST failed -- addon aborted")
+        return
+
+    deal_ref = resp.get("dealReference", "")
+    confirm  = _live_confirm_deal(deal_ref) if deal_ref else None
+    if not confirm or confirm.get("dealStatus") != "ACCEPTED":
+        status = confirm.get("dealStatus", "?") if confirm else "no-confirm"
+        reason = confirm.get("reason", "?") if confirm else "?"
+        _live_log(f"[PYRAMID] {sym}: deal {status}: {reason} -- addon aborted")
+        return
+
+    deal_id    = confirm.get("dealId", "")
+    fill_price = float(confirm.get("level", mid))
+
+    # Precise aggregate stop using actual fill
+    blended = (
+        (fill1 * size1 + fill_price * ig_size) / (size1 + ig_size)
+        if (size1 + ig_size) > 0 else fill_price
+    )
+    agg_stop_level = (
+        blended * (1.0 - _PYRAMID_AGG_STOP_PCT) if dirn == "long"
+        else blended * (1.0 + _PYRAMID_AGG_STOP_PCT)
+    )
+
+    leg = {
+        "instrument": sym,
+        "direction":  dirn,
+        "deal_id":    deal_id,
+        "deal_ref":   deal_ref,
+        "fill_price": fill_price,
+        "ig_size":    ig_size,
+        "notional":   notional,
+        "stop_pct":   stop_pct,
+        "tp_pct":     tp_pct,
+        "entry_time": time.time(),
+        "leg_index":  2,
+    }
+    _live.setdefault("pyramid_legs", []).append(leg)
+    _live["pyramid_agg_stop_level"] = agg_stop_level
+
+    # PUT aggregate stop to primary leg (update broker-side stop to shared agg level)
+    primary_deal = primary.get("deal_id", "")
+    if primary_deal:
+        _pip_sz       = _live_pip_sizes.get(sym, _LIVE_FX_PIP)
+        dist_to_agg   = abs(mid - agg_stop_level)
+        min_stop_dist = (_live_min_stop_pts.get(sym, 4) + 1) * _pip_sz
+        if dist_to_agg >= min_stop_dist:
+            _put_r = _ig_live_put(
+                f"/positions/otc/{primary_deal}",
+                {"stopLevel": round(agg_stop_level, 5), "guaranteedStop": False},
+                version="2",
+            )
+            if _put_r:
+                _live["open_position"]["defensive_stop_level"] = agg_stop_level
+                _live["open_position"]["defensive_stop_active"] = True
+                _live_log(f"[PYRAMID] Aggregate stop PUT to primary: stopLevel={agg_stop_level:.5f}")
+            else:
+                _live_log("[PYRAMID] Aggregate stop PUT failed for primary -- software check only")
+        else:
+            _live_log(
+                f"[PYRAMID] Agg stop {agg_stop_level:.5f} too close to mid {mid:.5f} "
+                f"({dist_to_agg:.5f} < {min_stop_dist:.5f}) -- software check only"
+            )
+
+    _live_log(
+        f"✅ PYRAMID LEG 2 OPENED: {sym} {ig_dir} @ {fill_price:.5f} "
+        f"| size {ig_size} | deal {deal_id} "
+        f"| blended {blended:.5f} | agg_stop {agg_stop_level:.5f} "
+        f"({_PYRAMID_AGG_STOP_PCT*100:.2f}% from blended)"
+    )
+    _live_save_state()
+
+
+# == End pyramid management ===================================================
+
+
 def _live_try_entry(signals: dict, regime: str) -> None:
     """Evaluate entry for live trading. Reuses all sim decision functions.
     Calls _live_open_position which is the only place orders are placed.
@@ -8204,8 +8584,24 @@ def run_live_step(signals: dict) -> None:
         if not _sim.get("open_position"):   # sim path handles it via _sim_check_exit when sim is also open
             _sim_apply_pos_adjust()
         _live_check_exit(signals, regime)
+        # Pyramid orphan protection: if primary just closed but addon legs remain,
+        # close them immediately. Any primary exit (SL/TP/rotation) terminates addons.
+        if not _live.get("open_position") and _live.get("pyramid_legs"):
+            _live_log("⚠️ PYRAMID ORPHAN: primary leg closed -- immediately closing all addon legs")
+            _live_close_all_addon_legs("orphan_primary_closed", signals)
         if _live.get("open_position"):
+            # Primary still open -- pyramid exit checks then try to add leg 2
+            _live_check_pyramid_exits(signals)
+            if _live.get("open_position") and not _live.get("pyramid_legs"):
+                _live_check_pyramid_entry(signals, regime)
             return    # still holding — skip entry logic
+
+    # Belt-and-suspenders: stale addon legs without a primary position
+    if _live.get("pyramid_legs"):
+        _live_log("⚠️ STALE PYRAMID LEGS: no primary position -- clearing")
+        _live["pyramid_legs"] = []
+        _live["pyramid_agg_stop_level"] = None
+        _live_save_state()
 
     # Daily drawdown circuit breaker — gates new-trade authority only.
     # Runs after exit management so a position that just closed still triggers
@@ -8273,19 +8669,30 @@ def _live_reconcile_positions() -> None:
         _live_log("Reconciliation: IG flat, June flat -- state matches")
         return
 
-    # Both sides have a position -- verify deal_id agreement
+    # Both sides have a position -- verify deal count and deal_id agreement
     if ig_positions and june_pos:
-        ig_deal   = ig_positions[0].get("position", {}).get("dealId", "")
-        june_deal = june_pos.get("deal_id", "")
-        if len(ig_positions) == 1 and ig_deal and ig_deal == june_deal:
+        pyramid_legs   = _live.get("pyramid_legs", [])
+        expected_n     = 1 + len(pyramid_legs)  # primary + active addon legs
+        ig_deals       = {p.get("position", {}).get("dealId", "") for p in ig_positions}
+        june_deal      = june_pos.get("deal_id", "")
+        addon_deals    = {l.get("deal_id", "") for l in pyramid_legs}
+        all_june_deals = {june_deal} | addon_deals
+        if len(ig_positions) == expected_n and all_june_deals <= ig_deals:
             _live_log(
-                f"Reconciliation: deal {ig_deal} confirmed in IG -- state matches "
+                f"Reconciliation: {expected_n} position(s) confirmed in IG -- state matches "
                 f"({june_pos['instrument']} {june_pos['direction'].upper()})"
             )
+        elif len(ig_positions) > _PYRAMID_MAX_LEGS:
+            _live_log(
+                f"Reconciliation: INCIDENT -- IG has {len(ig_positions)} positions "
+                f"(max={_PYRAMID_MAX_LEGS}), June tracks {expected_n} -- "
+                f"manual_review_required set"
+            )
+            _live["manual_review_required"] = True
         else:
             _live_log(
                 f"Reconciliation: MISMATCH -- IG has {len(ig_positions)} position(s) "
-                f"(first deal={ig_deal}), June has deal={june_deal} -- manual check needed"
+                f"(expected {expected_n}), June deal={june_deal} -- manual check needed"
             )
         return
 
@@ -8415,6 +8822,8 @@ def _live_startup() -> None:
         "instrument_mode_entered_at": {},
         "instrument_stopouts_today": {},
         "instrument_won_after_def":  {},
+        "pyramid_legs":              [],   # addon legs for no-decay pyramid
+        "pyramid_agg_stop_level":    None, # aggregate stop level when pyramid active
     }
     for k, v in defaults.items():
         _live.setdefault(k, v)
