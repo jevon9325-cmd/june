@@ -6857,9 +6857,24 @@ def _live_open_position(sym: str, direction: str, signals: dict,
                 f"within phase leverage control"
             )
             return
-    stop_pct  = max(_sim_get_dynamic_stop(sym), _sim_get_spread_floor(sym))
+    _spread_floor = _sim_get_spread_floor(sym)
+    stop_pct      = max(_sim_get_dynamic_stop(sym), _spread_floor)
     if stop_mult != 1.0:
         stop_pct = round(stop_pct * stop_mult, 6)  # counter-trend SL compression
+    # Leverage-scaled stop tightening — dormant below _LIVE_PHASE_GATE_BAL ($200).
+    # Normalised to phase floor (3x = _LIVE_PHASE_CONSERVATIVE_LEV): the most
+    # conservative phase trade is unaffected; stops tighten proportionally above that.
+    # sqrt() dampens the tightening so high-conviction edge is preserved.
+    # Spread floor clamped as hard minimum — stops never tighten into spread noise.
+    # NOT empirically validated at $200+: reasoned starting point, revisit when data exists.
+    if _live.get("balance", 0.0) >= _LIVE_PHASE_GATE_BAL and leverage > _LIVE_PHASE_CONSERVATIVE_LEV:
+        _lev_mult = (_LIVE_PHASE_CONSERVATIVE_LEV / leverage) ** 0.5
+        stop_pct  = max(round(stop_pct * _lev_mult, 6), _spread_floor)
+        _live_log(
+            f"  [LEV-STOP] {sym} {leverage}:1 x{_lev_mult:.3f} "
+            f"(floor {_LIVE_PHASE_CONSERVATIVE_LEV}:1) -> {stop_pct*100:.4f}% "
+            f"(spread floor {_spread_floor*100:.4f}%)"
+        )
     tp_pct    = _sim_get_tp(sym, direction, conviction)
     _tp_spread_floor_l = _sim_get_spread_floor(sym) / 2
     if tp_pct < _tp_spread_floor_l:
