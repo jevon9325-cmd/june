@@ -6513,7 +6513,7 @@ def _live_migrate_perf_blocks() -> None:
                     f"(n={n}, WR={wr:.0%}, loss={loss_pct:.1%})"
                 )
 
-def _live_perf_record(sym: str, won: bool, sar, pnl_dollar: float = 0.0) -> None:
+def _live_perf_record(sym: str, won: bool, sar, pnl_dollar: float = 0.0, entry_sar=None) -> None:
     """Update rolling per-instrument performance stats in Redis.
     Each record carries epoch timestamp and dollar P&L.
     Severity tiers keyed to % of current balance lost:
@@ -6533,6 +6533,7 @@ def _live_perf_record(sym: str, won: bool, sar, pnl_dollar: float = 0.0) -> None
         trades.append({
             "won": won,
             "sar": round(sar or 0.0, 4),
+            "entry_sar": round(entry_sar, 4) if entry_sar is not None else None,
             "session": session,
             "epoch": int(time.time()),
             "pnl_dollar": round(pnl_dollar, 4),
@@ -6590,7 +6591,14 @@ def _live_perf_record(sym: str, won: bool, sar, pnl_dollar: float = 0.0) -> None
         cur_session    = "overnight" if is_overnight() else "day"
         session_trades = [t for t in recent if t.get("session") == cur_session]
         if len(session_trades) >= _PERF_BLOCK_SAR_SESSION_MIN:
-            sar_vals = [t["sar"] for t in session_trades if t["sar"] > 0]
+            # Use entry_sar for block evaluation when available (recorded since this patch);
+            # fall back to exit-time sar for pre-patch records. Entry SAR is more correct:
+            # it reflects conditions at the point the bot decided to enter, not at close.
+            sar_vals = [
+                (t.get("entry_sar") if t.get("entry_sar") is not None else t["sar"])
+                for t in session_trades
+                if (t.get("entry_sar") or t.get("sar", 0)) > 0
+            ]
             if sar_vals:
                 avg_sar = sum(sar_vals) / len(sar_vals)
                 if avg_sar > _PERF_BLOCK_SAR_THRESH:
@@ -6984,6 +6992,7 @@ def _live_open_position(sym: str, direction: str, signals: dict,
         "claudia_pts":  _sim_claudia_pts(sym, direction),
         "initial_sl_pct": stop_pct,  # baseline for time-decay SL compression
         "reversal_count": 0,
+        "entry_sar":      round(sig.get("spread_atr_ratio") or 0.0, 4),
     }
     _live["total_trades"]    = _live.get("total_trades", 0) + 1
     _live_log(
@@ -7323,7 +7332,8 @@ def _live_close_position(exit_reason: str, signals: dict) -> None:
             if won: _live["short_wins"] = _live.get("short_wins", 0) + 1
 
         _live_update_streak(sym, dirn, won)
-        _live_perf_record(sym, won, sig.get("spread_atr_ratio"), pnl_dollar=net_dollar)
+        _live_perf_record(sym, won, sig.get("spread_atr_ratio"), pnl_dollar=net_dollar,
+                          entry_sar=pos.get("entry_sar"))
         _sim_15m_record(sym, dirn, pos.get("entry_change_15m") or 0.0, won)
         # Live phase stat update — only counted when above balance gate
         if _live.get("balance", 0.0) >= _LIVE_PHASE_GATE_BAL:
