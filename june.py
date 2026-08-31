@@ -938,6 +938,31 @@ def is_overnight() -> bool:
     return m >= OVERNIGHT_START_MIN or m < OVERNIGHT_END_MIN
 
 
+def _current_sub_session(sym: str) -> str:
+    """Trading sub-session label for SAR block bucketing.
+
+    OIL / SILVER: day session split into three independent buckets so that
+    afternoon chop cannot block the next morning's primary trading window.
+      pre_nyse:       07:00 UTC - NYSE open     (London + pre-market hours)
+      nyse_morning:   NYSE open - 12:00 ET noon (highest volume, tightest spreads)
+      nyse_afternoon: 12:00 ET  - 21:00 UTC     (lower volume, wider spreads)
+    Other instruments: plain "day" (single bucket, unchanged behaviour).
+    Overnight always returns "overnight" for all instruments.
+    """
+    if is_overnight():
+        return "overnight"
+    if sym not in ("OIL", "SILVER"):
+        return "day"
+    now_et       = datetime.now(_US_EAST_TZ)
+    nyse_open_et = now_et.replace(hour=9,  minute=30, second=0, microsecond=0)
+    nyse_mid_et  = now_et.replace(hour=12, minute=0,  second=0, microsecond=0)
+    if now_et < nyse_open_et:
+        return "pre_nyse"
+    if now_et < nyse_mid_et:
+        return "nyse_morning"
+    return "nyse_afternoon"
+
+
 def is_premarket() -> bool:
     """True during the 06:00-07:00 UTC pre-London gap window."""
     m = _now_mins()
@@ -6356,62 +6381,73 @@ def _live_is_paused(combo: str) -> bool:
 _perf_block_cache: dict = {}   # {sym: cache_expire_ts} — in-memory, refreshed from Redis
 
 
-def _perf_block_sar_ttl(sym: str = "") -> int:
-    """Seconds until the next session boundary for SAR perf blocks.
+def _perf_block_sar_ttl(sym: str = "", sub_session: str = "") -> int:
+    """Seconds until end of the given sub-session for SAR perf blocks.
 
-    Standard (all instruments except OIL): next 07:00 UTC (overnight) or 21:00 UTC (day).
-    OIL: NYSE open (09:30 ET, DST-aware via _US_EAST_TZ) is an intermediate boundary
-    during the London pre-NYSE window (07:00-13:30 UTC), so overnight-session noise does
-    not block OIL through its strongest intraday window. Floor of 30 min (6 scan cycles)
-    prevents a trivially-short block when the NYSE boundary is imminent.
-    SILVER: unaffected — London morning is SILVER's primary window, 07:00/21:00 boundaries
-    correctly cover both London and NY hours for precious metals.
+    Sub-session boundaries (OIL / SILVER):
+      overnight:      expires 07:00 UTC (next day when called after 21:00)
+      pre_nyse:       expires NYSE open (DST-aware, floor _PERF_SAR_OIL_BOUNDARY_FLOOR_SECS)
+      nyse_morning:   expires 12:00 ET (NYSE midday boundary)
+      nyse_afternoon: expires 21:00 UTC
+    Other instruments (sub_session="day"): expires 21:00 UTC (day) or 07:00 UTC (overnight).
     """
     now_utc = datetime.now(timezone.utc)
 
-    if sym == "OIL" and not is_overnight():
+    if sub_session == "overnight" or (not sub_session and is_overnight()):
+        target = now_utc.replace(hour=OVERNIGHT_END_MIN // 60, minute=0, second=0, microsecond=0)
+        if now_utc.hour >= OVERNIGHT_START_MIN // 60:
+            target += timedelta(days=1)
+        return max(1, int((target - now_utc).total_seconds()))
+
+    if sub_session == "pre_nyse":
         now_et        = datetime.now(_US_EAST_TZ)
         nyse_open_et  = now_et.replace(hour=9, minute=30, second=0, microsecond=0)
         nyse_open_utc = nyse_open_et.astimezone(timezone.utc)
         secs_to_nyse  = (nyse_open_utc - now_utc).total_seconds()
-        if secs_to_nyse > 0:
-            # Before NYSE open: use NYSE open as boundary, floor at 30 min
-            return max(_PERF_SAR_OIL_BOUNDARY_FLOOR_SECS, int(secs_to_nyse))
-        # Past NYSE open: fall through to standard 21:00 UTC boundary
+        return max(_PERF_SAR_OIL_BOUNDARY_FLOOR_SECS, int(secs_to_nyse))
 
-    if is_overnight():
-        # Overnight (21:00-07:00 UTC): next boundary is 07:00 UTC
-        target = now_utc.replace(hour=OVERNIGHT_END_MIN // 60, minute=0, second=0, microsecond=0)
-        if now_utc.hour >= OVERNIGHT_START_MIN // 60:
-            target += timedelta(days=1)  # after 21:00: 07:00 is next day
-    else:
-        # Day session (07:00-21:00 UTC): next boundary is 21:00 UTC
-        target = now_utc.replace(hour=OVERNIGHT_START_MIN // 60, minute=0, second=0, microsecond=0)
+    if sub_session == "nyse_morning":
+        now_et       = datetime.now(_US_EAST_TZ)
+        nyse_mid_et  = now_et.replace(hour=12, minute=0, second=0, microsecond=0)
+        nyse_mid_utc = nyse_mid_et.astimezone(timezone.utc)
+        secs_to_mid  = (nyse_mid_utc - now_utc).total_seconds()
+        return max(1, int(secs_to_mid))
+
+    # nyse_afternoon, plain "day", or legacy fallback — expire at 21:00 UTC
+    target = now_utc.replace(hour=OVERNIGHT_START_MIN // 60, minute=0, second=0, microsecond=0)
     return max(1, int((target - now_utc).total_seconds()))
 
 
 def _live_perf_blocked(sym: str) -> bool:
     """True if sym is blocked by the instrument performance filter.
     Checks legacy (june_perf_block:{sym}), WR (june_perf_block_wr:{sym}),
-    and SAR (june_perf_block_sar:{sym}) keys — any active key blocks.
-    Caches Redis state locally for 5 minutes per symbol to avoid per-cycle churn.
+    and SAR (june_perf_block_sar:{sym}:{sub_session}) keys — any active key blocks.
+    SAR blocks are sub-session specific (OIL/SILVER): a bad afternoon never blocks the next morning.
+    Caches Redis state locally: instrument-wide blocks under sym, SAR blocks under sym:sub_session.
     On Redis error: blocks the trade (fail-closed) to prevent trading through an active block.
     Caches for the full block TTL at fire time — no Redis check needed during the block window.
     """
     now = time.time()
+    sub = _current_sub_session(sym)
     if now < _perf_block_cache.get(sym, 0.0):
-        return True  # still within cache window — blocked
+        return True  # instrument-wide block cache (WR/legacy, or full-TTL from fire time)
+    if now < _perf_block_cache.get(f"{sym}:{sub}", 0.0):
+        return True  # sub-session SAR block cache — no Redis round-trip during block window
     try:
         r = _redis()
-        if (r.get(f"june_perf_block:{sym}") or
-                r.get(f"june_perf_block_wr:{sym}") or
-                r.get(f"june_perf_block_sar:{sym}")):
-            _perf_block_cache[sym] = now + 300.0  # 5-min cache after post-restart Redis hit
+        # Instrument-wide blocks (WR, legacy) apply across all sub-sessions.
+        if r.get(f"june_perf_block:{sym}") or r.get(f"june_perf_block_wr:{sym}"):
+            _perf_block_cache[sym] = now + 300.0  # 5-min cache for instrument-wide blocks
+            return True
+        # SAR block is sub-session specific — a bad afternoon never blocks the next morning.
+        if r.get(f"june_perf_block_sar:{sym}:{sub}"):
+            _perf_block_cache[f"{sym}:{sub}"] = now + 300.0
             return True
     except Exception as exc:
-        _live_log(f"⚠️ [PERF BLOCK] {sym}: Redis error checking perf block — treating as BLOCKED (fail-closed): {exc}")
+        _live_log(f"⚠️ [PERF BLOCK] {sym}/{sub}: Redis error — treating as BLOCKED (fail-closed): {exc}")
         return True  # fail-closed: never allow a blocked instrument to trade on Redis outage
     _perf_block_cache.pop(sym, None)
+    _perf_block_cache.pop(f"{sym}:{sub}", None)
     return False
 
 
@@ -6553,13 +6589,15 @@ def _live_perf_record(sym: str, won: bool, sar, pnl_dollar: float = 0.0, entry_s
         raw    = r.get(key)
         stats  = json.loads(raw) if raw else {"trades": []}
         trades = stats.get("trades", [])
-        session = "overnight" if is_overnight() else "day"
+        session     = "overnight" if is_overnight() else "day"
+        sub_session = _current_sub_session(sym)
         trades.append({
             "won": won,
             "sar": round(sar or 0.0, 4),
             "entry_sar": round(entry_sar, 4) if entry_sar is not None else None,
             "persistence_confirmed": persistence_confirmed,
             "session": session,
+            "sub_session": sub_session,
             "epoch": int(time.time()),
             "pnl_dollar": round(pnl_dollar, 4),
         })
@@ -6613,15 +6651,17 @@ def _live_perf_record(sym: str, won: bool, sar, pnl_dollar: float = 0.0, entry_s
                 )
 
         # ── SAR block (session-scoped TTL) ───────────────────────────────────────────────────────────
-        cur_session    = "overnight" if is_overnight() else "day"
-        # Piece 1: exclude pre-a62093f trades — pre-sizing-fix records used 100x over-sized lots,
-        # producing non-representative SAR values. Epoch cutoff = 2026-08-28 06:25 UTC.
-        session_trades_all = [t for t in recent if t.get("session") == cur_session]
+        cur_sub_session = _current_sub_session(sym)
+        # Exclude pre-a62093f trades (pre-sizing-fix, 100x over-sized lots, epoch cutoff 2026-08-28 06:25 UTC).
+        # Records without sub_session fall back to their "session" value for backwards compat.
+        session_trades_all = [
+            t for t in recent
+            if t.get("sub_session", t.get("session", "day")) == cur_sub_session
+        ]
         session_trades = [t for t in session_trades_all
                           if t.get("epoch", 0) >= _PERF_BLOCK_SAR_EPOCH_CUTOFF]
         if len(session_trades) >= _PERF_BLOCK_SAR_SESSION_MIN:
-            # Piece 2: entry_sar fallback — treat 0.0 same as None (pre-tracking sentinel);
-            # fall back to exit-time sar. Entry SAR is more correct when valid (> 0).
+            # entry_sar fallback: treat 0.0 same as None; fall back to exit-time sar.
             sar_vals = [
                 (t.get("entry_sar") if t.get("entry_sar") else t.get("sar", 0))
                 for t in session_trades
@@ -6630,14 +6670,16 @@ def _live_perf_record(sym: str, won: bool, sar, pnl_dollar: float = 0.0, entry_s
             if sar_vals:
                 avg_sar = sum(sar_vals) / len(sar_vals)
                 if avg_sar > _PERF_BLOCK_SAR_THRESH:
-                    sar_ttl = _perf_block_sar_ttl(sym)
-                    r.setex(f"june_perf_block_sar:{sym}", sar_ttl, "1")
-                    _perf_block_cache[sym] = time.time() + sar_ttl  # full TTL — no Redis gap
+                    sar_ttl   = _perf_block_sar_ttl(sym, cur_sub_session)
+                    sar_key   = f"june_perf_block_sar:{sym}:{cur_sub_session}"
+                    cache_key = f"{sym}:{cur_sub_session}"
+                    r.setex(sar_key, sar_ttl, "1")
+                    _perf_block_cache[cache_key] = time.time() + sar_ttl  # full TTL — no Redis gap
                     _live_log(
-                        f"⛔ [PERF BLOCK SAR] {sym}: Avg Spread/ATR {avg_sar:.0%} above "
+                        f"⛔ [PERF BLOCK SAR] {sym}/{cur_sub_session}: Avg Spread/ATR {avg_sar:.0%} above "
                         f"{_PERF_BLOCK_SAR_THRESH:.0%} threshold "
-                        f"({len(session_trades)}/{len(session_trades_all)} post-cutoff {cur_session}-session trades). "
-                        f"Suspended until next session ({sar_ttl}s)."
+                        f"({len(session_trades)}/{len(session_trades_all)} post-cutoff {cur_sub_session} trades). "
+                        f"Suspended until next sub-session ({sar_ttl}s)."
                     )
 
     except Exception as exc:
