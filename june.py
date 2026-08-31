@@ -6394,7 +6394,8 @@ def _live_perf_blocked(sym: str) -> bool:
     Checks legacy (june_perf_block:{sym}), WR (june_perf_block_wr:{sym}),
     and SAR (june_perf_block_sar:{sym}) keys — any active key blocks.
     Caches Redis state locally for 5 minutes per symbol to avoid per-cycle churn.
-    On Redis error: permits the trade (fail-open).
+    On Redis error: blocks the trade (fail-closed) to prevent trading through an active block.
+    Caches for the full block TTL at fire time — no Redis check needed during the block window.
     """
     now = time.time()
     if now < _perf_block_cache.get(sym, 0.0):
@@ -6404,10 +6405,11 @@ def _live_perf_blocked(sym: str) -> bool:
         if (r.get(f"june_perf_block:{sym}") or
                 r.get(f"june_perf_block_wr:{sym}") or
                 r.get(f"june_perf_block_sar:{sym}")):
-            _perf_block_cache[sym] = now + 300.0  # cache for 5 min
+            _perf_block_cache[sym] = now + 300.0  # 5-min cache after post-restart Redis hit
             return True
-    except Exception:
-        return False  # Redis unavailable — fail open
+    except Exception as exc:
+        _live_log(f"⚠️ [PERF BLOCK] {sym}: Redis error checking perf block — treating as BLOCKED (fail-closed): {exc}")
+        return True  # fail-closed: never allow a blocked instrument to trade on Redis outage
     _perf_block_cache.pop(sym, None)
     return False
 
@@ -6590,7 +6592,7 @@ def _live_perf_record(sym: str, won: bool, sar, pnl_dollar: float = 0.0, entry_s
                     and loss_pct > _PERF_BLOCK_HARD_LOSS_PCT):
                 r.setex(f"june_perf_block_wr:{sym}", _PERF_BLOCK_HARD_TTL, "hard")
                 _live_clear_observer(sym)
-                _perf_block_cache[sym] = time.time() + 300.0
+                _perf_block_cache[sym] = time.time() + _PERF_BLOCK_HARD_TTL  # full TTL — no Redis gap
                 _live_log(
                     f"⛔ [PERF HARD BLOCK] {sym}: WR {wr:.0%} < {_PERF_BLOCK_HARD_WR_THRESH:.0%}, "
                     f"loss {loss_pct:.1%} > {_PERF_BLOCK_HARD_LOSS_PCT:.0%} "
@@ -6626,7 +6628,7 @@ def _live_perf_record(sym: str, won: bool, sar, pnl_dollar: float = 0.0, entry_s
                 if avg_sar > _PERF_BLOCK_SAR_THRESH:
                     sar_ttl = _perf_block_sar_ttl(sym)
                     r.setex(f"june_perf_block_sar:{sym}", sar_ttl, "1")
-                    _perf_block_cache[sym] = time.time() + 300.0
+                    _perf_block_cache[sym] = time.time() + sar_ttl  # full TTL — no Redis gap
                     _live_log(
                         f"⛔ [PERF BLOCK SAR] {sym}: Avg Spread/ATR {avg_sar:.0%} above "
                         f"{_PERF_BLOCK_SAR_THRESH:.0%} threshold "
