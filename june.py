@@ -5566,6 +5566,8 @@ def _ts() -> str:
 _live: dict             = {}      # runtime state; empty = not started
 _live_balance_polled_at: float = 0.0
 _live_pnl_polled_at:    float  = 0.0
+_last_cycle_direction: dict       = {}   # sig["direction"] per sym from prior scan cycle
+_current_cycle_signals_snap: dict = {}   # signals snapshot from current cycle
 
 _LIVE_REDIS_KEY      = "june_live_state"
 _LIVE_REDIS_TTL      = 30 * 24 * 3600  # 30 days
@@ -6513,7 +6515,7 @@ def _live_migrate_perf_blocks() -> None:
                     f"(n={n}, WR={wr:.0%}, loss={loss_pct:.1%})"
                 )
 
-def _live_perf_record(sym: str, won: bool, sar, pnl_dollar: float = 0.0, entry_sar=None) -> None:
+def _live_perf_record(sym: str, won: bool, sar, pnl_dollar: float = 0.0, entry_sar=None, persistence_confirmed=None) -> None:
     """Update rolling per-instrument performance stats in Redis.
     Each record carries epoch timestamp and dollar P&L.
     Severity tiers keyed to % of current balance lost:
@@ -6534,6 +6536,7 @@ def _live_perf_record(sym: str, won: bool, sar, pnl_dollar: float = 0.0, entry_s
             "won": won,
             "sar": round(sar or 0.0, 4),
             "entry_sar": round(entry_sar, 4) if entry_sar is not None else None,
+            "persistence_confirmed": persistence_confirmed,
             "session": session,
             "epoch": int(time.time()),
             "pnl_dollar": round(pnl_dollar, 4),
@@ -7008,6 +7011,7 @@ def _live_open_position(sym: str, direction: str, signals: dict,
         "initial_sl_pct": stop_pct,  # baseline for time-decay SL compression
         "reversal_count": 0,
         "entry_sar":      round(sig.get("spread_atr_ratio") or 0.0, 4),
+        "persistence_confirmed": _last_cycle_direction.get(sym) == ("bull" if direction == "long" else "bear"),
     }
     _live["total_trades"]    = _live.get("total_trades", 0) + 1
     _live_log(
@@ -7348,7 +7352,7 @@ def _live_close_position(exit_reason: str, signals: dict) -> None:
 
         _live_update_streak(sym, dirn, won)
         _live_perf_record(sym, won, sig.get("spread_atr_ratio"), pnl_dollar=net_dollar,
-                          entry_sar=pos.get("entry_sar"))
+                          entry_sar=pos.get("entry_sar"), persistence_confirmed=pos.get("persistence_confirmed"))
         _sim_15m_record(sym, dirn, pos.get("entry_change_15m") or 0.0, won)
         # Live phase stat update — only counted when above balance gate
         if _live.get("balance", 0.0) >= _LIVE_PHASE_GATE_BAL:
@@ -8746,6 +8750,10 @@ def run_live_step(signals: dict) -> None:
     """
     if not _live:
         return    # not started
+
+    global _last_cycle_direction, _current_cycle_signals_snap
+    _last_cycle_direction       = {s: g.get("direction") for s, g in _current_cycle_signals_snap.items()}
+    _current_cycle_signals_snap = signals
 
     # Periodic balance and P&L refresh (every 5 minutes, not every cycle)
     _live_poll_balance()
