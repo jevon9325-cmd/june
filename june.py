@@ -5622,6 +5622,7 @@ _PERF_BLOCK_WR_THRESH  = 0.30    # block if win rate < 30% over window
 _PERF_BLOCK_SAR_THRESH = 0.50    # block if avg Spread/ATR ratio > 50% over window
 _PERF_BLOCK_TTL             = 86400  # 24-hour block duration (seconds)
 _PERF_BLOCK_SAR_SESSION_MIN = 4      # min same-session trades before SAR block fires
+_PERF_SAR_OIL_BOUNDARY_FLOOR_SECS = 30 * 60  # OIL NYSE boundary: floor = 6 scan cycles
 _PERF_BLOCK_RECENCY_DAYS    = 14     # only trades within this window count for WR/SAR evaluation
 _PERF_BLOCK_MIN_RECENT      = 8      # min recent trades required before WR block can fire (= full rolling window)
 _PERF_BLOCK_HARD_MIN_TRADES = 12     # stricter minimum for hard 12h block
@@ -6354,11 +6355,29 @@ def _live_is_paused(combo: str) -> bool:
 _perf_block_cache: dict = {}   # {sym: cache_expire_ts} — in-memory, refreshed from Redis
 
 
-def _perf_block_sar_ttl() -> int:
-    """Seconds until the next session boundary (21:00 UTC or 07:00 UTC).
-    Used to scope SAR perf blocks to the current trading session only.
+def _perf_block_sar_ttl(sym: str = "") -> int:
+    """Seconds until the next session boundary for SAR perf blocks.
+
+    Standard (all instruments except OIL): next 07:00 UTC (overnight) or 21:00 UTC (day).
+    OIL: NYSE open (09:30 ET, DST-aware via _US_EAST_TZ) is an intermediate boundary
+    during the London pre-NYSE window (07:00-13:30 UTC), so overnight-session noise does
+    not block OIL through its strongest intraday window. Floor of 30 min (6 scan cycles)
+    prevents a trivially-short block when the NYSE boundary is imminent.
+    SILVER: unaffected — London morning is SILVER's primary window, 07:00/21:00 boundaries
+    correctly cover both London and NY hours for precious metals.
     """
     now_utc = datetime.now(timezone.utc)
+
+    if sym == "OIL" and not is_overnight():
+        now_et        = datetime.now(_US_EAST_TZ)
+        nyse_open_et  = now_et.replace(hour=9, minute=30, second=0, microsecond=0)
+        nyse_open_utc = nyse_open_et.astimezone(timezone.utc)
+        secs_to_nyse  = (nyse_open_utc - now_utc).total_seconds()
+        if secs_to_nyse > 0:
+            # Before NYSE open: use NYSE open as boundary, floor at 30 min
+            return max(_PERF_SAR_OIL_BOUNDARY_FLOOR_SECS, int(secs_to_nyse))
+        # Past NYSE open: fall through to standard 21:00 UTC boundary
+
     if is_overnight():
         # Overnight (21:00-07:00 UTC): next boundary is 07:00 UTC
         target = now_utc.replace(hour=OVERNIGHT_END_MIN // 60, minute=0, second=0, microsecond=0)
@@ -6605,7 +6624,7 @@ def _live_perf_record(sym: str, won: bool, sar, pnl_dollar: float = 0.0, entry_s
             if sar_vals:
                 avg_sar = sum(sar_vals) / len(sar_vals)
                 if avg_sar > _PERF_BLOCK_SAR_THRESH:
-                    sar_ttl = _perf_block_sar_ttl()
+                    sar_ttl = _perf_block_sar_ttl(sym)
                     r.setex(f"june_perf_block_sar:{sym}", sar_ttl, "1")
                     _perf_block_cache[sym] = time.time() + 300.0
                     _live_log(
