@@ -6660,27 +6660,29 @@ def _live_perf_record(sym: str, won: bool, sar, pnl_dollar: float = 0.0, entry_s
         ]
         session_trades = [t for t in session_trades_all
                           if t.get("epoch", 0) >= _PERF_BLOCK_SAR_EPOCH_CUTOFF]
-        if len(session_trades) >= _PERF_BLOCK_SAR_SESSION_MIN:
-            # entry_sar fallback: treat 0.0 same as None; fall back to exit-time sar.
-            sar_vals = [
-                (t.get("entry_sar") if t.get("entry_sar") else t.get("sar", 0))
-                for t in session_trades
-                if (t.get("entry_sar") or t.get("sar", 0)) > 0
-            ]
-            if sar_vals:
-                avg_sar = sum(sar_vals) / len(sar_vals)
-                if avg_sar > _PERF_BLOCK_SAR_THRESH:
-                    sar_ttl   = _perf_block_sar_ttl(sym, cur_sub_session)
-                    sar_key   = f"june_perf_block_sar:{sym}:{cur_sub_session}"
-                    cache_key = f"{sym}:{cur_sub_session}"
-                    r.setex(sar_key, sar_ttl, "1")
-                    _perf_block_cache[cache_key] = time.time() + sar_ttl  # full TTL — no Redis gap
-                    _live_log(
-                        f"⛔ [PERF BLOCK SAR] {sym}/{cur_sub_session}: Avg Spread/ATR {avg_sar:.0%} above "
-                        f"{_PERF_BLOCK_SAR_THRESH:.0%} threshold "
-                        f"({len(session_trades)}/{len(session_trades_all)} post-cutoff {cur_sub_session} trades). "
-                        f"Suspended until next sub-session ({sar_ttl}s)."
-                    )
+        # Gate on VALID-SAR count, not total trade count.
+        # Zero-value entries (cold-start sentinels, pre-tracking records) must not count
+        # as evidence — a bucket with 4 trades but only 2 valid SAR measurements has
+        # 2 data points, not 4, and should not be able to fire the block.
+        sar_vals = [
+            (t.get("entry_sar") if t.get("entry_sar") else t.get("sar", 0))
+            for t in session_trades
+            if (t.get("entry_sar") or t.get("sar", 0)) > 0
+        ]
+        if len(sar_vals) >= _PERF_BLOCK_SAR_SESSION_MIN:
+            avg_sar = sum(sar_vals) / len(sar_vals)
+            if avg_sar > _PERF_BLOCK_SAR_THRESH:
+                sar_ttl   = _perf_block_sar_ttl(sym, cur_sub_session)
+                sar_key   = f"june_perf_block_sar:{sym}:{cur_sub_session}"
+                cache_key = f"{sym}:{cur_sub_session}"
+                r.setex(sar_key, sar_ttl, "1")
+                _perf_block_cache[cache_key] = time.time() + sar_ttl  # full TTL — no Redis gap
+                _live_log(
+                    f"⛔ [PERF BLOCK SAR] {sym}/{cur_sub_session}: Avg Spread/ATR {avg_sar:.0%} above "
+                    f"{_PERF_BLOCK_SAR_THRESH:.0%} threshold "
+                    f"({len(sar_vals)} valid / {len(session_trades)} post-cutoff {cur_sub_session} trades). "
+                    f"Suspended until next sub-session ({sar_ttl}s)."
+                )
 
     except Exception as exc:
         _live_log(f"[perf_record] {sym}: Redis error — {exc}")
