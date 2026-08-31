@@ -5624,6 +5624,7 @@ _PERF_BLOCK_TTL             = 86400  # 24-hour block duration (seconds)
 _PERF_BLOCK_SAR_SESSION_MIN = 4      # min same-session trades before SAR block fires
 _PERF_SAR_OIL_BOUNDARY_FLOOR_SECS = 30 * 60  # OIL NYSE boundary: floor = 6 scan cycles
 _PERF_BLOCK_RECENCY_DAYS    = 14     # only trades within this window count for WR/SAR evaluation
+_PERF_BLOCK_SAR_EPOCH_CUTOFF = 1787898314  # exclude pre-a62093f trades from SAR eval (2026-08-28 06:25 UTC — OIL/SILVER sizing fix)
 _PERF_BLOCK_MIN_RECENT      = 8      # min recent trades required before WR block can fire (= full rolling window)
 _PERF_BLOCK_HARD_MIN_TRADES = 12     # stricter minimum for hard 12h block
 _PERF_BLOCK_HARD_WR_THRESH  = 0.20   # hard block if WR < 20%
@@ -6613,13 +6614,16 @@ def _live_perf_record(sym: str, won: bool, sar, pnl_dollar: float = 0.0, entry_s
 
         # ── SAR block (session-scoped TTL) ───────────────────────────────────────────────────────────
         cur_session    = "overnight" if is_overnight() else "day"
-        session_trades = [t for t in recent if t.get("session") == cur_session]
+        # Piece 1: exclude pre-a62093f trades — pre-sizing-fix records used 100x over-sized lots,
+        # producing non-representative SAR values. Epoch cutoff = 2026-08-28 06:25 UTC.
+        session_trades_all = [t for t in recent if t.get("session") == cur_session]
+        session_trades = [t for t in session_trades_all
+                          if t.get("epoch", 0) >= _PERF_BLOCK_SAR_EPOCH_CUTOFF]
         if len(session_trades) >= _PERF_BLOCK_SAR_SESSION_MIN:
-            # Use entry_sar for block evaluation when available (recorded since this patch);
-            # fall back to exit-time sar for pre-patch records. Entry SAR is more correct:
-            # it reflects conditions at the point the bot decided to enter, not at close.
+            # Piece 2: entry_sar fallback — treat 0.0 same as None (pre-tracking sentinel);
+            # fall back to exit-time sar. Entry SAR is more correct when valid (> 0).
             sar_vals = [
-                (t.get("entry_sar") if t.get("entry_sar") is not None else t["sar"])
+                (t.get("entry_sar") if t.get("entry_sar") else t.get("sar", 0))
                 for t in session_trades
                 if (t.get("entry_sar") or t.get("sar", 0)) > 0
             ]
@@ -6632,7 +6636,7 @@ def _live_perf_record(sym: str, won: bool, sar, pnl_dollar: float = 0.0, entry_s
                     _live_log(
                         f"⛔ [PERF BLOCK SAR] {sym}: Avg Spread/ATR {avg_sar:.0%} above "
                         f"{_PERF_BLOCK_SAR_THRESH:.0%} threshold "
-                        f"({len(session_trades)} recent {cur_session}-session trades). "
+                        f"({len(session_trades)}/{len(session_trades_all)} post-cutoff {cur_session}-session trades). "
                         f"Suspended until next session ({sar_ttl}s)."
                     )
 
