@@ -2718,6 +2718,15 @@ _SIM_HIGH_VOL_THRESH = 0.50
 _SIM_LOW_VOL_THRESH  = 0.20
 
 # ── Weekend market signal integration ────────────────────────────────────────
+# -- Slow-grind detector: cumulative directional momentum over 4-cycle window
+_GRIND_WINDOW      = 4     # rolling cycle count (~4 min at 60s/cycle)
+_GRIND_CONSISTENCY = 0.75  # >=75% of cycles must agree on direction (3 of 4)
+_GRIND_THRESH: dict = {    # minimum net cumulative % move to trigger boost
+    "OIL":    0.28,         # ~2.5x OIL typical 1-cycle move; recalibrate at bal > $250
+    "SILVER": 0.22,         # ~2.5x SILVER typical 1-cycle move; recalibrate at bal > $250
+}
+_GRIND_MAX_PTS = 1.0       # bounded cap: conviction boost never exceeds 1pt
+
 _SIM_WKND_MAX_PTS = 1.0   # max conviction pts from weekend IG signal; matches streak_pts/rel_pts peers
 _WKND_SIGNAL_MAP  = {      # June instrument name → weekend_market_signals key
     "SILVER":  "gold",     # Silver CFD is EDITS_ONLY on weekends; Gold is proxy
@@ -3176,11 +3185,14 @@ def _sim_conviction_gauge(
         rel_pts = 0.0
     wknd_pts    = _sim_weekend_pts(sym, direction)
     claudia_pts = _sim_claudia_pts(sym, direction)
-    raw = clearance + regime_pts + bucket_pts + streak_pts + rel_pts + wknd_pts + claudia_pts
+    grind_pts   = _slow_grind_pts(sym, direction)
+    raw = clearance + regime_pts + bucket_pts + streak_pts + rel_pts + wknd_pts + claudia_pts + grind_pts
     if wknd_pts:
         import logging; logging.getLogger().debug(f"  wknd_pts={wknd_pts:+.3f} for {sym}/{direction}")
     if claudia_pts:
         import logging; logging.getLogger().debug(f"  claudia_pts={claudia_pts:+.3f} for {sym}/{direction}")
+    if grind_pts:
+        import logging; logging.getLogger().debug(f"  grind_pts={grind_pts:+.3f} for {sym}/{direction}")
     return max(1, min(10, round(raw)))
 
 
@@ -3621,6 +3633,55 @@ def _load_claudia_directive_notes() -> None:
         }
     except Exception:
         _claudia_directive_notes = {}
+
+
+def _slow_grind_pts(sym: str, direction: str) -> float:
+    """Cumulative slow-grind conviction boost (max +_GRIND_MAX_PTS = 1.0 pt).
+
+    Detects concentrated directional momentum over the last _GRIND_WINDOW
+    one-minute cycles using the existing _history deque. No new data source.
+
+    Fires when ALL three hold:
+      1. |net_sum| >= _GRIND_THRESH[sym]  -- sufficient cumulative move
+      2. consistent_fraction >= 0.75      -- >=3 of 4 cycles same direction
+      3. net_sum sign matches direction    -- correct direction only
+
+    Distinct from persistence_confirmed: that flag checks ONE prior cycle for
+    direction agreement. This function requires BOTH magnitude (net_sum
+    threshold) AND consistency (>=75%) across a 4-cycle window.
+
+    Additive only -- never a gate. spread_alert, HYBRID spread gate, and
+    SAR/perf-block all override this boost unconditionally.
+    Returns 0.0 for instruments without a configured threshold.
+    """
+    if sym not in _GRIND_THRESH:
+        return 0.0
+    hist = _history.get(sym)
+    if not hist or len(hist) < _GRIND_WINDOW + 1:
+        return 0.0
+    prices = [px for _, px in hist]
+    recent = prices[-(_GRIND_WINDOW + 1):]   # last N+1 readings -> N changes
+    changes = [
+        (recent[i + 1] - recent[i]) / recent[i] * 100.0
+        for i in range(_GRIND_WINDOW)
+        if recent[i] > 0
+    ]
+    if len(changes) < _GRIND_WINDOW:
+        return 0.0
+    net_sum = sum(changes)
+    same_dir = sum(
+        1 for c in changes
+        if (c > 0 and direction == 'long') or (c < 0 and direction == 'short')
+    )
+    consistent_fraction = same_dir / len(changes)
+    target_sign = 1 if direction == 'long' else -1
+    if (
+        abs(net_sum) >= _GRIND_THRESH[sym]
+        and consistent_fraction >= _GRIND_CONSISTENCY
+        and net_sum * target_sign > 0
+    ):
+        return _GRIND_MAX_PTS
+    return 0.0
 
 
 def _sim_claudia_pts(sym: str, direction: str) -> float:
