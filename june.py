@@ -79,6 +79,9 @@ POLL_MAINT  = 5 * 60    # 5-min cadence during detected maintenance window
 SIGNAL_TTL  = 120       # june_signals Redis TTL — stale data is worse than no data
 SESSION_MAX = 6 * 3600 - 1800  # re-auth 30 min before 6h IG token expiry
 HISTORY_LEN = 20        # rolling price readings per instrument (~20 min at 60s)
+_HISTORY_REDIS_KEY       = "june_price_history"  # persisted rolling price deques
+_HISTORY_REDIS_TTL       = HISTORY_LEN * 60 * 3  # 60 min TTL — 3x the window
+_HISTORY_STALE_CUTOFF    = 300  # discard saved readings older than 5 min (5 missed cycles)
 
 # ── Weekend / session windows (all in UTC minutes-since-midnight) ────────────
 # IG CFD closure: Friday 21:15 UTC → Sunday 21:00 UTC
@@ -2612,7 +2615,62 @@ def poll_cycle() -> bool:
     price_row = " | ".join(f"{s}={v['price']:.4f}({v['change_5m']:+.3f}%)" for s, v in signals.items())
     print(f"[{_ts()}] 📡 {len(signals)} signals published (TTL {SIGNAL_TTL}s){alert_tag}", flush=True)
     print(f"[{_ts()}]    {price_row}", flush=True)
+    _history_save()
     return True
+
+
+def _history_save() -> None:
+    """Persist all _history deques to Redis so the grind detector survives restarts."""
+    try:
+        payload = {sym: [[e, m] for e, m in hist] for sym, hist in _history.items() if hist}
+        _redis().set(_HISTORY_REDIS_KEY, __import__("json").dumps(payload), ex=_HISTORY_REDIS_TTL)
+    except Exception as _exc:
+        import logging; logging.getLogger().warning(f"_history_save failed: {_exc}")
+
+
+def _history_load() -> None:
+    """Restore _history deques from Redis on startup.
+
+    Per-instrument staleness check: if the most recent reading for a given
+    instrument is older than _HISTORY_STALE_CUTOFF seconds (default 5 min /
+    5 missed cycles), that instrument's history is discarded and cold-starts.
+    Fresh instruments load immediately -- the grind detector can fire as soon
+    as 20 readings are present, with no 20-minute wait after a brief restart.
+    """
+    try:
+        raw = _redis().get(_HISTORY_REDIS_KEY)
+        if not raw:
+            return
+        import json as _json, time as _time
+        stored = _json.loads(raw)
+        now = _time.time()
+        loaded = discarded = 0
+        for sym, readings in stored.items():
+            if sym not in _history:
+                continue
+            if not readings:
+                continue
+            last_epoch = readings[-1][0]
+            if now - last_epoch > _HISTORY_STALE_CUTOFF:
+                discarded += 1
+                continue
+            for epoch, mid in readings:
+                _history[sym].append((epoch, mid))
+            loaded += 1
+        if loaded or discarded:
+            import logging
+            logging.getLogger().info(
+                f"_history_load: {loaded} instruments restored, "
+                f"{discarded} discarded (stale >{_HISTORY_STALE_CUTOFF}s)"
+            )
+            print(
+                f"[{{__import__('time').strftime('%Y-%m-%d %H:%M UTC', __import__('time').gmtime())}}] "
+                f"\U0001f9e0 Price history: {loaded} instruments restored, "
+                f"{discarded} discarded (stale >{_HISTORY_STALE_CUTOFF}s)",
+                flush=True
+            )
+    except Exception as _exc:
+        import logging; logging.getLogger().warning(f"_history_load failed: {_exc}")
 
 
 # ── Utility ───────────────────────────────────────────────────────────────────
@@ -9314,6 +9372,9 @@ def main():
 
     # Start live trading (gated behind kill switch; safe to call with switch off)
     _live_startup()
+
+    # Restore rolling price history so grind detector doesn't cold-start after short restarts
+    _history_load()
 
     if not INSTRUMENTS:
         print(f"[{_ts()}] ❌ No valid instruments after verification — exiting", flush=True)
