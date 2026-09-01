@@ -3744,6 +3744,38 @@ def _slow_grind_pts(sym: str, direction: str) -> float:
     return 0.0
 
 
+def _exhaustion_ratio(sym: str, direction: str) -> float:
+    """Ratio of net directional price move (full _history window) to current ATR_5m.
+
+    Measures how much of the current trend has already played out before entry.
+      0.0   — price moved against our direction (fresh entry, no exhaustion)
+      >0    — price already moved in our direction; larger = more exhausted
+      >=3.5 — chasing: blocked by live entry pipeline
+      2.5–3.5 — conviction reduced 1pt
+
+    Uses the same _history deque and _compute_atr_5m() as the HYBRID spread gate
+    and slow-grind detector — no new data source.
+
+    Three distinct, complementary signal-quality checks:
+      persistence_confirmed — single prior-cycle direction agreement
+      _slow_grind_pts       — sustained multi-cycle consistency + magnitude
+      _exhaustion_ratio     — total elapsed move vs ATR (chasing detection)
+    """
+    hist = _history.get(sym)
+    if not hist or len(hist) < 6:
+        return 0.0   # warming up — skip check
+    atr_5m, _ = _compute_atr_5m(sym)
+    if not atr_5m or atr_5m == 0.0:
+        return 0.0
+    prices = [px for _, px in hist]
+    net_move = prices[-1] - prices[0]
+    # Sign in direction of trade: positive = price already moved our way
+    net_signed = net_move if direction == "long" else -net_move
+    if net_signed <= 0.0:
+        return 0.0   # price moved against direction — no exhaustion for this trade side
+    return net_signed / atr_5m
+
+
 def _sim_claudia_pts(sym: str, direction: str) -> float:
     """Soft conviction adjustment from Claudia's session directive.
     Bounded to ±0.3 (below _SIM_WKND_MAX_PTS=1.0 peer ceiling).
@@ -5771,6 +5803,33 @@ _PERF_BLOCK_SAR_SESSION_MIN = 4      # min same-session trades before SAR block 
 _PERF_SAR_OIL_BOUNDARY_FLOOR_SECS = 30 * 60  # OIL NYSE boundary: floor = 6 scan cycles
 _PERF_BLOCK_RECENCY_DAYS    = 14     # only trades within this window count for WR/SAR evaluation
 _PERF_BLOCK_SAR_EPOCH_CUTOFF = 1787898314  # exclude pre-a62093f trades from SAR eval (2026-08-28 06:25 UTC — OIL/SILVER sizing fix)
+
+# Trend-exhaustion gate thresholds — derived from OIL/SILVER historical move data.
+# Ratio = net directional price move (full _history window) / ATR_5m.
+# Calibrated against today's 16:14-18:50 OIL cluster: clean entries 1.0–2.5×, exhausted 4.5–8.1×.
+_EXHAUST_RATIO_REDUCE = 2.5   # conviction -1 when move has run > 2.5× ATR_5m in direction
+_EXHAUST_RATIO_BLOCK  = 3.5   # block entry when move has run > 3.5× ATR_5m in direction
+
+# Defect-quarantine registry — MANUALLY MAINTAINED, never auto-populated.
+# Add an entry ONLY when a diagnosed+fixed code defect has already been corrected
+# in this same commit; tagging without a corresponding structural fix is not permitted.
+# Trades matching each window get excluded_defect_id set in Redis; SAR/WR calcs skip them.
+_DEFECT_QUARANTINE: list = [
+    {
+        "sym":       "OIL",
+        "defect_id": "late_entry_exhaustion_2026-09-01",
+        "epoch_min": 1788280100,   # 2026-09-01 16:28 UTC — first exhaustion-blocked entry
+        "epoch_max": 1788281800,   # 2026-09-01 16:55 UTC — last defect-pattern exit
+        "note": (
+            "4 OIL trades caused by trend-exhaustion code defect (structural entry lag "
+            "+ immediate re-entry chasing exhausted moves): "
+            "16:28 BUY 9355.5 (ratio~4.5x), 16:31 BUY 9376 (ratio~8.1x), "
+            "16:51 SELL 9319.3 (ratio~3.7x), 16:54 BUY 9345.7 (flip into resumed uptrend). "
+            "Fixed by _exhaustion_ratio() gate in same commit — these patterns are now "
+            "structurally blocked before any order is placed."
+        ),
+    },
+]
 _PERF_BLOCK_MIN_RECENT      = 8      # min recent trades required before WR block can fire (= full rolling window)
 _PERF_BLOCK_HARD_MIN_TRADES = 12     # stricter minimum for hard 12h block
 _PERF_BLOCK_HARD_WR_THRESH  = 0.20   # hard block if WR < 20%
@@ -6627,7 +6686,7 @@ def _live_migrate_perf_blocks() -> None:
             trades = []
 
         cutoff = _time.time() - _PERF_BLOCK_RECENCY_DAYS * 86400
-        recent = [t for t in trades if t.get("epoch", 0) >= cutoff]
+        recent = [t for t in trades if t.get("epoch", 0) >= cutoff and not t.get("excluded_defect_id")]
         n = len(recent)
         wins = sum(1 for t in recent if t.get("won"))
         wr = wins / n if n > 0 else 1.0
@@ -6694,7 +6753,7 @@ def _live_migrate_perf_blocks() -> None:
                     f"(n={n}, WR={wr:.0%}, loss={loss_pct:.1%})"
                 )
 
-def _live_perf_record(sym: str, won: bool, sar, pnl_dollar: float = 0.0, entry_sar=None, persistence_confirmed=None) -> None:
+def _live_perf_record(sym: str, won: bool, sar, pnl_dollar: float = 0.0, entry_sar=None, persistence_confirmed=None, excluded_defect_id: str = None) -> None:
     """Update rolling per-instrument performance stats in Redis.
     Each record carries epoch timestamp and dollar P&L.
     Severity tiers keyed to % of current balance lost:
@@ -6721,6 +6780,7 @@ def _live_perf_record(sym: str, won: bool, sar, pnl_dollar: float = 0.0, entry_s
             "sub_session": sub_session,
             "epoch": int(time.time()),
             "pnl_dollar": round(pnl_dollar, 4),
+            **({"excluded_defect_id": excluded_defect_id} if excluded_defect_id else {}),
         })
         keep = max(_PERF_BLOCK_WINDOW, _PERF_BLOCK_HARD_MIN_TRADES)
         if len(trades) > keep:
@@ -6730,7 +6790,11 @@ def _live_perf_record(sym: str, won: bool, sar, pnl_dollar: float = 0.0, entry_s
 
         # ── Recency filter ─────────────────────────────────────────────────────────────────────────
         cutoff = time.time() - (_PERF_BLOCK_RECENCY_DAYS * 86400)
-        recent = [t for t in trades if t.get("epoch", 0) >= cutoff]
+        _recent_all = [t for t in trades if t.get("epoch", 0) >= cutoff]
+        recent = [t for t in _recent_all if not t.get("excluded_defect_id")]
+        _qt_wr = len(_recent_all) - len(recent)
+        if _qt_wr:
+            _live_log(f"  [QUARANTINE] {sym}: {_qt_wr} defect-tagged trade(s) excluded from WR eval")
         n = len(recent)
         wins = sum(1 for t in recent if t.get("won"))
         wr = wins / n if n > 0 else 1.0
@@ -6779,8 +6843,15 @@ def _live_perf_record(sym: str, won: bool, sar, pnl_dollar: float = 0.0, entry_s
             t for t in recent
             if t.get("sub_session", t.get("session", "day")) == cur_sub_session
         ]
-        session_trades = [t for t in session_trades_all
-                          if t.get("epoch", 0) >= _PERF_BLOCK_SAR_EPOCH_CUTOFF]
+        _session_trades_cutoff = [t for t in session_trades_all
+                                    if t.get("epoch", 0) >= _PERF_BLOCK_SAR_EPOCH_CUTOFF]
+        session_trades = [t for t in _session_trades_cutoff if not t.get("excluded_defect_id")]
+        for _qt in _session_trades_cutoff:
+            if _qt.get("excluded_defect_id"):
+                _live_log(
+                    f"  [QUARANTINE] {sym} epoch={_qt['epoch']} "
+                    f"defect={_qt['excluded_defect_id']!r} excluded from SAR eval"
+                )
         # Gate on VALID-SAR count, not total trade count.
         # Zero-value entries (cold-start sentinels, pre-tracking records) must not count
         # as evidence — a bucket with 4 trades but only 2 valid SAR measurements has
@@ -8861,6 +8932,24 @@ def _live_try_entry(signals: dict, regime: str) -> None:
             f"[{'+'.join(_floor_parts)}]"
         )
         return
+    # ── Trend-exhaustion gate ────────────────────────────────────────────────
+    # Blocks entries where the directional move in the _history window has
+    # already run > _EXHAUST_RATIO_BLOCK × ATR_5m. Prevents chasing aged moves
+    # after the vol signal has decayed. Thresholds derived from OIL/SILVER data:
+    # clean entries ≤2.5×, exhausted entries 4.5–8.1× (today's loss cluster).
+    _ex_ratio = _exhaustion_ratio(sym, direction)
+    if _ex_ratio >= _EXHAUST_RATIO_BLOCK:
+        _live_log(
+            f"skip {sym}: trend-exhausted {_ex_ratio:.1f}× ATR ≥ {_EXHAUST_RATIO_BLOCK}× "
+            f"({direction}, net_move/ATR_5m over history window)"
+        )
+        return
+    if _ex_ratio >= _EXHAUST_RATIO_REDUCE:
+        conv = max(1, conv - 1)
+        _live_log(
+            f"  📉 trend-exhaustion {_ex_ratio:.1f}× ATR: conviction reduced 1pt → {conv}/10"
+        )
+
     _cv_lev = _sim_conviction_leverage("sprout", conv)
     # Phase system: cap conviction-based lev at current phase ceiling.
     # Dormant below _LIVE_PHASE_GATE_BAL — lev passes through unchanged.
@@ -9159,6 +9248,54 @@ def _live_reconcile_positions() -> None:
         _live.pop("manual_review_required", None)  # cascade fully resolved — unblock closes
 
 
+def _apply_defect_quarantine() -> None:
+    """Tag diagnosed, fixed code-defect trades in Redis so SAR/WR calculations skip them.
+
+    Idempotent — safe to call on every startup. Reads _DEFECT_QUARANTINE registry;
+    each entry must reference a real defect fixed in the same commit that added it.
+    Never auto-fires based on loss size or streak — only explicit registry entries apply.
+
+    Tagging flow:
+      1. Read june_perf_stats:{sym} from Redis
+      2. Find trades in [epoch_min, epoch_max] without excluded_defect_id already set
+      3. Set excluded_defect_id = defect_id on matching records
+      4. Write back; log count tagged (0 = already done or no matching trades)
+    """
+    import logging as _log
+    log = _log.getLogger()
+    for entry in _DEFECT_QUARANTINE:
+        sym       = entry["sym"]
+        defect_id = entry["defect_id"]
+        emin      = entry["epoch_min"]
+        emax      = entry["epoch_max"]
+        note      = entry.get("note", "")
+        try:
+            r   = _redis()
+            key = f"june_perf_stats:{sym}"
+            raw = r.get(key)
+            if not raw:
+                continue
+            stats  = json.loads(raw)
+            trades = stats.get("trades", [])
+            tagged = 0
+            for t in trades:
+                ep = t.get("epoch", 0)
+                if emin <= ep <= emax and not t.get("excluded_defect_id"):
+                    t["excluded_defect_id"] = defect_id
+                    tagged += 1
+            if tagged:
+                stats["trades"] = trades
+                r.set(key, json.dumps(stats))
+                log.info(
+                    f"[QUARANTINE] Tagged {tagged} {sym} trade(s) as {defect_id!r} "
+                    f"(epoch {emin}–{emax}). Note: {note[:120]}"
+                )
+            else:
+                log.debug(f"[QUARANTINE] {sym}/{defect_id}: no new trades to tag (already done or none in window)")
+        except Exception as exc:
+            log.warning(f"[QUARANTINE] Failed to tag {sym}/{defect_id}: {exc}")
+
+
 def _live_startup() -> None:
     """Initialize live trading state. Called once from main() after sim_startup().
     Safe to call when live account is not available — degrades gracefully.
@@ -9377,6 +9514,9 @@ def main():
 
     # Restore rolling price history so grind detector doesn't cold-start after short restarts
     _history_load()
+
+    # Tag diagnosed+fixed defect trades in Redis so SAR/WR calcs skip them
+    _apply_defect_quarantine()
 
     if not INSTRUMENTS:
         print(f"[{_ts()}] ❌ No valid instruments after verification — exiting", flush=True)
