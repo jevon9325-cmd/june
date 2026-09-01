@@ -2719,7 +2719,7 @@ _SIM_LOW_VOL_THRESH  = 0.20
 
 # ── Weekend market signal integration ────────────────────────────────────────
 # -- Slow-grind detector: cumulative directional momentum over 4-cycle window
-_GRIND_WINDOW      = 4     # rolling cycle count (~4 min at 60s/cycle)
+_GRIND_WINDOW      = 19    # rolling cycle count (uses all 20 deque readings -> 19 changes, ~19 min at 60s/cycle)
 _GRIND_CONSISTENCY = 0.75  # >=75% of cycles must agree on direction (3 of 4)
 _GRIND_THRESH: dict = {    # minimum net cumulative % move to trigger boost
     "OIL":    0.28,         # ~2.5x OIL typical 1-cycle move; recalibrate at bal > $250
