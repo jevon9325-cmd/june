@@ -1014,6 +1014,7 @@ def _maybe_reset_daily_flags():
     if _flags["date"] != today:
         _flags["date"]      = today
         _flags["gap_syms"]  = set()
+        _htf_self_calibrate()  # re-run on date rollover (no-op if <10 new matched events)
         # ny_close_date / premarket_date / morning_pub_date intentionally not reset here —
         # they track whether today's capture already happened and are keyed by date string.
 
@@ -5747,6 +5748,8 @@ _live_pnl_polled_at:    float  = 0.0
 _last_cycle_direction: dict       = {}   # sig["direction"] per sym from prior scan cycle
 _current_cycle_signals_snap: dict = {}   # signals snapshot from current cycle
 _live_spread_block_cooldown: dict = {}   # sym -> last_logged_ts (5-min dedup for block log)
+_htf_ready_alerted: bool = False         # review-readiness alert: fires at most once per process
+_htf_calib_last_n:  int  = 0             # N events at last calibration; re-runs every +10 new
 
 _LIVE_REDIS_KEY      = "june_live_state"
 _LIVE_REDIS_TTL      = 30 * 24 * 3600  # 30 days
@@ -5869,6 +5872,198 @@ def _live_write_block_log(sym: str, direction: str, gate: str, values: dict) -> 
         _r.expire("june_live_block_log", 86400)
     except Exception:
         pass
+
+
+# ── HTF (Higher-Timeframe) Observation Pipeline ─────────────────────────────
+# Observation-only: collects hourly candle data, logs [HTF DIAG], accumulates
+# events for self-calibration, and emits a one-shot readiness alert.  Zero effect
+# on any conviction value, gate, or trading decision anywhere in this file.
+
+_HTF_INSTRUMENTS = {
+    "OIL":    "CC.D.LCO.BMU.IP",
+    "SILVER": "CS.D.CFDSILVER.BMU.IP",
+    "NATGAS": "CC.D.NG.BMU.IP",
+}
+_HTF_NOISE_FLOOR_PROV  = 0.003   # 0.3% provisional noise floor
+_HTF_SATURATION_PROV   = 0.008   # 0.8% provisional saturation
+_HTF_CANDLE_TTL        = 3300    # 55-min Redis TTL for cached hourly candles
+_HTF_EVENTS_KEY        = "june_htf_events"
+_HTF_READY_KEY         = "june_htf_ready_alert"
+_HTF_CALIB_MIN_EVENTS  = 30
+_HTF_CALIB_RERUN_EVERY = 10
+_HTF_CALIB_MIN_SEP     = 0.10    # 10pp aligned vs opposed WR gap required
+
+
+def _live_fetch_htf_candles(sym):
+    """Return last 4 hourly OHLC mid-price dicts via IG REST.
+    Cached in Redis 55 min.  OBSERVATION-ONLY.
+    """
+    epic = _HTF_INSTRUMENTS.get(sym)
+    if not epic:
+        return []
+    cache_key = "june_htf_candles:" + sym
+    try:
+        cached = _redis().get(cache_key)
+        if cached:
+            return json.loads(cached)
+    except Exception:
+        pass
+    data = _ig_live_get("/prices/" + epic,
+                        params={"resolution": "HOUR", "max": 4},
+                        version="3")
+    if not data:
+        return []
+    raw = data.get("prices", [])
+    if len(raw) < 2:
+        return []
+    candles = []
+    for p in raw:
+        cp  = p.get("closePrice", {})
+        mid = ((cp.get("bid") or 0) + (cp.get("ask") or 0)) / 2
+        if mid > 0:
+            candles.append({"close": round(mid, 5), "ts": p.get("snapshotTimeUTC", "")})
+    try:
+        _redis().set(cache_key, json.dumps(candles), ex=_HTF_CANDLE_TTL)
+    except Exception:
+        pass
+    return candles
+
+
+def _compute_htf_alignment(sym, direction):
+    """Compute HTF directional bias from last 3 hourly closes.
+    Returns (htf_bias, htf_move, note).  OBSERVATION-ONLY.
+    """
+    candles = _live_fetch_htf_candles(sym)
+    if len(candles) < 2:
+        return "unknown", 0.0, "insufficient candles"
+    oldest = candles[0]["close"]
+    latest = candles[-1]["close"]
+    if oldest <= 0:
+        return "unknown", 0.0, "zero price"
+    htf_move = (latest - oldest) / oldest
+    if htf_move > _HTF_NOISE_FLOOR_PROV:
+        htf_bias = "bull"
+    elif htf_move < -_HTF_NOISE_FLOOR_PROV:
+        htf_bias = "bear"
+    else:
+        htf_bias = "neutral"
+    aligned = ((direction == "long"  and htf_bias == "bull") or
+               (direction == "short" and htf_bias == "bear"))
+    opposed = ((direction == "long"  and htf_bias == "bear") or
+               (direction == "short" and htf_bias == "bull"))
+    alignment = "aligned" if aligned else ("opposed" if opposed else "neutral/unknown")
+    note = ("HTF %s %.2f%% over %dh -> %s"
+            % ("bull" if htf_move >= 0 else "bear",
+               abs(htf_move) * 100, len(candles) - 1, alignment))
+    return htf_bias, htf_move, note
+
+
+def _live_write_htf_event(sym, direction, htf_bias, htf_move_pct, entry_price):
+    """Write completed-trade HTF event to Redis for calibration.  Fire-and-forget.
+    OBSERVATION-ONLY.
+    """
+    try:
+        rec = json.dumps({
+            "ts":           int(time.time()),
+            "sym":          sym,
+            "direction":    direction,
+            "htf_bias":     htf_bias,
+            "htf_move_pct": round(htf_move_pct, 5),
+            "entry_price":  round(entry_price, 5),
+        })
+        _r = _redis()
+        _r.lpush(_HTF_EVENTS_KEY, rec)
+        _r.ltrim(_HTF_EVENTS_KEY, 0, 499)
+        _r.expire(_HTF_EVENTS_KEY, 86400 * 30)
+    except Exception:
+        pass
+
+
+def _htf_self_calibrate():
+    """Match HTF events against trade history; log WR by alignment bucket.
+    NEVER modifies any conviction, gate, or trading decision.
+    Emits [HTF CALIB] log and one-shot readiness alert when criteria met.
+    """
+    global _htf_ready_alerted, _htf_calib_last_n
+    try:
+        _r = _redis()
+        raw_events = _r.lrange(_HTF_EVENTS_KEY, 0, -1)
+        if not raw_events:
+            return
+        n_raw = len(raw_events)
+        events = []
+        for raw in raw_events:
+            try:
+                events.append(json.loads(raw))
+            except Exception:
+                pass
+        trade_hist = _live.get("trade_history", [])
+        results = {"aligned": [], "opposed": [], "neutral": []}
+        matched = 0
+        for ev in events:
+            ev_ts  = ev.get("ts", 0)
+            ev_sym = ev.get("sym", "")
+            ev_dir = ev.get("direction", "")
+            htf_b  = ev.get("htf_bias", "unknown")
+            match = None
+            for tr in trade_hist:
+                if tr.get("instrument") != ev_sym or tr.get("direction") != ev_dir:
+                    continue
+                if abs(tr.get("exit_epoch", 0) - ev_ts) <= 1800:
+                    match = tr
+                    break
+            if match is None:
+                continue
+            matched += 1
+            won = match.get("dollar_pnl", 0.0) > 0
+            pnl = match.get("pnl_pct", 0.0)
+            aligned = ((ev_dir == "long"  and htf_b == "bull") or
+                       (ev_dir == "short" and htf_b == "bear"))
+            opposed = ((ev_dir == "long"  and htf_b == "bear") or
+                       (ev_dir == "short" and htf_b == "bull"))
+            bucket  = "aligned" if aligned else ("opposed" if opposed else "neutral")
+            results[bucket].append((won, pnl))
+        if matched - _htf_calib_last_n < _HTF_CALIB_RERUN_EVERY and _htf_calib_last_n > 0:
+            return
+        _htf_calib_last_n = matched
+        _live_log("[HTF CALIB] n_raw=%d matched=%d | aligned=%d opposed=%d neutral=%d"
+                  % (n_raw, matched, len(results["aligned"]),
+                     len(results["opposed"]), len(results["neutral"])))
+        for bucket, trades in results.items():
+            if not trades:
+                continue
+            wr     = sum(1 for w, _ in trades if w) / len(trades)
+            avg_pl = sum(p for _, p in trades) / len(trades)
+            _live_log("[HTF CALIB] %s: N=%d WR=%.0f%% avg_pnl=%+.3f%%"
+                      % (bucket, len(trades), wr * 100, avg_pl * 100))
+        al = results["aligned"]
+        op = results["opposed"]
+        if (matched >= _HTF_CALIB_MIN_EVENTS
+                and len(al) >= 5 and len(op) >= 5
+                and not _htf_ready_alerted):
+            al_wr = sum(1 for w, _ in al if w) / len(al)
+            op_wr = sum(1 for w, _ in op if w) / len(op)
+            if abs(al_wr - op_wr) >= _HTF_CALIB_MIN_SEP:
+                al_avg = sum(p for _, p in al) / len(al)
+                op_avg = sum(p for _, p in op) / len(op)
+                _live_log(
+                    "\U0001f514 [HTF READY FOR REVIEW] N=%d matched | "
+                    "aligned_WR=%.0f%% (N=%d) vs opposed_WR=%.0f%% (N=%d) | "
+                    "separation=%.0f%% | avg_pnl aligned=%+.3f%% opposed=%+.3f%%"
+                    % (matched, al_wr * 100, len(al), op_wr * 100, len(op),
+                       abs(al_wr - op_wr) * 100, al_avg * 100, op_avg * 100)
+                )
+                try:
+                    _redis().set(_HTF_READY_KEY, json.dumps({
+                        "ts": int(time.time()), "matched": matched,
+                        "aligned_wr": round(al_wr, 4), "opposed_wr": round(op_wr, 4),
+                        "al_avg_pnl": round(al_avg, 6), "op_avg_pnl": round(op_avg, 6),
+                    }), ex=86400 * 7)
+                except Exception:
+                    pass
+                _htf_ready_alerted = True
+    except Exception as exc:
+        _live_log("[HTF CALIB] error: %s" % exc)
 
 
 # ── Redis persistence ─────────────────────────────────────────────────────────
@@ -7086,7 +7281,7 @@ def _live_confirm_deal(deal_ref: str, retries: int = 4) -> Optional[dict]:
 
 def _live_open_position(sym: str, direction: str, signals: dict,
                         pos_size: float, leverage: int, conviction: int,
-                        stop_mult: float = 1.0) -> None:
+                        stop_mult: float = 1.0, htf_bias: str = "unknown") -> None:
     """Place a real BUY/SELL order on the IG live account.
 
     STRUCTURALLY GATED: _live_trade_guard() is the first call. No code path can
@@ -7290,6 +7485,7 @@ def _live_open_position(sym: str, direction: str, signals: dict,
         "reversal_count": 0,
         "entry_sar":      round(sig.get("spread_atr_ratio") or 0.0, 4),
         "persistence_confirmed": _last_cycle_direction.get(sym) == ("bull" if direction == "long" else "bear"),
+        "htf_bias":     htf_bias,  # observation-only; never gates or conviction
     }
     _live["total_trades"]    = _live.get("total_trades", 0) + 1
     _live_log(
@@ -7629,6 +7825,9 @@ def _live_close_position(exit_reason: str, signals: dict) -> None:
             if won: _live["short_wins"] = _live.get("short_wins", 0) + 1
 
         _live_update_streak(sym, dirn, won)
+        _htf_b_c = pos.get("htf_bias", "unknown")
+        if _htf_b_c not in ("unknown", None):
+            _live_write_htf_event(sym, dirn, _htf_b_c, 0.0, fill_px)
         _live_perf_record(sym, won, sig.get("spread_atr_ratio"), pnl_dollar=net_dollar,
                           entry_sar=pos.get("entry_sar"), persistence_confirmed=pos.get("persistence_confirmed"))
         _sim_15m_record(sym, dirn, pos.get("entry_change_15m") or 0.0, won)
@@ -9062,8 +9261,12 @@ def _live_try_entry(signals: dict, regime: str) -> None:
         f"conv {conv}/10 lev {lev}:1 pos ${pos_size:.2f} notional ${notional:.2f}"
     )
 
+    _htf_b, _htf_m, _htf_note = _compute_htf_alignment(sym, direction)
+    _live_log("  📏 [HTF DIAG] %s/%s: %s" % (sym, direction, _htf_note))
+
     _live_open_position(sym, direction, _ext, pos_size, lev, conv,
-                       stop_mult=0.8 if _compress_sl else 1.0)
+                       stop_mult=0.8 if _compress_sl else 1.0,
+                       htf_bias=_htf_b)
 
 
 # ── Top-level live step (called from poll_cycle) ──────────────────────────────
