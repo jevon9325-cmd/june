@@ -5746,6 +5746,7 @@ _live_balance_polled_at: float = 0.0
 _live_pnl_polled_at:    float  = 0.0
 _last_cycle_direction: dict       = {}   # sig["direction"] per sym from prior scan cycle
 _current_cycle_signals_snap: dict = {}   # signals snapshot from current cycle
+_live_spread_block_cooldown: dict = {}   # sym -> last_logged_ts (5-min dedup for block log)
 
 _LIVE_REDIS_KEY      = "june_live_state"
 _LIVE_REDIS_TTL      = 30 * 24 * 3600  # 30 days
@@ -5855,6 +5856,19 @@ _LIVE_DEF_TIMEOUT_SECS     = 1800   # 30-min safety valve (recovery time gate)
 
 def _live_log(msg: str) -> None:
     print(f"[{_ts()}] 🟢 LIVE: {msg}", flush=True)
+
+
+def _live_write_block_log(sym: str, direction: str, gate: str, values: dict) -> None:
+    """Append one structured block/reduce event to the capped Redis list. Fire-and-forget."""
+    try:
+        rec = json.dumps({"ts": int(time.time()), "sym": sym,
+                          "direction": direction, "gate": gate, **values})
+        _r = _redis()
+        _r.lpush("june_live_block_log", rec)
+        _r.ltrim("june_live_block_log", 0, 199)
+        _r.expire("june_live_block_log", 86400)
+    except Exception:
+        pass
 
 
 # ── Redis persistence ─────────────────────────────────────────────────────────
@@ -8873,6 +8887,12 @@ def _live_try_entry(signals: dict, regime: str) -> None:
                 f"🚫 [HYBRID SPREAD GATE] {sym}: Spread/ATR(5m) ratio {_sar5:.2f} "
                 f"> tier cap {_thr5:.2f} | Entry suppressed"
             )
+            _now_sb = int(time.time())
+            if _now_sb - _live_spread_block_cooldown.get(sym, 0) >= 300:
+                _live_spread_block_cooldown[sym] = _now_sb
+                _live_write_block_log(sym, direction, "spread_atr",
+                                     {"sar5": round(_sar5, 3), "thr5": round(_thr5, 3),
+                                      "atr5": round(_atr5, 4)})
             return
 
     # 1m anti-reversal gate (same as sim)
@@ -8960,12 +8980,19 @@ def _live_try_entry(signals: dict, regime: str) -> None:
             f"skip {sym}: trend-exhausted {_ex_ratio:.1f}× ATR ≥ {_EXHAUST_RATIO_BLOCK}× "
             f"({direction}, net_move/ATR_5m over history window)"
         )
+        _live_write_block_log(sym, direction, "exhaust_block",
+                              {"ex_ratio": round(_ex_ratio, 3),
+                               "threshold": _EXHAUST_RATIO_BLOCK, "conv": conv})
         return
     if _ex_ratio >= _EXHAUST_RATIO_REDUCE:
         conv = max(1, conv - 1)
         _live_log(
             f"  📉 trend-exhaustion {_ex_ratio:.1f}× ATR: conviction reduced 1pt → {conv}/10"
         )
+        _live_write_block_log(sym, direction, "exhaust_reduce",
+                              {"ex_ratio": round(_ex_ratio, 3),
+                               "threshold": _EXHAUST_RATIO_REDUCE,
+                               "conv_after_reduce": conv})
 
     _cv_lev = _sim_conviction_leverage("sprout", conv)
     # Phase system: cap conviction-based lev at current phase ceiling.
