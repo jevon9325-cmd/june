@@ -6369,6 +6369,9 @@ def _live_fetch_market_data(sym: str, epic: str) -> bool:
     if price_unit == 1.0 and epic.upper().startswith("CC."):
         price_unit = 0.01  # CC.D.* commodity epics price in cents; "1" pip lacks "cent" keyword
         pip_sz *= price_unit  # rescale pip_sz to USD so stop formula (price*price_unit*pct/pip_sz) is unit-consistent
+        if sym == "NATGAS":
+            pip_sz = price_unit  # NATGAS pip from IG is 1e-3 native (not 1.0 like OIL/SILVER);
+                                  # CC.D.* rescaling gives 1e-5, inflating stop_pts 1000x -> ATTACHED_ORDER_LEVEL_ERROR
     # v3 API: marginFactor + marginFactorUnit; v1 API: margin — both percentage scale
     _mf_v3   = inst.get("marginFactor")
     _mf_v1   = inst.get("margin")
