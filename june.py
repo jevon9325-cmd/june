@@ -9058,6 +9058,21 @@ def run_live_step(signals: dict) -> None:
     # must be managed unconditionally so live money is never left without
     # stop/TP coverage regardless of why the kill switch was disabled.
     if _live.get("open_position"):
+        # ── Overnight DFB financing proximity warning (observational only) ─────
+        # IG cutover: 22:00 UK local (BST = 21:00 UTC, GMT = 22:00 UTC).
+        # Warn when a live position is open within 30 min of cutover.
+        # Purely informational — no exit, no sizing, no action of any kind.
+        _now_uk_fin = datetime.now(_UK_TZ)
+        _uk_h_fin   = _now_uk_fin.hour + _now_uk_fin.minute / 60.0
+        if 21.5 <= _uk_h_fin < 22.0:
+            _pos_fin  = _live["open_position"]
+            _notional = _pos_fin.get("notional", 0.0)
+            _est_cost = round(_notional * 0.07 / 365, 4)
+            _live_log(
+                f"⚠️  [{_pos_fin.get('instrument','?')} {_pos_fin.get('direction','?').upper()}] "
+                f"Open position within 30min of overnight DFB financing cutover (22:00 UK) — "
+                f"est cost ~${_est_cost:.4f} (notional ${_notional:.2f} × 7% / 365)"
+            )
         if not _sim.get("open_position"):   # sim path handles it via _sim_check_exit when sim is also open
             _sim_apply_pos_adjust()
         _live_check_exit(signals, regime)
