@@ -5874,6 +5874,28 @@ def _live_write_block_log(sym: str, direction: str, gate: str, values: dict) -> 
         pass
 
 
+def _live_write_ex_ratio_obs(sym: str, direction: str, ex_ratio: float,
+                              sar, conv: int) -> None:
+    """Continuous ex_ratio + spread_atr_ratio timeseries for OIL/SILVER/NATGAS.
+    Fires every evaluation cycle regardless of gate outcome.
+    Observation-only; no gate, conviction, or sizing effect.
+    Key: june_live_ex_ratio_log (capped 2000, 7-day TTL)."""
+    try:
+        rec = json.dumps({
+            "ts":        int(time.time()),
+            "sym":       sym,
+            "direction": direction,
+            "ex_ratio":  round(ex_ratio, 3),
+            "sar":       round(sar, 4) if sar is not None else None,
+            "conv":      conv,
+        })
+        _r = _redis()
+        _r.lpush("june_live_ex_ratio_log", rec)
+        _r.ltrim("june_live_ex_ratio_log", 0, 1999)
+        _r.expire("june_live_ex_ratio_log", 604800)  # 7-day TTL
+    except Exception:
+        pass
+
 # ── HTF (Higher-Timeframe) Observation Pipeline ─────────────────────────────
 # Observation-only: collects hourly candle data, logs [HTF DIAG], accumulates
 # events for self-calibration, and emits a one-shot readiness alert.  Zero effect
@@ -9186,6 +9208,11 @@ def _live_try_entry(signals: dict, regime: str) -> None:
                     f"  📏 [EXHAUST DIAG] {sym}/{direction}: "
                     f"20t={_ex_ratio:.2f}× 10t={_ex10:.2f}× ATR={_diag_atr:.2f}"
                 )
+    # [EX_RATIO OBS] Continuous timeseries — OIL/SILVER/NATGAS, every cycle.
+    # Purely observational: zero gate, conviction, or sizing effect.
+    if sym in _HTF_INSTRUMENTS:
+        _live_write_ex_ratio_obs(sym, direction, _ex_ratio,
+                                 sig.get("spread_atr_ratio"), conv)
     if _ex_ratio >= _EXHAUST_RATIO_BLOCK:
         _live_log(
             f"skip {sym}: trend-exhausted {_ex_ratio:.1f}× ATR ≥ {_EXHAUST_RATIO_BLOCK}× "
