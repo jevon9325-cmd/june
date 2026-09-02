@@ -9304,6 +9304,17 @@ def _live_try_entry(signals: dict, regime: str) -> None:
     _htf_b, _htf_m, _htf_note = _compute_htf_alignment(sym, direction)
     _live_log("  📏 [HTF DIAG] %s/%s: %s" % (sym, direction, _htf_note))
 
+    # DRY-RUN gate: when live is halted (CB fired or kill-switch off), all
+    # observation logs above (ex_ratio obs, HTF diag, SIM->live WR, block log)
+    # have already fired. Stop here — no order placement.
+    # _live_trade_guard() inside _live_open_position() provides a second
+    # structural backstop, but this gate makes the dry-run explicit in logs.
+    if not _june_live_trading_enabled:
+        _live_log(
+            f"[DRY-RUN] would enter {sym}/{direction} conv={conv}/10 "
+            f"lev={lev}:1 pos=${pos_size:.2f} — live halted, no order placed"
+        )
+        return
     _live_open_position(sym, direction, _ext, pos_size, lev, conv,
                        stop_mult=0.8 if _compress_sl else 1.0,
                        htf_bias=_htf_b)
@@ -9389,11 +9400,13 @@ def run_live_step(signals: dict) -> None:
     # Runs after exit management so a position that just closed still triggers
     # the check before the next entry is attempted this cycle.
     _live_check_circuit_breaker()
-    if not _june_live_trading_enabled:
-        return   # new-trade authority OFF — no entry attempts
+    # No early return on kill-switch off: _live_try_entry() still runs so all
+    # observation logging fires during CB/halt periods. Order placement is blocked
+    # by the DRY-RUN gate inside _live_try_entry() and by _live_trade_guard()
+    # inside _live_open_position() as belt-and-suspenders.
+    # Weekend and zero-balance gates below still apply in all states.
 
-    # Update tiered defensive mode (middle layer between NORMAL and CB HALT).
-    # Runs after CB check — if CB fired above, we already returned.
+    # Update tiered defensive mode (safe to run during halted state).
     _live_update_defensive_mode()
 
     if _live.get("balance", 0.0) <= 0:
