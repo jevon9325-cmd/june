@@ -6488,7 +6488,8 @@ def _live_check_circuit_breaker() -> None:
     # Sub-floor edge case: when day_start < $2 floor, max() returns the floor which
     # exceeds the entire account — CB becomes mathematically unreachable. Fix: use
     # pct-only (30% x day_start) when below the floor. No change above $2.
-    # Full tier ($30+): $20 floor + 5% rule (unchanged; dominant below ~$400).
+    # Full tier ($30+): 5% rule; $20 floor capped at 10% x account so the
+    # pct threshold is never swamped for accounts below ~$400.
     dollar_loss = day_start - current
     if day_start < _LIVE_CB_MICRO_THRESH:
         _pct_buf = _LIVE_CB_MICRO_PCT * day_start
@@ -6498,7 +6499,10 @@ def _live_check_circuit_breaker() -> None:
         else:
             effective_buffer = max(_LIVE_CB_MICRO_FLOOR_USD, _pct_buf)  # unchanged
     else:
-        effective_buffer = max(_LIVE_CB_FLOOR_USD, abs(_LIVE_CIRCUIT_BREAKER_PCT) * day_start)
+        # Without cap: at $34.79 the $20 floor requires -57.5% loss before CB fires.
+        # Cap at 10% of account; crossover where 5% pct rule binds: ~$400.
+        _full_floor = min(_LIVE_CB_FLOOR_USD, 0.10 * day_start)
+        effective_buffer = max(_full_floor, abs(_LIVE_CIRCUIT_BREAKER_PCT) * day_start)
     drawdown         = (current - day_start) / day_start
     if dollar_loss < effective_buffer:
         return   # within daily tolerance
