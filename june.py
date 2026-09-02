@@ -9078,6 +9078,15 @@ def _live_try_entry(signals: dict, regime: str) -> None:
     direction = "long" if chg > 0 else "short"
     combo     = _sim_combo_key(sym, direction)
 
+    # [SIM→LIVE OBS]: read SIM per-combo WR for this candidate
+    # OBSERVATION-ONLY: pure read of _sim dict, no write-back, zero gate or conviction effect.
+    _slob_co = (_sim.get("combo_outcomes") or {}).get(combo, [])
+    _slob_n  = len(_slob_co)
+    if _slob_n >= 20:
+        _slob_wr = sum(_slob_co) / _slob_n
+        _live_log("[SIM→LIVE OBS] %s/%s: SIM WR=%.0f%% (n=%d)"
+                  % (sym, direction, _slob_wr * 100, _slob_n))
+
     # Hybrid Spread/ATR gate — tiered threshold using 5-minute ATR baseline (fail-open)
     _atr5, _atr5_fb = _compute_atr_5m(sym)
     if _atr5 is not None and _atr5 > 0:
