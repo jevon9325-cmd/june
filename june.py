@@ -8938,6 +8938,23 @@ def _live_try_entry(signals: dict, regime: str) -> None:
     # after the vol signal has decayed. Thresholds derived from OIL/SILVER data:
     # clean entries ≤2.5×, exhausted entries 4.5–8.1× (today's loss cluster).
     _ex_ratio = _exhaustion_ratio(sym, direction)
+    # ── Exhaustion diagnostic (observational — zero gate impact) ────────────────────────
+    # Log 10-tick sub-window ratio alongside 20-tick for calibration.
+    # See session 2026-09-02 investigation: window vs hold-time analysis.
+    # Same ATR_5m denominator as the gate; only net_move uses prices[-10:].
+    _diag_hist = _history.get(sym)
+    if _diag_hist and len(_diag_hist) >= 10:
+        _diag_px       = [px for _, px in _diag_hist]
+        _diag_atr, _   = _compute_atr_5m(sym)
+        if _diag_atr:
+            _net10_raw     = _diag_px[-1] - _diag_px[-10]
+            _net10_signed  = _net10_raw if direction == "long" else -_net10_raw
+            _ex10          = max(0.0, _net10_signed / _diag_atr)
+            if _ex_ratio > 0.0 or _ex10 > 0.0:
+                _live_log(
+                    f"  📏 [EXHAUST DIAG] {sym}/{direction}: "
+                    f"20t={_ex_ratio:.2f}× 10t={_ex10:.2f}× ATR={_diag_atr:.2f}"
+                )
     if _ex_ratio >= _EXHAUST_RATIO_BLOCK:
         _live_log(
             f"skip {sym}: trend-exhausted {_ex_ratio:.1f}× ATR ≥ {_EXHAUST_RATIO_BLOCK}× "
