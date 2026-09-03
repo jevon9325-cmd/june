@@ -5074,7 +5074,7 @@ def _sim_stop(reason: str, signals=None) -> None:
             "combo_outcomes":   _sim.get("combo_outcomes", {}),
             "failure_snapshot": _failure_snapshot,
         }
-        r.set("june_sim_calibration", json.dumps(_cal), ex=7 * 24 * 3600)
+        r.set("june_sim_calibration", json.dumps(_cal), ex=90 * 24 * 3600)
         r.delete("june_sim_state")
         _sim_log("Results published -> Redis june_sim_results | calibration preserved (7d TTL)")
     except Exception as exc:
@@ -5241,7 +5241,7 @@ def run_simulation_step(signals: dict) -> None:
                 "combo_outcomes":   _sim.get("combo_outcomes", {}),
                 "failure_snapshot": _floor_fail_snap,
             }
-            _r_bf.set("june_sim_calibration", json.dumps(_cal_bf), ex=7 * 24 * 3600)
+            _r_bf.set("june_sim_calibration", json.dumps(_cal_bf), ex=90 * 24 * 3600)
         except Exception as _exc_bf:
             _sim_log(f"Redis calibration write failed (balance_floor): {_exc_bf}")
         _sim.update({
