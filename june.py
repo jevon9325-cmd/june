@@ -4300,6 +4300,12 @@ def _sim_try_entry(signals: dict, regime: str, leverage: int) -> None:
     if not sym or sym not in _ext:
         return
 
+    # Per-sym FX weekend gate: continuous instruments (24/7 markets) bypass.
+    # Fires only when _CONTINUOUS_INSTRUMENTS is non-empty (outer gate already
+    # blocked for all-non-continuous case). Currently inert: set is empty.
+    if sym not in _CONTINUOUS_INSTRUMENTS and is_weekend_closure():
+        return
+
     stage    = _sim.get("stage", "sprout")
     approach = _sim_select_approach(stage, sym)
     if approach == "__all_infeasible__":
@@ -5368,9 +5374,10 @@ def run_simulation_step(signals: dict) -> None:
         leverage = _sim_phase_leverage(_sim.get("phase", 1))
 
     # Weekend block: IG CFD markets close Fri 21:15 UTC → Sun 21:00 UTC.
-    # Continuous instruments (24/7 markets) bypass this gate.
+    # If any 24/7 instruments are registered, skip this outer gate and let
+    # _sim_try_entry apply a per-sym check instead.
     # _CONTINUOUS_INSTRUMENTS is empty until crypto epics are confirmed — currently inert.
-    if sym not in _CONTINUOUS_INSTRUMENTS and is_weekend_closure():
+    if not _CONTINUOUS_INSTRUMENTS and is_weekend_closure():
         global _sim_weekend_log_next
         if now >= _sim_weekend_log_next:
             _sim_log("💤 Weekend market closure — entries blocked until Sunday 21:00 UTC")
