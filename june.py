@@ -2999,6 +2999,31 @@ def _sim_load_state():
     return None
 
 
+_SIM_TRADE_HISTORY_KEY = "june_sim_trade_history"
+_SIM_TRADE_HISTORY_CAP = 500
+_SIM_TRADE_HISTORY_TTL = 30 * 24 * 3600  # 30 days
+
+
+def _sim_save_trade(trade_rec: dict) -> None:
+    """Append one completed SIM trade to the persistent cross-run Redis list."""
+    try:
+        r = _redis()
+        r.lpush(_SIM_TRADE_HISTORY_KEY, json.dumps(trade_rec))
+        r.ltrim(_SIM_TRADE_HISTORY_KEY, 0, _SIM_TRADE_HISTORY_CAP - 1)
+        r.expire(_SIM_TRADE_HISTORY_KEY, _SIM_TRADE_HISTORY_TTL)
+    except Exception:
+        pass
+
+
+def _sim_load_trade_history() -> list:
+    """Load persisted SIM trade records from Redis (chronological order)."""
+    try:
+        raw_list = _redis().lrange(_SIM_TRADE_HISTORY_KEY, 0, _SIM_TRADE_HISTORY_CAP - 1)
+        return list(reversed([json.loads(r) for r in raw_list]))
+    except Exception:
+        return []
+
+
 # ── Stage helpers ─────────────────────────────────────────────────────────────
 def _sim_check_graduation() -> str:
     """Return 'graduate', 'graduate_rolling', 'fail', or 'continue'.
@@ -4233,6 +4258,7 @@ def _sim_close_position(prices: dict, exit_reason: str) -> None:
     }
     history = _sim.setdefault("trade_history", [])
     history.append(trade_rec)
+    _sim_save_trade(trade_rec)
     if len(history) > 50:
         _sim["trade_history"] = history[-50:]
 
@@ -5539,6 +5565,9 @@ def sim_startup() -> None:
                 "failure_context_checked": True,
                 "approach_skip_counts": {},
             })
+            _hist = _sim_load_trade_history()
+            if _hist:
+                _sim["trade_history"] = _hist
             _sim_save_state()
             return
 
@@ -5730,6 +5759,10 @@ def sim_startup() -> None:
 
     print(f"[{_ts()}] \U0001f9ea SIM: Eligible instruments: {sorted(_sim_eligible)}", flush=True)
     _cal_note = "Calibration loaded from prior session." if _cal_loaded else "No prior calibration."
+    _hist = _sim_load_trade_history()
+    if _hist:
+        _sim["trade_history"] = _hist
+        print(f"[{_ts()}] 🧪 SIM: Restored {len(_hist)} trade records from prior runs", flush=True)
     print(
         f"[{_ts()}] 🔄 SIM: Fresh start — spread-aware stops, performance-based phases, "
         f"Silver prioritized. {_cal_note}",
