@@ -119,7 +119,7 @@ SPREAD_ALERT_FACTOR  = 3.0    # current spread > 3× avg → spread_alert: True
 SPREAD_ATR_THRESHOLD = 1.00   # spread > 100% of 14-period ATR → rank/size penalty (breakeven: spread=ATR). Calibrated at minDeal floor ($49 bal, $2.78 SILVER notional, $0.0016/trade spread cost = 0.008% of $20 CFD allocation). Re-derive when computed position size exceeds minDeal floor (~$280 account for SILVER ig_size>0.04).
 ATR_PERIOD           = 14     # periods for ATR from rolling mid-price history
 # Hybrid tiered Spread/ATR thresholds — per asset class, used by entry gate with 5m ATR
-_SPREAD_ATR_TIERS:        dict  = {"FX": 0.35, "METAL": 0.60, "ENERGY": 0.85}
+_SPREAD_ATR_TIERS:        dict  = {"FX": 0.35, "METAL": 0.60, "ENERGY": 0.85, "CRYPTO": 1.50}  # CRYPTO tier is PROVISIONAL — must confirm with real BTC/ETH/XRP/LTC/SOL spread/ATR data before adding any crypto epic to INSTRUMENTS
 _SPREAD_ATR_ASSET_CLASS:  dict  = {"GOLD": "METAL", "SILVER": "METAL", "OIL": "ENERGY", "NATGAS": "ENERGY", "WHEAT": "METAL", "COCOA": "METAL"}
 _SPREAD_ATR_FALLBACK_BUMP: float = 0.15  # added to tier threshold when using 1m-ATR fallback
 SPREAD_MIN_READINGS = 5      # minimum readings before anomaly detection active
@@ -370,6 +370,7 @@ _live_margin:    dict = {}   # sym -> IG margin rate (0.0-1.0 fraction) from LIV
 _live_equity_cfd: set = set() # syms whose epic ends .CASH.IP — IG size field is shares, not lots
 _live_fx_instruments: set = set() # syms whose epic matches CS.D.*.CFD.IP — FX pairs (correct sizing: lot_sz/pip_sz)
 _METALS_INSTRUMENTS: frozenset = frozenset({"SILVER", "OIL"})  # CME/COMEX-linked; separate weekend gate from FX
+_CONTINUOUS_INSTRUMENTS: frozenset = frozenset()  # 24/7 markets (crypto CFDs) — bypasses FX weekend closure gate; populated once real epics + calibrated tier are confirmed
 _IG_EQUITY_COMMISSION_USD = 9.0       # IG charges $9/side = $18 round-trip on equity CFDs
 _live_min_stop_pts: dict = {}  # sym -> minNormalStopOrLimitDistance (pts) from IG at startup
 _live_elig_publish_next: float = 0.0  # rate-limiter for barbie_june_eligible_instruments (1h)
@@ -5367,9 +5368,9 @@ def run_simulation_step(signals: dict) -> None:
         leverage = _sim_phase_leverage(_sim.get("phase", 1))
 
     # Weekend block: IG CFD markets close Fri 21:15 UTC → Sun 21:00 UTC.
-    # Uses is_weekend_closure() which is UTC-based and DST-safe.
-    # Open-position exits have already been handled above; only new entries are blocked.
-    if is_weekend_closure():
+    # Continuous instruments (24/7 markets) bypass this gate.
+    # _CONTINUOUS_INSTRUMENTS is empty until crypto epics are confirmed — currently inert.
+    if sym not in _CONTINUOUS_INSTRUMENTS and is_weekend_closure():
         global _sim_weekend_log_next
         if now >= _sim_weekend_log_next:
             _sim_log("💤 Weekend market closure — entries blocked until Sunday 21:00 UTC")
@@ -9112,6 +9113,12 @@ def _live_try_entry(signals: dict, regime: str) -> None:
         _live_log(f"⏳ {sym}: CME metals not yet open (Sun 18:00 ET) — skipping")
         return
 
+    # FX weekend gate: block non-continuous instruments Fri 22:00 UK → Sun 21:00 UK.
+    # Continuous instruments (24/7 markets) bypass this gate entirely.
+    # _CONTINUOUS_INSTRUMENTS is empty until crypto epics are added — currently inert.
+    if sym not in _CONTINUOUS_INSTRUMENTS and is_weekend_closure():
+        return
+
     sig       = _ext[sym]
     chg       = sig.get("change_5m", 0.0)
     vol       = abs(chg)
@@ -9427,11 +9434,7 @@ def run_live_step(signals: dict) -> None:
         _live_log("balance $0 or unavailable — skipping entry logic")
         return
 
-    # Weekend block
-    if is_weekend_closure():
-        return
-
-    # Entry check
+    # Entry check (FX weekend gate is now per-instrument inside _live_try_entry)
     _live_try_entry(signals, regime)
 
 
@@ -9859,8 +9862,10 @@ def main():
     consec_errors = 0
     while True:
         try:
-            # Weekend closure — pause entirely, check every 30 min
-            if is_weekend_closure():
+            # Weekend closure — pause entirely unless 24/7 instruments are active.
+            # _CONTINUOUS_INSTRUMENTS is empty until crypto epics are confirmed;
+            # current behaviour is identical to before: sleep 30 min and skip poll.
+            if is_weekend_closure() and not _CONTINUOUS_INSTRUMENTS:
                 print(
                     f"[{_ts()}] 💤 Weekend market closure — June pausing until Sunday 21:00 UTC",
                     flush=True,
