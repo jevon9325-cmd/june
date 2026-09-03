@@ -5788,10 +5788,18 @@ _SKIM_ENABLED             = False   # kill-switch: set True to re-enable skim (r
 # Profit gate 0.15%: ~10pts SILVER = 2.5x spread (4pt). Real profit confirmed.
 # Aggregate stop 0.5%: ~33pts SILVER. Software check every cycle (belt+suspenders).
 # Max legs 2 = 1 primary + 1 addon. 2 deal_ids tracked; margin ~$4.34 of $49.
-# Extend to 3 only after live validation of the 2-leg design.
-_PYRAMID_MAX_LEGS        = 2       # 1 primary + 1 addon (2 total legs max)
-_PYRAMID_PROFIT_GATE_PCT = 0.0015  # +0.15% from fill before adding leg 2
+# Leg 3 unlocks after _PYRAMID_3LEG_THRESHOLD confirmed 2-leg completions (Redis counter).
+# Leg 4 unlocks after _PYRAMID_4LEG_THRESHOLD confirmed 2-leg completions.
+# All unlock logic in _pyramid_active_max_legs() -- fails safe to 2 on any error.
+_PYRAMID_MAX_LEGS        = 2       # current hard floor (code default; counter can raise to 4)
+_PYRAMID_HARD_MAX_LEGS   = 4       # absolute ceiling -- counter never raises beyond this
+_PYRAMID_PROFIT_GATE_PCT = 0.0015  # +0.15% from fill before adding each leg
 _PYRAMID_AGG_STOP_PCT    = 0.005   # 0.5% from blended entry -- aggregate stop
+_PYRAMID_UNLOCK_KEY      = "june_pyramid_2leg_completions"  # Redis incr counter
+_PYRAMID_3LEG_THRESHOLD  = 10     # completions needed to unlock leg 3
+_PYRAMID_4LEG_THRESHOLD  = 20     # completions needed to unlock leg 4
+_PYRAMID_3LEG_SIZE_DECAY = 0.75   # leg 3 notional = leg2_notional * 0.75
+_PYRAMID_4LEG_SIZE_DECAY = 0.50   # leg 4 notional = leg2_notional * 0.50
 
 # Daily drawdown circuit breaker for the live account.
 # Derivation: max per-trade loss = 10% position × 10× leverage × 0.5% max stop = 0.5%/trade.
@@ -8692,6 +8700,11 @@ def _live_close_addon_leg(leg: dict, exit_reason: str, signals: dict) -> None:
         _live["pyramid_legs"] = [l for l in _live.get("pyramid_legs", [])
                                   if l.get("deal_id") != deal_id]
         if not _live.get("pyramid_legs"):
+            # Last addon leg closed -- one full multi-leg cycle complete; increment unlock counter
+            try:
+                _redis().incr(_PYRAMID_UNLOCK_KEY)
+            except Exception:
+                pass
             _live["pyramid_agg_stop_level"] = None
         _live_save_state()
     else:
@@ -8784,6 +8797,20 @@ def _live_check_pyramid_exits(signals: dict) -> None:
             return
 
 
+def _pyramid_active_max_legs() -> int:
+    """Return the live pyramid leg cap based on the Redis evidence counter.
+    Fails safe to _PYRAMID_MAX_LEGS (2) on any Redis error."""
+    try:
+        n = int(_redis().get(_PYRAMID_UNLOCK_KEY) or 0)
+        if n >= _PYRAMID_4LEG_THRESHOLD:
+            return 4
+        if n >= _PYRAMID_3LEG_THRESHOLD:
+            return 3
+        return _PYRAMID_MAX_LEGS
+    except Exception:
+        return _PYRAMID_MAX_LEGS
+
+
 def _live_check_pyramid_entry(signals: dict, regime: str) -> None:
     # Evaluate whether to add a pyramid leg to the existing primary position.
     # All defensive gates explicitly checked -- mirrors _live_try_entry exactly.
@@ -8792,7 +8819,8 @@ def _live_check_pyramid_entry(signals: dict, regime: str) -> None:
     primary = _live.get("open_position")
     if not primary:
         return
-    if len(_live.get("pyramid_legs", [])) >= _PYRAMID_MAX_LEGS - 1:
+    active_max = _pyramid_active_max_legs()
+    if len(_live.get("pyramid_legs", [])) >= active_max - 1:
         return  # already at cap
     sym     = primary["instrument"]
     dirn    = primary["direction"]
@@ -8840,9 +8868,10 @@ def _live_check_pyramid_entry(signals: dict, regime: str) -> None:
         if _sar5 > _thr5:
             return
 
+    next_leg_idx = len(_live.get("pyramid_legs", [])) + 2
     _live_log(
         f"[PYRAMID] {sym}: gate passed -- primary at +{pnl_pct*100:.3f}% "
-        f"(gate={_PYRAMID_PROFIT_GATE_PCT*100:.2f}%) | adding leg 2/{_PYRAMID_MAX_LEGS}"
+        f"(gate={_PYRAMID_PROFIT_GATE_PCT*100:.2f}%) | adding leg {next_leg_idx}/{active_max}"
     )
     _live_add_pyramid_leg(signals)
 
@@ -8880,6 +8909,15 @@ def _live_add_pyramid_leg(signals: dict) -> None:
     bal      = max(0.0, total - skimmed)
     _pyr_base = min(10.0, bal) if bal < 100.0 else round(bal * 0.10, 2)
     notional = pos_sz * lev if pos_sz > 0 else max(2.0, _pyr_base) * lev
+
+    # Dynamic leg index: 2 = first addon, 3 = second addon, 4 = third addon
+    leg_index = len(_live.get("pyramid_legs", [])) + 2
+    # Size decay for legs 3+ to reduce per-leg risk as pyramid deepens
+    if leg_index == 3:
+        notional = round(notional * _PYRAMID_3LEG_SIZE_DECAY, 2)
+    elif leg_index >= 4:
+        notional = round(notional * _PYRAMID_4LEG_SIZE_DECAY, 2)
+
     ig_size  = _live_compute_ig_size(sym, notional, mid)
     if ig_size <= 0:
         _live_log(f"[PYRAMID] {sym}: ig_size=0 -- addon aborted")
@@ -8888,10 +8926,13 @@ def _live_add_pyramid_leg(signals: dict) -> None:
     stop_pct = max(_sim_get_dynamic_stop(sym), _sim_get_spread_floor(sym))
     tp_pct   = _sim_get_tp(sym, dirn, primary.get("conviction", 5))
 
-    # Approximate aggregate stop for entry-time stop distance
+    # N-way approximate aggregate stop for entry-time stop distance (all legs including new)
+    _existing_legs = _live.get("pyramid_legs", [])
+    _approx_pts = [(fill1, size1)] + [(l.get("fill_price", 0.0), l.get("ig_size", 0.0))
+                                       for l in _existing_legs] + [(mid, ig_size)]
+    _approx_w   = sum(sz for _, sz in _approx_pts)
     approx_blended = (
-        (fill1 * size1 + mid * ig_size) / (size1 + ig_size)
-        if (size1 + ig_size) > 0 else mid
+        sum(fp * sz for fp, sz in _approx_pts) / _approx_w if _approx_w > 0 else mid
     )
     approx_agg_stop = (
         approx_blended * (1.0 - _PYRAMID_AGG_STOP_PCT) if dirn == "long"
@@ -8900,7 +8941,7 @@ def _live_add_pyramid_leg(signals: dict) -> None:
     approx_stop_dist = _live_compute_stop_pts(sym, _PYRAMID_AGG_STOP_PCT, mid)
 
     _live_log(
-        f"[PYRAMID] {'WOULD-BUY' if not _june_live_trading_enabled else 'BUY'} addon: "
+        f"[PYRAMID] {'WOULD-BUY' if not _june_live_trading_enabled else 'BUY'} leg {leg_index}: "
         f"{sym} {ig_dir} size={ig_size} notional~${notional:.2f} | "
         f"stop {stop_pct*100:.2f}% TP {tp_pct*100:.2f}% | "
         f"approx_agg_stop={approx_agg_stop:.5f} ({approx_stop_dist}pts)"
@@ -8934,10 +8975,14 @@ def _live_add_pyramid_leg(signals: dict) -> None:
     deal_id    = confirm.get("dealId", "")
     fill_price = float(confirm.get("level", mid))
 
-    # Precise aggregate stop using actual fill
+    # N-way precise aggregate stop using actual fill (primary + all existing addons + new leg)
+    _all_fill_pts = [(fill1, size1)] + [
+        (l.get("fill_price", 0.0), l.get("ig_size", 0.0))
+        for l in _live.get("pyramid_legs", [])
+    ] + [(fill_price, ig_size)]
+    _total_w = sum(sz for _, sz in _all_fill_pts)
     blended = (
-        (fill1 * size1 + fill_price * ig_size) / (size1 + ig_size)
-        if (size1 + ig_size) > 0 else fill_price
+        sum(fp * sz for fp, sz in _all_fill_pts) / _total_w if _total_w > 0 else fill_price
     )
     agg_stop_level = (
         blended * (1.0 - _PYRAMID_AGG_STOP_PCT) if dirn == "long"
@@ -8955,37 +9000,42 @@ def _live_add_pyramid_leg(signals: dict) -> None:
         "stop_pct":   stop_pct,
         "tp_pct":     tp_pct,
         "entry_time": time.time(),
-        "leg_index":  2,
+        "leg_index":  leg_index,
     }
     _live.setdefault("pyramid_legs", []).append(leg)
     _live["pyramid_agg_stop_level"] = agg_stop_level
 
-    # PUT aggregate stop to primary leg (update broker-side stop to shared agg level)
-    primary_deal = primary.get("deal_id", "")
-    if primary_deal:
-        _pip_sz       = _live_pip_sizes.get(sym, _LIVE_FX_PIP)
-        dist_to_agg   = abs(mid - agg_stop_level)
-        min_stop_dist = (_live_min_stop_pts.get(sym, 4) + 1) * _pip_sz
-        if dist_to_agg >= min_stop_dist:
+    # PUT aggregate stop to ALL open deals (primary + all addon legs including the new one)
+    _pip_sz       = _live_pip_sizes.get(sym, _LIVE_FX_PIP)
+    dist_to_agg   = abs(mid - agg_stop_level)
+    min_stop_dist = (_live_min_stop_pts.get(sym, 4) + 1) * _pip_sz
+    primary_deal  = primary.get("deal_id", "")
+    _all_deal_ids = [d for d in
+                     [primary_deal] +
+                     [l.get("deal_id", "") for l in _live.get("pyramid_legs", [])]
+                     if d]
+    if dist_to_agg >= min_stop_dist:
+        for _d in _all_deal_ids:
             _put_r = _ig_live_put(
-                f"/positions/otc/{primary_deal}",
+                f"/positions/otc/{_d}",
                 {"stopLevel": round(agg_stop_level, 5), "guaranteedStop": False},
                 version="2",
             )
             if _put_r:
-                _live["open_position"]["defensive_stop_level"] = agg_stop_level
-                _live["open_position"]["defensive_stop_active"] = True
-                _live_log(f"[PYRAMID] Aggregate stop PUT to primary: stopLevel={agg_stop_level:.5f}")
+                _live_log(f"[PYRAMID] Agg stop PUT deal {_d}: stopLevel={agg_stop_level:.5f}")
             else:
-                _live_log("[PYRAMID] Aggregate stop PUT failed for primary -- software check only")
-        else:
-            _live_log(
-                f"[PYRAMID] Agg stop {agg_stop_level:.5f} too close to mid {mid:.5f} "
-                f"({dist_to_agg:.5f} < {min_stop_dist:.5f}) -- software check only"
-            )
+                _live_log(f"[PYRAMID] Agg stop PUT failed deal {_d} -- software check only")
+        if primary_deal:
+            _live["open_position"]["defensive_stop_level"] = agg_stop_level
+            _live["open_position"]["defensive_stop_active"] = True
+    else:
+        _live_log(
+            f"[PYRAMID] Agg stop {agg_stop_level:.5f} too close to mid {mid:.5f} "
+            f"({dist_to_agg:.5f} < {min_stop_dist:.5f}) -- software check only"
+        )
 
     _live_log(
-        f"✅ PYRAMID LEG 2 OPENED: {sym} {ig_dir} @ {fill_price:.5f} "
+        f"✅ PYRAMID LEG {leg_index} OPENED: {sym} {ig_dir} @ {fill_price:.5f} "
         f"| size {ig_size} | deal {deal_id} "
         f"| blended {blended:.5f} | agg_stop {agg_stop_level:.5f} "
         f"({_PYRAMID_AGG_STOP_PCT*100:.2f}% from blended)"
