@@ -5881,6 +5881,15 @@ def _live_write_ex_ratio_obs(sym: str, direction: str, ex_ratio: float,
     Observation-only; no gate, conviction, or sizing effect.
     Key: june_live_ex_ratio_log (capped 2000, 7-day TTL)."""
     try:
+        # Kaufman ER: |net_displacement| / sum(|tick_changes|), range 0-1.
+        # Computed from same _history deque as _exhaustion_ratio. Observation-only.
+        _er_hist = _history.get(sym)
+        _er = None
+        if _er_hist and len(_er_hist) >= 2:
+            _er_px   = [px for _, px in _er_hist]
+            _er_net  = abs(_er_px[-1] - _er_px[0])
+            _er_path = sum(abs(_er_px[i] - _er_px[i-1]) for i in range(1, len(_er_px)))
+            _er = round(_er_net / _er_path, 3) if _er_path > 0 else 0.0
         rec = json.dumps({
             "ts":        int(time.time()),
             "sym":       sym,
@@ -5888,6 +5897,7 @@ def _live_write_ex_ratio_obs(sym: str, direction: str, ex_ratio: float,
             "ex_ratio":  round(ex_ratio, 3),
             "sar":       round(sar, 4) if sar is not None else None,
             "conv":      conv,
+            "er":        _er,
         })
         _r = _redis()
         _r.lpush("june_live_ex_ratio_log", rec)
