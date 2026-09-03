@@ -4268,6 +4268,9 @@ def _sim_close_position(prices: dict, exit_reason: str) -> None:
     _sim["open_position"] = None
     _sim_update_streak(pos["instrument"], dirn, won)
     _sim_15m_record(pos["instrument"], dirn, pos.get("entry_change_15m") or 0.0, won)
+    _htf_b_close = pos.get("htf_bias", "unknown")
+    if _htf_b_close not in ("unknown", None):
+        _live_write_htf_event(pos["instrument"], dirn, _htf_b_close, 0.0, pos["fill_price"])
     _sim_save_state()
 
 
@@ -4503,6 +4506,7 @@ def _sim_try_entry(signals: dict, regime: str, leverage: int) -> None:
     vbkt    = _sim_vol_bucket(vol)
     notl    = round(pos_size * leverage, 2)
 
+    _htf_b_sim, _, _ = _compute_htf_alignment(sym, direction)
     _sim["open_position"] = {
         "instrument": sym, "direction": direction,
         "fill_price": fill, "stop_price": stop_px, "tp_price": tp_px,
@@ -4513,6 +4517,7 @@ def _sim_try_entry(signals: dict, regime: str, leverage: int) -> None:
         "conviction": conviction,
         "initial_sl_pct": stop_pct,  # baseline for time-decay SL compression
         "claudia_pts": _sim_claudia_pts(sym, direction),
+        "htf_bias": _htf_b_sim,
     }
 
     action = "BUY" if direction == "long" else "SELL"
@@ -6041,7 +6046,7 @@ def _htf_self_calibrate():
                 events.append(json.loads(raw))
             except Exception:
                 pass
-        trade_hist = _live.get("trade_history", [])
+        trade_hist = _live.get("trade_history", []) + _sim.get("trade_history", [])
         results = {"aligned": [], "opposed": [], "neutral": []}
         matched = 0
         for ev in events:
