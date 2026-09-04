@@ -145,7 +145,7 @@ _KNOWN_MIN_NOTIONALS: dict = {
     "SILVER":  0.05,  # eligibility floor: bypasses 20% concentration cap; actual IG min ~$2.79 (minDeal×lot×spot×pu)
     "OIL":     0.04,  # eligibility floor: bypasses 20% concentration cap; actual IG min ~$2.75 (minDeal×lot×spot×pu)
     "BTC":   807.20,  # minDeal=0.01 × lot=1 × ~$80,720 (live API) — blocks at <~$1,345 balance (20% cap, 10% margin, lev capped at 3)
-    "ETH":     0.25,  # minDeal=0.0001 × lot=1 × ~$2,504 — eligible at small balances; live API updates on startup
+    "ETH":   100.16,  # minDeal=0.04 × lot=1 × ~$2,504 (live API) — blocks at <~$167 balance (20% cap, 10% margin, lev capped at 3)
 }
 _NOTIONAL_REDIS_KEY = "june_min_notionals"  # separate key — survives sim resets
 _NOTIONAL_REDIS_TTL = 7 * 24 * 3600        # 7 days
@@ -270,7 +270,7 @@ INSTRUMENTS: dict = {
     "SPCX": "UD.D.SPCXUS.CASH.IP",     # SpaceX — IPO June 12 2026, Nasdaq
     # Crypto CFDs — 24/7, bypasses FX weekend gate via _CONTINUOUS_INSTRUMENTS
     "BTC":  "CS.D.BITCOIN.CFD.IP",      # Bitcoin ($1) — lot=1, minDeal=0.001
-    "ETH":  "CS.D.ETHUSD.CFD.IP",       # Ether ($1) — lot=1, minDeal=0.0001
+    "ETH":  "CS.D.ETHUSD.CFD.IP",       # Ether ($1) — lot=1, minDeal=0.04 (live) — demo showed 0.0001 (wrong)
 }
 
 # Reverse lookup: epic → base symbol (used to route .CASH.IP epics to Finnhub)
