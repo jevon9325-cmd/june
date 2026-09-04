@@ -278,7 +278,6 @@ _INSTRUMENTS_REVERSE: dict = {v: k for k, v in INSTRUMENTS.items()}
 
 _SEARCH_FALLBACKS: dict = {
     "BTC":    "Bitcoin",
-    "ETH":    "Ether",
     "EURUSD": "EUR/USD",
     "GBPUSD": "GBP/USD",
     "USDJPY": "USD/JPY",
@@ -882,6 +881,12 @@ def verify_epics():
         time.sleep(1.5)
 
     for sym in failed:
+        # CRYPTO instruments have stable hardcoded epics — a transient 403 during
+        # verify must NOT trigger search-based discovery, which risks finding unrelated
+        # instruments (e.g. 'Ether' -> Etherstack PLC via IG search).
+        if _SPREAD_ATR_ASSET_CLASS.get(sym) == 'CRYPTO':
+            print(f"[{_ts()}]   ⚠️  {sym} verify rate-limited — keeping hardcoded epic (no search fallback for CRYPTO)", flush=True)
+            continue
         print(f"[{_ts()}]   🔍 Attempting discovery for {sym}...", flush=True)
         new_epic = discover_epic(sym)
         if new_epic:
