@@ -130,18 +130,21 @@ DIRECT_CFD_SEARCH_INTERVAL = 30        # seconds between IG search API calls
 DIRECT_CFD_MISS_TTL        = 6 * 3600  # 6h before re-searching a not-found symbol
 DIRECT_CFD_CONFIRMED_MISS_TTL = 24 * 3600  # 24h after all search strategies exhausted
 
-# Minimum notional values for core instruments — confirmed from IG API 2026-07-14.
-# Pre-populated in sim_startup() so FX + Silver trade immediately without /markets/ calls.
+# Minimum notional values for core instruments — SIM bootstrap (live API overwrites at startup).
+# FX values use CORRECT formula (lot_sz/pip_sz)×minDeal×mid; confirmed 2026-09-04.
 _KNOWN_MIN_NOTIONALS: dict = {
-    # Derived from LIVE API startup data (lot x minDeal x price x price_unit):
-    "EURUSD":  0.47,  # lot=10, minDeal=0.04, price~1.17 → 0.04×10×1.17=$0.47
-    "GBPUSD":  0.54,  # lot=10, minDeal=0.04, price~1.36 → 0.04×10×1.36=$0.54 (confirmed)
-    "USDJPY": 40.0,   # lot=1000 (USD base), minDeal=0.04 → 0.04×1000=$40 USD min; 50% margin=$20; eligible at ~$100 balance
-    "AUDUSD":  0.29,  # lot=10, minDeal=0.04, price~0.71 → 0.04×10×0.71=$0.28
-    "USDCAD":  0.55,  # lot=10, minDeal=0.04, price~1.38 → 0.04×10×1.38=$0.55
-    "EURGBP":  0.34,  # lot=10, minDeal=0.04, price~0.86 → 0.04×10×0.86=$0.34
-    "NZDUSD":  0.24,  # lot=10, minDeal=0.04, price~0.59 → 0.04×10×0.59=$0.24
-    "USDCHF":  0.32,  # lot=10, minDeal=0.04, price~0.80 → 0.04×10×0.80=$0.32
+    # FX formula: (lot_sz/pip_sz) × minDeal × mid  [NOT lot_sz × minDeal × mid — that was 10,000x wrong]
+    # unit_val = lot_sz/pip_sz = 10/0.0001 = 100,000 base-currency units per lot for 4-decimal pairs
+    # Values pegged to ~2026-09-04 prices; live API overwrites at startup via _live_fetch_market_data.
+    # *minDeal unconfirmed on live — assumed 0.04 (same as EURUSD/GBPUSD; demo returned wrong 1.0)
+    "EURUSD": 4648.0,   # (10/0.0001)×0.04×1.162 = $4,648  | minDeal=0.04 live-confirmed
+    "GBPUSD": 5409.0,   # (10/0.0001)×0.04×1.352 = $5,409  | minDeal=0.04 live-confirmed
+    "USDJPY": 20000.0,  # (1000/0.01)×0.2×1.0 = $20,000    | base=USD; minDeal=0.2 live-confirmed
+    "AUDUSD": 2883.0,   # (10/0.0001)×0.04×0.721 = $2,883*  | base=AUD; minDeal=0.04 assumed*
+    "USDCAD": 10000.0,  # (10/0.0001)×0.1×1.0 = $10,000    | base=USD; minDeal=0.1 demo-confirmed
+    "EURGBP": 4648.0,   # (10/0.0001)×0.04×EURUSD = $4,648* | base=EUR; minDeal=0.04 assumed*
+    "NZDUSD": 5889.0,   # (10/0.0001)×0.1×0.589 = $5,889   | minDeal=0.1 demo-confirmed
+    "USDCHF": 4000.0,   # (10/0.0001)×0.04×1.0 = $4,000*   | base=USD; minDeal=0.04 assumed*
     "SILVER":  0.05,  # eligibility floor: bypasses 20% concentration cap; actual IG min ~$2.79 (minDeal×lot×spot×pu)
     "OIL":     0.04,  # eligibility floor: bypasses 20% concentration cap; actual IG min ~$2.75 (minDeal×lot×spot×pu)
     "BTC":   807.20,  # minDeal=0.01 × lot=1 × ~$80,720 (live API) — blocks at <~$1,345 balance (20% cap, 10% margin, lev capped at 3)
@@ -6862,7 +6865,9 @@ def _live_is_eligible(sym: str) -> bool:
     if bal <= 0:
         return False
     if sym in _live_fx_instruments:
-        return False  # FX min_notional in _KNOWN_MIN_NOTIONALS is 10,000x too small; block until formula verified
+        return False  # FX structurally blocked: cheapest pair (AUDUSD) needs ~$4,800 balance;
+                    # current balance ~$22 (215× below). _KNOWN_MIN_NOTIONALS now uses correct
+                    # FX formula — guard stays until balance reaches viable threshold.
     lev = int(_SIM_LEV_RANGES.get("sprout", (3, 10))[1])  # sim ceiling
     margin_rate = _live_margin.get(sym)
     if margin_rate and margin_rate > 0:
