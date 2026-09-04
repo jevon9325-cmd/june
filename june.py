@@ -119,8 +119,8 @@ SPREAD_ALERT_FACTOR  = 3.0    # current spread > 3× avg → spread_alert: True
 SPREAD_ATR_THRESHOLD = 1.00   # spread > 100% of 14-period ATR → rank/size penalty (breakeven: spread=ATR). Calibrated at minDeal floor ($49 bal, $2.78 SILVER notional, $0.0016/trade spread cost = 0.008% of $20 CFD allocation). Re-derive when computed position size exceeds minDeal floor (~$280 account for SILVER ig_size>0.04).
 ATR_PERIOD           = 14     # periods for ATR from rolling mid-price history
 # Hybrid tiered Spread/ATR thresholds — per asset class, used by entry gate with 5m ATR
-_SPREAD_ATR_TIERS:        dict  = {"FX": 0.35, "METAL": 0.60, "ENERGY": 0.85, "CRYPTO": 1.50}  # CRYPTO tier is PROVISIONAL — must confirm with real BTC/ETH/XRP/LTC/SOL spread/ATR data before adding any crypto epic to INSTRUMENTS
-_SPREAD_ATR_ASSET_CLASS:  dict  = {"GOLD": "METAL", "SILVER": "METAL", "OIL": "ENERGY", "NATGAS": "ENERGY", "WHEAT": "METAL", "COCOA": "METAL"}
+_SPREAD_ATR_TIERS:        dict  = {"FX": 0.35, "METAL": 0.60, "ENERGY": 0.85, "CRYPTO": 1.50}  # CRYPTO tier confirmed for BTC (ratio 0.531) and ETH (ratio 0.598) at worst-case Asian session; XRP/SOL pending measurement
+_SPREAD_ATR_ASSET_CLASS:  dict  = {"GOLD": "METAL", "SILVER": "METAL", "OIL": "ENERGY", "NATGAS": "ENERGY", "WHEAT": "METAL", "COCOA": "METAL", "BTC": "CRYPTO", "ETH": "CRYPTO"}
 _SPREAD_ATR_FALLBACK_BUMP: float = 0.15  # added to tier threshold when using 1m-ATR fallback
 SPREAD_MIN_READINGS = 5      # minimum readings before anomaly detection active
 
@@ -144,6 +144,8 @@ _KNOWN_MIN_NOTIONALS: dict = {
     "USDCHF":  0.32,  # lot=10, minDeal=0.04, price~0.80 → 0.04×10×0.80=$0.32
     "SILVER":  0.05,  # eligibility floor: bypasses 20% concentration cap; actual IG min ~$2.79 (minDeal×lot×spot×pu)
     "OIL":     0.04,  # eligibility floor: bypasses 20% concentration cap; actual IG min ~$2.75 (minDeal×lot×spot×pu)
+    "BTC":    80.79,  # minDeal=0.001 × lot=1 × ~$80,793 — blocks at <~$400 balance (20% cap, 50% margin)
+    "ETH":     0.25,  # minDeal=0.0001 × lot=1 × ~$2,504 — eligible at small balances; live API updates on startup
 }
 _NOTIONAL_REDIS_KEY = "june_min_notionals"  # separate key — survives sim resets
 _NOTIONAL_REDIS_TTL = 7 * 24 * 3600        # 7 days
@@ -266,12 +268,17 @@ INSTRUMENTS: dict = {
     "INTC": "UB.D.INTC.CASH.IP",       # Intel Corp
     "MU":   "UC.D.MU.CASH.IP",         # Micron Technology
     "SPCX": "UD.D.SPCXUS.CASH.IP",     # SpaceX — IPO June 12 2026, Nasdaq
+    # Crypto CFDs — 24/7, bypasses FX weekend gate via _CONTINUOUS_INSTRUMENTS
+    "BTC":  "CS.D.BITCOIN.CFD.IP",      # Bitcoin ($1) — lot=1, minDeal=0.001
+    "ETH":  "CS.D.ETHUSD.CFD.IP",       # Ether ($1) — lot=1, minDeal=0.0001
 }
 
 # Reverse lookup: epic → base symbol (used to route .CASH.IP epics to Finnhub)
 _INSTRUMENTS_REVERSE: dict = {v: k for k, v in INSTRUMENTS.items()}
 
 _SEARCH_FALLBACKS: dict = {
+    "BTC":    "Bitcoin",
+    "ETH":    "Ethereum",
     "EURUSD": "EUR/USD",
     "GBPUSD": "GBP/USD",
     "USDJPY": "USD/JPY",
@@ -370,7 +377,7 @@ _live_margin:    dict = {}   # sym -> IG margin rate (0.0-1.0 fraction) from LIV
 _live_equity_cfd: set = set() # syms whose epic ends .CASH.IP — IG size field is shares, not lots
 _live_fx_instruments: set = set() # syms whose epic matches CS.D.*.CFD.IP — FX pairs (correct sizing: lot_sz/pip_sz)
 _METALS_INSTRUMENTS: frozenset = frozenset({"SILVER", "OIL"})  # CME/COMEX-linked; separate weekend gate from FX
-_CONTINUOUS_INSTRUMENTS: frozenset = frozenset()  # 24/7 markets (crypto CFDs) — bypasses FX weekend closure gate; populated once real epics + calibrated tier are confirmed
+_CONTINUOUS_INSTRUMENTS: frozenset = frozenset({"BTC", "ETH"})  # 24/7 markets (crypto CFDs) — bypasses FX weekend closure gate
 _IG_EQUITY_COMMISSION_USD = 9.0       # IG charges $9/side = $18 round-trip on equity CFDs
 _live_min_stop_pts: dict = {}  # sym -> minNormalStopOrLimitDistance (pts) from IG at startup
 _live_elig_publish_next: float = 0.0  # rate-limiter for barbie_june_eligible_instruments (1h)
@@ -5407,7 +5414,6 @@ def run_simulation_step(signals: dict) -> None:
     # Weekend block: IG CFD markets close Fri 21:15 UTC → Sun 21:00 UTC.
     # If any 24/7 instruments are registered, skip this outer gate and let
     # _sim_try_entry apply a per-sym check instead.
-    # _CONTINUOUS_INSTRUMENTS is empty until crypto epics are confirmed — currently inert.
     if not _CONTINUOUS_INSTRUMENTS and is_weekend_closure():
         global _sim_weekend_log_next
         if now >= _sim_weekend_log_next:
@@ -6687,7 +6693,8 @@ def _live_fetch_market_data(sym: str, epic: str) -> bool:
     _live_min_stop_pts[sym] = max(1, int(_ms_val))  # real IG value; +1 buffer in _live_compute_stop_pts
     if epic.upper().endswith(".CASH.IP"):
         _live_equity_cfd.add(sym)
-    if epic.upper().startswith("CS.D.") and epic.upper().endswith("CFD.IP"):
+    if (epic.upper().startswith("CS.D.") and epic.upper().endswith("CFD.IP")
+            and _SPREAD_ATR_ASSET_CLASS.get(sym) != "CRYPTO"):
         _live_fx_instruments.add(sym)
     _live_log(f"LIVE mkt: {sym} lot={lot_sz} minDeal={min_val} pip={pip_sz} unit={price_unit} margin={margin_rate:.0%} min_stop={_live_min_stop_pts[sym]}pts")
     return True
@@ -9210,7 +9217,6 @@ def _live_try_entry(signals: dict, regime: str) -> None:
 
     # FX weekend gate: block non-continuous instruments Fri 22:00 UK → Sun 21:00 UK.
     # Continuous instruments (24/7 markets) bypass this gate entirely.
-    # _CONTINUOUS_INSTRUMENTS is empty until crypto epics are added — currently inert.
     if sym not in _CONTINUOUS_INSTRUMENTS and is_weekend_closure():
         return
 
