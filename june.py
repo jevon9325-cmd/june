@@ -6675,7 +6675,7 @@ def _live_fetch_market_data(sym: str, epic: str) -> bool:
     one_pip = inst.get("onePipMeans")
     pip_sz  = _live_parse_pip_size(one_pip)
     price_unit = 0.01 if (one_pip and "cent" in str(one_pip).lower()) else 1.0
-    if price_unit == 1.0 and epic.upper().startswith("CC."):
+    if price_unit == 1.0 and epic.upper().startswith("CC.") and sym not in ("SUGAR", "COCOA"):  # SUGAR/COCOA quote in $/£ per tonne directly — not cents
         price_unit = 0.01  # CC.D.* commodity epics price in cents; "1" pip lacks "cent" keyword
         pip_sz *= price_unit  # rescale pip_sz to USD so stop formula (price*price_unit*pct/pip_sz) is unit-consistent
         if sym == "NATGAS":
