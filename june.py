@@ -144,7 +144,7 @@ _KNOWN_MIN_NOTIONALS: dict = {
     "USDCHF":  0.32,  # lot=10, minDeal=0.04, price~0.80 → 0.04×10×0.80=$0.32
     "SILVER":  0.05,  # eligibility floor: bypasses 20% concentration cap; actual IG min ~$2.79 (minDeal×lot×spot×pu)
     "OIL":     0.04,  # eligibility floor: bypasses 20% concentration cap; actual IG min ~$2.75 (minDeal×lot×spot×pu)
-    "BTC":    80.79,  # minDeal=0.001 × lot=1 × ~$80,793 — blocks at <~$400 balance (20% cap, 50% margin)
+    "BTC":   807.20,  # minDeal=0.01 × lot=1 × ~$80,720 (live API) — blocks at <~$1,345 balance (20% cap, 10% margin, lev capped at 3)
     "ETH":     0.25,  # minDeal=0.0001 × lot=1 × ~$2,504 — eligible at small balances; live API updates on startup
 }
 _NOTIONAL_REDIS_KEY = "june_min_notionals"  # separate key — survives sim resets
@@ -278,7 +278,7 @@ _INSTRUMENTS_REVERSE: dict = {v: k for k, v in INSTRUMENTS.items()}
 
 _SEARCH_FALLBACKS: dict = {
     "BTC":    "Bitcoin",
-    "ETH":    "Ethereum",
+    "ETH":    "Ether",
     "EURUSD": "EUR/USD",
     "GBPUSD": "GBP/USD",
     "USDJPY": "USD/JPY",
