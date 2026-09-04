@@ -6679,7 +6679,7 @@ def _live_fetch_market_data(sym: str, epic: str) -> bool:
     _mf_v3   = inst.get("marginFactor")
     _mf_v1   = inst.get("margin")
     _mf      = _mf_v3 if _mf_v3 is not None else _mf_v1
-    _mf_unit = inst.get("marginFactorUnit", "PERCENTAGE")
+    _mf_unit = inst.get("marginFactorUnit") or "PERCENTAGE"  # None from API treated same as absent — always a percentage scale
     if _mf is not None:
         margin_rate = float(_mf) / 100.0 if _mf_unit == "PERCENTAGE" else float(_mf)
     else:
