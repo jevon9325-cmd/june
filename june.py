@@ -120,7 +120,7 @@ SPREAD_ATR_THRESHOLD = 1.00   # spread > 100% of 14-period ATR → rank/size pen
 ATR_PERIOD           = 14     # periods for ATR from rolling mid-price history
 # Hybrid tiered Spread/ATR thresholds — per asset class, used by entry gate with 5m ATR
 _SPREAD_ATR_TIERS:        dict  = {"FX": 0.35, "METAL": 0.60, "ENERGY": 0.85, "CRYPTO": 1.50}  # CRYPTO tier confirmed for BTC (ratio 0.531) and ETH (ratio 0.598) at worst-case Asian session; XRP/SOL pending measurement
-_SPREAD_ATR_ASSET_CLASS:  dict  = {"GOLD": "METAL", "SILVER": "METAL", "OIL": "ENERGY", "NATGAS": "ENERGY", "WHEAT": "METAL", "COCOA": "METAL", "BTC": "CRYPTO", "ETH": "CRYPTO"}
+_SPREAD_ATR_ASSET_CLASS:  dict  = {"GOLD": "METAL", "SILVER": "METAL", "OIL": "ENERGY", "NATGAS": "ENERGY", "WHEAT": "METAL", "COCOA": "METAL", "LWB": "METAL", "SUGAR": "METAL", "HO": "ENERGY", "BTC": "CRYPTO", "ETH": "CRYPTO"}
 _SPREAD_ATR_FALLBACK_BUMP: float = 0.15  # added to tier threshold when using 1m-ATR fallback
 SPREAD_MIN_READINGS = 5      # minimum readings before anomaly detection active
 
@@ -254,7 +254,10 @@ INSTRUMENTS: dict = {
     "OIL":    "CC.D.LCO.BMU.IP",       # smaller variant: Oil - Brent Crude ($1) -- $9,244 min vs $123,197 for .USS.IP
     "NATGAS": "CC.D.NG.BMU.IP",         # Natural Gas ($1) -- 3% margin, min_margin=$3.53 at $36 balance; ENERGY class
     "WHEAT":  "CC.D.W.BMU.IP",          # Chicago Wheat ($1) -- 2% margin, S/ATR 0.557; METAL class
-    "COCOA":  "CC.D.LCC.BMU.IP",        # London Cocoa ($1) -- 2% margin, S/ATR 0.343; METAL class
+    "COCOA":  "CC.D.LCC.BMU.IP",        # London Cocoa ($1) -- 10% margin, S/ATR 0.343; METAL class
+    "LWB":    "CO.D.LWB.FBMU3.IP",      # London Wheat -- 10% margin, ICE London 07:00-17:30 UTC; METAL class
+    "SUGAR":  "CC.D.LSU.BMU.IP",        # Sugar London No.5 -- ICE London 07:00-17:30 UTC; METAL class
+    "HO":     "CC.D.HO.BMU.IP",         # Heating Oil -- NYMEX 09:00-21:00 UTC; ENERGY class
     # Additional forex majors/minors — eligibility checked at startup against IG min notional
     "AUDUSD": "CS.D.AUDUSD.CFD.IP",    # AUD/USD — ~$6 min notional (similar lot structure to EURUSD)
     "USDCAD": "CS.D.USDCAD.CFD.IP",    # USD/CAD — ~$14 min notional
@@ -293,6 +296,9 @@ _SEARCH_FALLBACKS: dict = {
     "NATGAS": "Natural Gas",
     "WHEAT":  "Chicago Wheat",
     "COCOA":  "London Cocoa",
+    "LWB":    "London Wheat",
+    "SUGAR":  "Sugar No 5",
+    "HO":     "Heating Oil",
     "AUDUSD": "AUD/USD",
     "USDCAD": "USD/CAD",
     "EURGBP": "EUR/GBP",
