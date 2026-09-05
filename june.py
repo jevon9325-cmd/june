@@ -8042,6 +8042,60 @@ def _live_close_position(exit_reason: str, signals: dict) -> None:
                     f" \u2014 retrying"
                 )
                 return None
+            # Pyramid primary-closed-addon-survives promotion check:
+            # If _ls_cl=True (primary CONFIRMS received) but deposit>0 (margin still
+            # held by a remaining addon leg), this is NOT a genuine disagreement —
+            # the primary closing is expected and the deposit belongs to the addon.
+            # Promote the addon to primary when: exactly 1 addon leg, addon NOT in
+            # _ls_confirms_closed (confirmed still open via LS + REST deposit>0).
+            # Multi-addon case (>1) falls through to manual_review_required: ambiguous.
+            _pyr_legs = _live.get("pyramid_legs", [])
+            if _ls_cl and len(_pyr_legs) == 1:
+                _addon_leg  = _pyr_legs[0]
+                _addon_deal = _addon_leg.get("deal_id", "")
+                if _addon_deal and not _ls_deal_closed(_addon_deal):
+                    _agg_stop = _live.get("pyramid_agg_stop_level")
+                    _a_fill   = _addon_leg.get("fill_price", 0.0)
+                    _promoted = {
+                        "instrument":         _addon_leg.get("instrument", sym),
+                        "direction":          _addon_leg.get("direction", pos.get("direction")),
+                        "deal_id":            _addon_deal,
+                        "deal_ref":           _addon_leg.get("deal_ref", ""),
+                        "fill_price":         _a_fill,
+                        "ig_size":            _addon_leg.get("ig_size", 0.0),
+                        "pos_size":           _addon_leg.get("notional", 0.0),
+                        "leverage":           pos.get("leverage", 1),
+                        "notional":           _addon_leg.get("notional", 0.0),
+                        "stop_pct":           _addon_leg.get("stop_pct", pos.get("stop_pct", 0.005)),
+                        "initial_sl_pct":     _addon_leg.get("stop_pct", pos.get("stop_pct", 0.005)),
+                        "tp_pct":             _addon_leg.get("tp_pct", pos.get("tp_pct", 0.01)),
+                        "stop_dist":          abs(_agg_stop - _a_fill) if _agg_stop and _a_fill else 0.0,
+                        "broker_stop_level":  _agg_stop,
+                        "entry_time":         _addon_leg.get("entry_time", time.time()),
+                        "entry_vol":          0.0,
+                        "entry_change_15m":   0.0,
+                        "conviction":         pos.get("conviction", 5),
+                        "claudia_pts":        pos.get("claudia_pts", 0),
+                        "reversal_count":     0,
+                        "entry_sar":          0.0,
+                        "persistence_confirmed": False,
+                        "htf_bias":           None,
+                        "_pyramid_promoted":  True,
+                    }
+                    _live_log(
+                        f"[PYRAMID PROMOTE] {sym}: primary {_pv_deal_id} FULLY_CLOSED "
+                        f"| addon {_addon_deal} open (LS+REST deposit={_dep:.2f}) "
+                        f"| promoting addon to primary "
+                        f"| fill={_a_fill} broker_stop={_agg_stop}"
+                    )
+                    _live["open_position"]          = _promoted
+                    _live["pyramid_legs"]           = []
+                    _live["pyramid_agg_stop_level"] = None
+                    _live_save_state()
+                    return False  # caller returns without clearing the promoted open_position
+
+            # Multi-addon legs, addon also FULLY_CLOSED, or no CONFIRMS — genuinely
+            # ambiguous. Fall through to manual_review_required (cautious, correct).
             # Disagreement \u2014 route into existing manual_review_required path
             _live_log(
                 f"\U0001f6a8 POST-CLOSE VERIFY {_vi_n}/{_VERIFY_MAX}: LS/REST DISAGREEMENT "
@@ -8088,7 +8142,7 @@ def _live_close_position(exit_reason: str, signals: dict) -> None:
                 _post_resolved = True
                 break
             if _pv_r is False:
-                return  # manual_review_required already set inside _post_dual_verify
+                return  # promotion or manual_review_required handled in _post_dual_verify
             continue
         _post_pos = _post_data.get("positions", [])
         if _post_pos:
