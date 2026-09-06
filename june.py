@@ -2744,6 +2744,7 @@ _SIM_TP_CAP          = 0.010   # 1.00% max TP per trade
 _SIM_STOP_VOL_MULT   = 2.0     # stop = vol_mean + MULT * vol_std
 _SIM_STOP_FLOOR      = 0.0008  # 0.08% floor (covers spread+noise for all instruments)
 _SIM_STOP_CAP        = 0.005   # 0.50% max stop (at 10x = 5% leveraged)
+_SIM_ATR_CAP_MULT    = 1.5     # high-ATR gate: block entry when 5m ATR > 1.5× stop cap (0.75%)
 _SIM_STOP_COLD       = 0.0020  # 0.20% cold-start when no vol_history available
 
 # Spread-aware stop floors — fallback when june_spread_baselines unavailable (fractions)
@@ -4382,6 +4383,23 @@ def _sim_try_entry(signals: dict, regime: str, leverage: int) -> None:
                 f"> tier cap {_thr5:.2f} | Entry suppressed"
             )
             return
+        # High-ATR gate: block entry when 5m ATR > _SIM_ATR_CAP_MULT × _SIM_STOP_CAP.
+        # When this ratio is exceeded the dynamic stop is truncated by the cap to sit
+        # inside the instrument's own noise range → near-100% stop-out rate, corrupting
+        # vol_history/win_moves/loss_moves. Fail-open when _atr5 unavailable (warmup).
+        # Leveraged ETFs (SOXL/SOXS ~1.6%, DFEN/USD ~0.8%) exceed the 0.75% threshold;
+        # existing instruments (OIL ~0.11%, SILVER ~0.03%, NATGAS ~0.23%) pass safely.
+        _atr5_price = sig.get("price", 0.0)
+        if _atr5_price > 0:
+            _atr5_pct  = _atr5 / _atr5_price * 100.0
+            _atr5_ceil = _SIM_ATR_CAP_MULT * _SIM_STOP_CAP * 100.0   # 0.75%
+            if _atr5_pct > _atr5_ceil:
+                _sim_log(
+                    f"⛔ [ATR-CAP GATE] {sym}: 5m ATR {_atr5_pct:.2f}% > "
+                    f"{_SIM_ATR_CAP_MULT:.1f}× stop cap {_SIM_STOP_CAP*100:.1f}% "
+                    f"({_atr5_ceil:.2f}%) — needs LEVERAGED_EQUITY tier"
+                )
+                return
 
     # 1m gate: only block if opposing move is >= _SIM_1M_MIN_REVERSAL%
     # Noise-filtered -- tiny spread-level ticks no longer block entries.
