@@ -7767,52 +7767,74 @@ def _ls_deal_closed(deal_id: str) -> bool:
 
 
 def _ls_position_guard_check(sym: str, deal_id: str) -> tuple:
-    """Dual-system pre-send guard: LS primary, REST fallback, disagreement detection.
+    """Pre-send guard: confirm THIS SPECIFIC DEAL still open before sending close.
 
-    Always runs both systems when LS is live so disagreements surface immediately.
-    On disagreement: sets manual_review_required and returns (True, "DISAGREEMENT").
+    Per-deal check replaces account-level margin/deposit signals:
+    - LS: _ls_deal_closed(deal_id) -- FULLY_CLOSED CONFIRMS received via TRADE stream?
+    - REST: /positions list filtered by deal_id -- is this deal still present?
+
+    On disagreement (LS says closed, REST still shows deal): treat as OPEN for this
+    cycle and let _post_dual_verify resolve on the next attempt. Does NOT set
+    manual_review_required -- transient REST lag resolves automatically.
 
     Return codes:
-      (True/False, "LS+REST")       both agree
-      (True/False, "LS-only")       LS live, REST unavailable
-      (True/False, "REST-fallback") LS offline, REST answered
-      (True,       "DISAGREEMENT")  systems disagree -- manual_review_required set
-      (None,       "unavailable")   both systems failed
+      (True,  "LS+REST")       both agree deal is open
+      (True,  "LS-only")       LS connected, no CONFIRMS yet (REST unavailable)
+      (True,  "REST-fallback") LS offline, REST shows deal present
+      (True,  "DISAGREEMENT")  LS CONFIRMS received but REST still shows deal (REST lag)
+      (False, "LS+REST")       both agree deal is gone
+      (False, "REST-absent")   LS no CONFIRMS but REST shows deal gone (cautious flat)
+      (None,  "unavailable")   both systems failed or no deal_id
     """
-    ls_margin = _ls_get_margin()
+    if not deal_id:
+        return (None, "unavailable")
 
-    # Always run REST too when LS is live -- needed for disagreement detection
-    rest_dep: Optional[float] = None
-    _acct_data = _ig_live_get("/accounts", version="1")
-    if _acct_data is not None:
-        for _ac in _acct_data.get("accounts", []):
-            if _ac.get("preferred"):
-                rest_dep = float(_ac.get("balance", {}).get("deposit", 0) or 0)
-                break
+    # LS: has this specific deal been confirmed FULLY_CLOSED via TRADE stream?
+    # None when LS is offline (can't distinguish "not closed" from "not received").
+    ls_confirmed_closed: Optional[bool] = _ls_deal_closed(deal_id) if _ls_connected else None
 
-    if ls_margin is not None and rest_dep is not None:
-        ls_open   = ls_margin > 0
-        rest_open = rest_dep  > 0
-        if ls_open != rest_open:
+    # REST: is this specific deal_id present in /positions?
+    # /positions (not /positions/otc, which 404s on this account) returns all open deals.
+    rest_deal_open: Optional[bool] = None
+    _pos_data = _ig_live_get("/positions", version="1")
+    if _pos_data is not None:
+        _all_deals = {p.get("position", {}).get("dealId", "")
+                      for p in _pos_data.get("positions", [])}
+        rest_deal_open = deal_id in _all_deals
+
+    # Both systems available
+    if ls_confirmed_closed is not None and rest_deal_open is not None:
+        ls_open   = not ls_confirmed_closed  # True = LS has NOT seen CONFIRMS (deal may be open)
+        rest_open = rest_deal_open
+        if ls_open and rest_open:
+            return (True, "LS+REST")
+        if not ls_open and not rest_open:
+            return (False, "LS+REST")  # both agree this deal is gone
+        if not ls_open and rest_open:
+            # LS CONFIRMS received but REST still shows deal -- transient REST lag.
+            # Treat as open this cycle; _post_dual_verify resolves after close.
             _live_log(
-                f"POSITION GUARD DISAGREEMENT [{sym}]: "
-                f"LS margin={ls_margin:.2f} ({'open' if ls_open else 'flat'}) "
-                f"vs REST deposit={rest_dep:.2f} ({'open' if rest_open else 'flat'}) "
-                f"-- treating as OPEN (cautious). Setting manual_review_required."
+                f"POSITION GUARD DISAGREEMENT [{sym}]: LS CONFIRMS for {deal_id} "
+                f"received but REST still shows deal open "
+                f"-- treating as OPEN (cautious, REST lag expected)."
             )
-            _live["manual_review_required"] = True
-            _live_save_state()
             return (True, "DISAGREEMENT")
-        return (ls_open, "LS+REST")
+        # ls_open=True but REST says deal gone -- LS hasn't received CONFIRMS yet.
+        # REST is ground truth for position existence; treat as closed.
+        _live_log(f"[{sym}] [guard] LS no CONFIRMS yet but REST shows deal absent -- treating as closed")
+        return (False, "REST-absent")
 
-    if ls_margin is not None:
-        return (ls_margin > 0, "LS-only")
+    # LS only (REST unavailable)
+    if ls_confirmed_closed is not None:
+        return (not ls_confirmed_closed, "LS-only")
 
-    if rest_dep is not None:
-        _live_log(
-            f"[{sym}] [guard] LS offline -- deposit REST fallback (deposit={rest_dep:.2f})"
-        )
-        return (rest_dep > 0, "REST-fallback")
+    # REST only (LS offline)
+    if rest_deal_open is not None:
+        if rest_deal_open:
+            _live_log(f"[{sym}] [guard] LS offline -- deal present in /positions")
+        else:
+            _live_log(f"[{sym}] [guard] LS offline -- deal absent from /positions")
+        return (rest_deal_open, "REST-fallback")
 
     return (None, "unavailable")
 
@@ -8020,135 +8042,134 @@ def _live_close_position(exit_reason: str, signals: dict) -> None:
     _post_resolved = False  # True only when flat is confirmed
     _pv_deal_id    = deal_id  # captured for LS confirms check inside loop
 
-    def _get_preferred_deposit() -> float:
-        """Return deposit of preferred account via /accounts, or -1.0 on failure."""
-        _bd = _ig_live_get("/accounts", version="1")
-        if _bd is None:
-            return -1.0
-        for _ac in _bd.get("accounts", []):
-            if _ac.get("preferred"):
-                return float(_ac.get("balance", {}).get("deposit", 0) or 0)
-        return -1.0
-
     def _post_dual_verify(_vi_n: int) -> Optional[bool]:
-        """Dual-system flat check (LS + REST) for post-close 404 disambiguation.
+        """Post-close flat check using per-deal signals (not account-level margin/deposit).
 
-        Mirrors _ls_position_guard_check philosophy: always run both when LS is
-        live so disagreements surface immediately. Routes disagreement into the
-        existing manual_review_required path rather than building new logic.
+        LS: _ls_deal_closed(deal_id) -- FULLY_CLOSED CONFIRMS received via TRADE stream.
+        REST: /positions filtered by deal_id -- is this specific deal still present?
 
-        Returns True=flat confirmed, False=blocked (disagreement), None=retry.
+        Pyramid promotion trigger updated: addon confirmed via REST deal presence
+        (not account deposit > 0, which was account-level and would conflict with
+        any second concurrent position).
+
+        Returns True=flat confirmed, False=blocked (promotion or unresolvable), None=retry.
         """
-        _ls_m  = _ls_get_margin()
-        _ls_cl = _ls_deal_closed(_pv_deal_id) if _pv_deal_id else False
-        _dep   = _get_preferred_deposit()
-        _ls_ok = _ls_m is not None
-        _rs_ok = _dep >= 0.0
-        _ls_flat = _ls_ok and (_ls_m == 0.0 or _ls_cl)
-        _rs_flat = _rs_ok and _dep == 0.0
+        _ls_cl   = _ls_deal_closed(_pv_deal_id) if (_pv_deal_id and _ls_connected) else False
+        _ls_ok   = _ls_connected  # LS is reliable only when actively connected
+        _ls_flat = _ls_ok and _ls_cl  # LS confirms THIS deal specifically closed
+
+        # REST: per-deal check via /positions (not /positions/otc which 404s on this account)
+        _rs_data    = _ig_live_get("/positions", version="1")
+        _rs_ok      = _rs_data is not None
+        _rs_all_pos = _rs_data.get("positions", []) if _rs_ok else []
+        _rs_deals   = {p.get("position", {}).get("dealId", "") for p in _rs_all_pos}
+        _rs_flat    = (_pv_deal_id not in _rs_deals) if (_rs_ok and _pv_deal_id) else (not _rs_ok)
+
         if _ls_ok and _rs_ok:
             if _ls_flat and _rs_flat:
+                # Both agree primary deal is gone.
+                # Pyramid check: if other positions still exist on REST, addon may have survived.
+                _pyr_legs = _live.get("pyramid_legs", [])
+                if _rs_all_pos and _ls_cl and len(_pyr_legs) == 1:
+                    _addon_leg  = _pyr_legs[0]
+                    _addon_deal = _addon_leg.get("deal_id", "")
+                    if _addon_deal and _addon_deal in _rs_deals and not _ls_deal_closed(_addon_deal):
+                        # Addon confirmed open: present in REST + no LS CONFIRMS for addon.
+                        _agg_stop = _live.get("pyramid_agg_stop_level")
+                        _a_fill   = _addon_leg.get("fill_price", 0.0)
+                        _promoted = {
+                            "instrument":         _addon_leg.get("instrument", sym),
+                            "direction":          _addon_leg.get("direction", pos.get("direction")),
+                            "deal_id":            _addon_deal,
+                            "deal_ref":           _addon_leg.get("deal_ref", ""),
+                            "fill_price":         _a_fill,
+                            "ig_size":            _addon_leg.get("ig_size", 0.0),
+                            "pos_size":           _addon_leg.get("notional", 0.0),
+                            "leverage":           pos.get("leverage", 1),
+                            "notional":           _addon_leg.get("notional", 0.0),
+                            "stop_pct":           _addon_leg.get("stop_pct", pos.get("stop_pct", 0.005)),
+                            "initial_sl_pct":     _addon_leg.get("stop_pct", pos.get("stop_pct", 0.005)),
+                            "tp_pct":             _addon_leg.get("tp_pct", pos.get("tp_pct", 0.01)),
+                            "stop_dist":          abs(_agg_stop - _a_fill) if _agg_stop and _a_fill else 0.0,
+                            "broker_stop_level":  _agg_stop,
+                            "entry_time":         _addon_leg.get("entry_time", time.time()),
+                            "entry_vol":          0.0,
+                            "entry_change_15m":   0.0,
+                            "conviction":         pos.get("conviction", 5),
+                            "claudia_pts":        pos.get("claudia_pts", 0),
+                            "reversal_count":     0,
+                            "entry_sar":          0.0,
+                            "persistence_confirmed": False,
+                            "htf_bias":           None,
+                            "_pyramid_promoted":  True,
+                        }
+                        _live_log(
+                            f"[PYRAMID PROMOTE] {sym}: primary {_pv_deal_id} FULLY_CLOSED "
+                            f"| addon {_addon_deal} confirmed open (REST + LS no CONFIRMS) "
+                            f"| promoting addon to primary "
+                            f"| fill={_a_fill} broker_stop={_agg_stop}"
+                        )
+                        _live["open_position"]          = _promoted
+                        _live["pyramid_legs"]           = []
+                        _live["pyramid_agg_stop_level"] = None
+                        _live_save_state()
+                        return False  # caller returns without clearing the promoted open_position
+                # No pyramid promotion (no addon, addon also gone, or >1 addon).
+                # Primary is flat -- orphan handler in run_live_step closes any stale addon legs.
                 _live_log(
-                    f"\u2705 POST-CLOSE VERIFY {_vi_n}/{_VERIFY_MAX}: "
-                    f"LS+REST agree flat (margin={_ls_m:.2f}, deposit={_dep:.2f}) for {sym}"
+                    f"✅ POST-CLOSE VERIFY {_vi_n}/{_VERIFY_MAX}: "
+                    f"LS+REST agree: deal {_pv_deal_id} gone for {sym}"
                 )
                 return True
             if not _ls_flat and not _rs_flat:
+                # LS: no CONFIRMS yet. REST: deal still present. Both say open -- retry.
                 _live_log(
-                    f"\u26a0\ufe0f  POST-CLOSE VERIFY {_vi_n}/{_VERIFY_MAX}: "
-                    f"LS+REST both open (margin={_ls_m:.2f}, deposit={_dep:.2f}) for {sym}"
-                    f" \u2014 retrying"
+                    f"⚠️  POST-CLOSE VERIFY {_vi_n}/{_VERIFY_MAX}: "
+                    f"LS+REST both show {sym} deal open -- retrying"
                 )
                 return None
-            # Pyramid primary-closed-addon-survives promotion check:
-            # If _ls_cl=True (primary CONFIRMS received) but deposit>0 (margin still
-            # held by a remaining addon leg), this is NOT a genuine disagreement —
-            # the primary closing is expected and the deposit belongs to the addon.
-            # Promote the addon to primary when: exactly 1 addon leg, addon NOT in
-            # _ls_confirms_closed (confirmed still open via LS + REST deposit>0).
-            # Multi-addon case (>1) falls through to manual_review_required: ambiguous.
-            _pyr_legs = _live.get("pyramid_legs", [])
-            if _ls_cl and len(_pyr_legs) == 1:
-                _addon_leg  = _pyr_legs[0]
-                _addon_deal = _addon_leg.get("deal_id", "")
-                if _addon_deal and not _ls_deal_closed(_addon_deal):
-                    _agg_stop = _live.get("pyramid_agg_stop_level")
-                    _a_fill   = _addon_leg.get("fill_price", 0.0)
-                    _promoted = {
-                        "instrument":         _addon_leg.get("instrument", sym),
-                        "direction":          _addon_leg.get("direction", pos.get("direction")),
-                        "deal_id":            _addon_deal,
-                        "deal_ref":           _addon_leg.get("deal_ref", ""),
-                        "fill_price":         _a_fill,
-                        "ig_size":            _addon_leg.get("ig_size", 0.0),
-                        "pos_size":           _addon_leg.get("notional", 0.0),
-                        "leverage":           pos.get("leverage", 1),
-                        "notional":           _addon_leg.get("notional", 0.0),
-                        "stop_pct":           _addon_leg.get("stop_pct", pos.get("stop_pct", 0.005)),
-                        "initial_sl_pct":     _addon_leg.get("stop_pct", pos.get("stop_pct", 0.005)),
-                        "tp_pct":             _addon_leg.get("tp_pct", pos.get("tp_pct", 0.01)),
-                        "stop_dist":          abs(_agg_stop - _a_fill) if _agg_stop and _a_fill else 0.0,
-                        "broker_stop_level":  _agg_stop,
-                        "entry_time":         _addon_leg.get("entry_time", time.time()),
-                        "entry_vol":          0.0,
-                        "entry_change_15m":   0.0,
-                        "conviction":         pos.get("conviction", 5),
-                        "claudia_pts":        pos.get("claudia_pts", 0),
-                        "reversal_count":     0,
-                        "entry_sar":          0.0,
-                        "persistence_confirmed": False,
-                        "htf_bias":           None,
-                        "_pyramid_promoted":  True,
-                    }
-                    _live_log(
-                        f"[PYRAMID PROMOTE] {sym}: primary {_pv_deal_id} FULLY_CLOSED "
-                        f"| addon {_addon_deal} open (LS+REST deposit={_dep:.2f}) "
-                        f"| promoting addon to primary "
-                        f"| fill={_a_fill} broker_stop={_agg_stop}"
-                    )
-                    _live["open_position"]          = _promoted
-                    _live["pyramid_legs"]           = []
-                    _live["pyramid_agg_stop_level"] = None
-                    _live_save_state()
-                    return False  # caller returns without clearing the promoted open_position
-
-            # Multi-addon legs, addon also FULLY_CLOSED, or no CONFIRMS — genuinely
-            # ambiguous. Fall through to manual_review_required (cautious, correct).
-            # Disagreement \u2014 route into existing manual_review_required path
+            if _ls_flat and not _rs_flat:
+                # LS CONFIRMS received but REST still shows this deal -- REST lag, retry.
+                _live_log(
+                    f"⚠️  POST-CLOSE VERIFY {_vi_n}/{_VERIFY_MAX}: "
+                    f"LS CONFIRMS for {_pv_deal_id} received but REST still shows deal "
+                    f"[{sym}] — REST lag, retrying"
+                )
+                return None
+            # _rs_flat=True but no LS CONFIRMS: REST says deal gone, LS not yet confirmed.
+            # REST is ground truth for position existence -- treat as flat.
             _live_log(
-                f"\U0001f6a8 POST-CLOSE VERIFY {_vi_n}/{_VERIFY_MAX}: LS/REST DISAGREEMENT "
-                f"margin={_ls_m:.2f} closed={_ls_cl} vs deposit={_dep:.2f} [{sym}]"
-                f" \u2014 setting manual_review_required (cautious)."
+                f"✅ POST-CLOSE VERIFY {_vi_n}/{_VERIFY_MAX}: "
+                f"REST-only: deal {_pv_deal_id} absent from /positions for {sym}"
             )
-            _live["manual_review_required"] = True
-            _live_save_state()
-            return False
+            return True
         if _ls_ok:
+            # REST unavailable -- LS only
             if _ls_flat:
                 _live_log(
-                    f"\u2705 POST-CLOSE VERIFY {_vi_n}/{_VERIFY_MAX}: "
-                    f"LS-only flat (margin={_ls_m:.2f}, REST unavailable) for {sym}"
+                    f"✅ POST-CLOSE VERIFY {_vi_n}/{_VERIFY_MAX}: "
+                    f"LS-only: deal {_pv_deal_id} FULLY_CLOSED for {sym}"
                 )
                 return True
-            return None
+            return None  # LS connected but CONFIRMS not yet received -- retry
         if _rs_ok:
+            # LS offline -- REST only
             if _rs_flat:
                 _live_log(
-                    f"\u2705 POST-CLOSE VERIFY {_vi_n}/{_VERIFY_MAX}: "
-                    f"REST deposit=0 flat confirm for {sym}"
+                    f"✅ POST-CLOSE VERIFY {_vi_n}/{_VERIFY_MAX}: "
+                    f"REST-only: deal {_pv_deal_id} absent from /positions for {sym}"
                 )
                 return True
             _live_log(
-                f"\u26a0\ufe0f  POST-CLOSE VERIFY {_vi_n}/{_VERIFY_MAX}: "
-                f"deposit={_dep:.2f}>0 for {sym} \u2014 retrying"
+                f"⚠️  POST-CLOSE VERIFY {_vi_n}/{_VERIFY_MAX}: "
+                f"deal {_pv_deal_id} still in /positions for {sym} -- retrying"
             )
             return None
         _live_log(
-            f"\u26a0\ufe0f  POST-CLOSE VERIFY {_vi_n}/{_VERIFY_MAX}: "
-            f"LS AND REST both failed for {sym} \u2014 retrying"
+            f"⚠️  POST-CLOSE VERIFY {_vi_n}/{_VERIFY_MAX}: "
+            f"LS AND REST both failed for {sym} — retrying"
         )
         return None
-
     for _vi in range(_VERIFY_MAX):
         if _vi > 0:
             time.sleep(3)  # 3s between retries; worst-case extra: 6s
@@ -9053,6 +9074,31 @@ def _live_add_pyramid_leg(signals: dict) -> None:
 
     stop_pct = max(_sim_get_dynamic_stop(sym), _sim_get_spread_floor(sym))
     tp_pct   = _sim_get_tp(sym, dirn, primary.get("conviction", 5))
+
+    # Equity CFD gates — mirror of _live_open_position() gates; this path bypasses
+    # that function so both checks must be replicated here for equity add-ons.
+    if sym in _live_equity_cfd:
+        _pyr_price_unit = _live_price_unit.get(sym, 1.0)
+        _pyr_actual_n   = ig_size * mid * _pyr_price_unit
+        if pos_sz > 0:
+            _pyr_eff_lev = _pyr_actual_n / pos_sz
+            if _pyr_eff_lev > lev + 0.5:
+                _live_log(
+                    f"🚫 [PYRAMID] EQUITY LEV GATE: {sym} addon blocked — "
+                    f"minDeal clamp produced {_pyr_eff_lev:.1f}× effective leverage "
+                    f"(${_pyr_actual_n:.2f} actual / ${pos_sz:.2f} pos) "
+                    f"vs intended {lev}:1 — account too small for add-on"
+                )
+                return
+        _pyr_exp_gross = _pyr_actual_n * tp_pct
+        _pyr_rt_comm   = _IG_EQUITY_COMMISSION_USD * 2
+        if _pyr_exp_gross < _pyr_rt_comm:
+            _live_log(
+                f"🚫 [PYRAMID] COMMISSION GATE: {sym} addon blocked — "
+                f"expected gross ${_pyr_exp_gross:.2f} < ${_pyr_rt_comm:.2f} round-trip "
+                f"commission (notional ${_pyr_actual_n:.2f} TP {tp_pct*100:.2f}%)."
+            )
+            return
 
     # N-way approximate aggregate stop for entry-time stop distance (all legs including new)
     _existing_legs = _live.get("pyramid_legs", [])
