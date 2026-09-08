@@ -7904,6 +7904,28 @@ def _live_close_position(exit_reason: str, signals: dict) -> None:
                 f"⚠️  {sym}: position already gone [{_guard_src}] — "
                 f"suppressed. Reconciling."
             )
+            # Broker-stop-first path: IG closed the position via its own stop order
+            # before this close scan fired. Mirror the same cooldowns the normal
+            # stop_loss close path sets -- without this, the entry gate is bypassed
+            # every time a broker stop fires faster than the bot's exit scan.
+            if exit_reason == "stop_loss":
+                _sl_exp = time.time() + 10 * 60
+                _live.setdefault("pause_expiry", {})[_sim_combo_key(sym, dirn)] = _sl_exp
+                _live_log(f"⏸️ [SAME-DIR COOLDOWN] {sym} {dirn} blocked for 10m (broker-stop path). Opposing direction remains active.")
+                _instr_exp = time.time() + 15 * 60
+                _live.setdefault("instrument_cooldown", {})[sym] = _instr_exp
+                _live_log(f"⏸️ [INSTRUMENT COOLDOWN] {sym} all-direction blocked for 15m after stop-out (broker-stop path)")
+                _so_ct = _live.setdefault("instrument_stopouts_today", {})
+                _so_ct[sym] = _so_ct.get(sym, 0) + 1
+                if _so_ct[sym] >= _LIVE_DEF_INSTR_STOPOUTS:
+                    _imd = _live.setdefault("instrument_mode", {})
+                    if _imd.get(sym) != "defensive":
+                        _imd[sym] = "defensive"
+                        _live.setdefault("instrument_mode_entered_at", {})[sym] = time.time()
+                        _live_log(
+                            f"⛔️ [DEFENSIVE] {sym}: NORMAL -> DEFENSIVE "
+                            f"({_so_ct[sym]} stop-outs today >= {_LIVE_DEF_INSTR_STOPOUTS})"
+                        )
             _live_reconcile_positions()
             _live_save_state()
             return
