@@ -9408,6 +9408,7 @@ def _live_try_entry(signals: dict, regime: str) -> None:
                 _live_write_block_log(sym, direction, "spread_atr",
                                      {"sar5": round(_sar5, 3), "thr5": round(_thr5, 3),
                                       "atr5": round(_atr5, 4)})
+            _live_shadow_obs_blocked(sym, direction, sig, combo, "SPREAD-BLOCKED")
             return
 
     # 1m anti-reversal gate (same as sim)
@@ -9598,6 +9599,102 @@ def _live_try_entry(signals: dict, regime: str) -> None:
                        htf_bias=_htf_b)
 
 
+
+def _live_shadow_obs_blocked(sym: str, direction: str, sig: dict,
+                              combo: str, block_label: str) -> None:
+    """Observation-only eval for a blocked candidate.
+    Runs exhaustion diag, ER obs (HTF instruments), HTF diag, conviction.
+    No trade state written, no order placed. Never crashes the cycle.
+    """
+    try:
+        vol = abs(sig.get("change_5m", 0.0))
+        _ex_ratio = _exhaustion_ratio(sym, direction)
+        _diag_hist = _history.get(sym)
+        if _diag_hist and len(_diag_hist) >= 10:
+            _diag_px  = [px for _, px in _diag_hist]
+            _d_atr, _ = _compute_atr_5m(sym)
+            if _d_atr:
+                _net10  = _diag_px[-1] - _diag_px[-10]
+                _net10s = _net10 if direction == "long" else -_net10
+                _ex10   = max(0.0, _net10s / _d_atr)
+                if _ex_ratio > 0.0 or _ex10 > 0.0:
+                    _live_log(
+                        f"  📏 [EXHAUST DIAG] {sym}/{direction}: "
+                        f"20t={_ex_ratio:.2f}× 10t={_ex10:.2f}× ATR={_d_atr:.2f}"
+                    )
+        if sym in _HTF_INSTRUMENTS:
+            thresh    = _sim_get_threshold(sym, direction,
+                                           low_tier=(_sim_vol_bucket(vol) == "low"))
+            weight    = _sim_regime_weight(sym, direction)
+            gate_mode, rel_score = _sim_15m_gate_mode(sym, direction)
+            conv      = _sim_conviction_gauge(sym, direction, vol, thresh, weight,
+                                              combo, gate_mode, rel_score)
+            _live_write_ex_ratio_obs(sym, direction, _ex_ratio,
+                                     sig.get("spread_atr_ratio"), conv)
+            _htf_b, _htf_m, _htf_note = _compute_htf_alignment(sym, direction)
+            _live_log("  📏 [HTF DIAG] %s/%s: %s" % (sym, direction, _htf_note))
+            _live_log(
+                f"🔍 [{block_label} DRY-RUN] {sym}/{direction}: "
+                f"would enter @ {sig.get('price', 0.0):.2f} "
+                f"| conv {conv}/10 | exhaust {_ex_ratio:.2f}× "
+                f"| HTF={_htf_b} {_htf_m:.2%}"
+            )
+        else:
+            _live_log(
+                f"🔍 [{block_label} DRY-RUN] {sym}/{direction}: "
+                f"would enter @ {sig.get('price', 0.0):.2f} "
+                f"| exhaust {_ex_ratio:.2f}×"
+            )
+    except Exception:
+        pass
+
+
+def _live_shadow_evaluate_blocked(signals: dict, regime: str) -> None:
+    """Shadow-evaluate all SAR/perf-blocked instruments each cycle.
+    Generates observation data that would otherwise be blank during a block
+    window. Logs [SAR-BLOCKED DRY-RUN] to distinguish from real trades.
+    No _live state written, no order placed.
+    """
+    _ext = dict(signals)
+    _now_ext = time.time()
+    for _eq_b, _eq_d in _direct_cfd_signals.items():
+        if _eq_b in _ext:
+            continue
+        if _now_ext - _eq_d.get("ts", 0) > 20 * 60:
+            continue
+        _eq_mid = _eq_d.get("mid", 0.0)
+        if _eq_mid <= 0.0:
+            continue
+        _eq_dir_raw = _eq_d.get("direction", "flat")
+        _ext[_eq_b] = {
+            "change_5m":    _eq_d["pct"],
+            "direction":    "neutral" if _eq_dir_raw == "flat" else _eq_dir_raw,
+            "spread_alert": False,
+            "price":        _eq_mid,
+            "spread_pct":   0.1,
+            "change_15m":   None,
+        }
+    for sym in _sim_eligible:
+        if not _live_perf_blocked(sym):
+            continue
+        if sym not in _ext:
+            continue
+        if sym in _METALS_INSTRUMENTS and _is_metals_weekend_closure():
+            continue
+        if sym not in _CONTINUOUS_INSTRUMENTS and is_weekend_closure():
+            continue
+        sig       = _ext[sym]
+        chg       = sig.get("change_5m", 0.0)
+        vol       = abs(chg)
+        direction = "long" if chg > 0 else "short"
+        combo     = _sim_combo_key(sym, direction)
+        thresh    = _sim_get_threshold(sym, direction,
+                                       low_tier=(_sim_vol_bucket(vol) == "low"))
+        if vol < thresh:
+            continue
+        _live_shadow_obs_blocked(sym, direction, sig, combo, "SAR-BLOCKED")
+
+
 # ── Top-level live step (called from poll_cycle) ──────────────────────────────
 
 def run_live_step(signals: dict) -> None:
@@ -9693,6 +9790,7 @@ def run_live_step(signals: dict) -> None:
 
     # Entry check (FX weekend gate is now per-instrument inside _live_try_entry)
     _live_try_entry(signals, regime)
+    _live_shadow_evaluate_blocked(signals, regime)
 
 
 # ── Startup ───────────────────────────────────────────────────────────────────
