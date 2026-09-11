@@ -5949,7 +5949,7 @@ _LIVE_DEF_MICRO_FLOOR_USD  = 1.00   # global defensive (micro <$30): half CB flo
 _LIVE_DEF_MICRO_PCT        = 0.15   # global defensive (micro <$30): half CB pct (30%->15%)
 _LIVE_DEF_FLOOR_USD        = 10.00  # global defensive (full >=30): half CB floor ($20)
 _LIVE_DEF_PCT              = 0.025  # global defensive (full >=30): half CB pct (5%->2.5%)
-_LIVE_DEF_INSTR_STOPOUTS   = 2      # stop-outs on one instrument before instrument-defensive
+_LIVE_DEF_INSTR_STOPOUTS   = 1      # stop-outs on one instrument before instrument-defensive
 _LIVE_DEF_TIMEOUT_SECS     = 1800   # 30-min safety valve (recovery time gate)
 
 
@@ -6224,7 +6224,7 @@ def _live_update_defensive_mode() -> None:
     threshold below day_start. Lifts when dollar_loss drops below half the
     defensive threshold (hysteresis band), OR 30-min time gate elapses.
 
-    Per-instrument defensive: fires after _LIVE_DEF_INSTR_STOPOUTS (2) stop-outs
+    Per-instrument defensive: fires after _LIVE_DEF_INSTR_STOPOUTS (1) stop-outs
     on the same instrument today. Lifts when a WIN closes on that instrument after
     entry, OR 30-min time gate elapses.
 
@@ -7926,6 +7926,21 @@ def _live_close_position(exit_reason: str, signals: dict) -> None:
                             f"⛔️ [DEFENSIVE] {sym}: NORMAL -> DEFENSIVE "
                             f"({_so_ct[sym]} stop-outs today >= {_LIVE_DEF_INSTR_STOPOUTS})"
                         )
+            elif exit_reason == "pyramid_leg_sl_close_primary":
+                # Pyramid-SL primary closure counts toward per-instrument defensive,
+                # same as a direct stop_loss. No same-dir/all-dir cooldown.
+                _so_ct = _live.setdefault("instrument_stopouts_today", {})
+                _so_ct[sym] = _so_ct.get(sym, 0) + 1
+                if _so_ct[sym] >= _LIVE_DEF_INSTR_STOPOUTS:
+                    _imd = _live.setdefault("instrument_mode", {})
+                    if _imd.get(sym) != "defensive":
+                        _imd[sym] = "defensive"
+                        _live.setdefault("instrument_mode_entered_at", {})[sym] = time.time()
+                        _live_log(
+                            f"[DEFENSIVE] {sym}: NORMAL -> DEFENSIVE "
+                            f"({_so_ct[sym]} stop-outs today >= {_LIVE_DEF_INSTR_STOPOUTS}) "
+                            f"[pyramid_leg_sl_close_primary]"
+                        )
             _live_reconcile_positions()
             _live_save_state()
             return
@@ -8043,6 +8058,21 @@ def _live_close_position(exit_reason: str, signals: dict) -> None:
                     _live_log(
                         f"⛔️ [DEFENSIVE] {sym}: NORMAL -> DEFENSIVE "
                         f"({_so_ct[sym]} stop-outs today >= {_LIVE_DEF_INSTR_STOPOUTS})"
+                    )
+        elif exit_reason == "pyramid_leg_sl_close_primary":
+            # Pyramid-SL primary closure counts toward per-instrument defensive,
+            # same as a direct stop_loss. No same-dir/all-dir cooldown.
+            _so_ct = _live.setdefault("instrument_stopouts_today", {})
+            _so_ct[sym] = _so_ct.get(sym, 0) + 1
+            if _so_ct[sym] >= _LIVE_DEF_INSTR_STOPOUTS:
+                _imd = _live.setdefault("instrument_mode", {})
+                if _imd.get(sym) != "defensive":
+                    _imd[sym] = "defensive"
+                    _live.setdefault("instrument_mode_entered_at", {})[sym] = time.time()
+                    _live_log(
+                        f"[DEFENSIVE] {sym}: NORMAL -> DEFENSIVE "
+                        f"({_so_ct[sym]} stop-outs today >= {_LIVE_DEF_INSTR_STOPOUTS}) "
+                        f"[pyramid_leg_sl_close_primary]"
                     )
         # Record wins on instruments in defensive mode (enables P&L recovery condition)
         if won and (_live.get("instrument_mode") or {}).get(sym) == "defensive":
