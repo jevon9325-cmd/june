@@ -2735,7 +2735,7 @@ _BARBIE_COMBO_THRESH_MIN = 0.10  # safety floor for Barbie override (~10% = floo
 _BARBIE_COMBO_THRESH_MAX = 0.55  # safety ceiling (~55% = stricter than any real breakeven)
 
 # Dynamic TP (all fractions — same units as pnl_pct; vol_history is in %, divided /100)
-_SIM_TP_WIN_FRACTION = 0.70    # TP from win history: 70% of avg winning move
+_SIM_TP_WIN_FRACTION = 0.82    # TP from win history: 82% of avg winning move (was 0.70; raised to reduce dilution from breakeven-stop exits)
 _SIM_TP_VOL_FRACTION = 0.30    # TP from vol_history: 30% of vol_mean (converted /100)
 _SIM_TP_FLOOR        = 0.0002  # 0.02% absolute floor (~2 pips GBPUSD, $0.011 Silver)
 _SIM_TP_CAP          = 0.010   # 1.00% max TP per trade
@@ -3566,11 +3566,23 @@ def _sim_get_tp(sym: str, direction: str, conviction: int = 5) -> float:
         return round(max(_SIM_TP_FLOOR, min(tp_cap, max(estimates))), 6)
 
     # True cold-start (zero history): instrument-type micro-defaults
+    # Commodity defaults derived from Sep 2026 observed TP targets and Aug win-move data.
     if "JPY" in sym:
-        return 0.0003
-    if sym == "SILVER":
-        return 0.0004   # commodity with wide spread — needs bigger move to profit
-    return 0.0002   # all forex pairs (EURUSD, GBPUSD, AUDUSD, USDCAD, EURGBP, NZDUSD, USDCHF…)
+        return 0.0003    # JPY 2-decimal pairs: tighter range (unchanged)
+    _cold_tp = {
+        "OIL":    0.0010,  # Aug-Sep win moves 0.09-0.19%; target lower bound 0.10%
+        "SILVER": 0.0012,  # Sep TP targets 0.12-0.15%; use lower bound
+        "NATGAS": 0.0014,  # Sep TP targets 0.14-0.17%; use lower bound
+        "COCOA":  0.0025,  # Sep TP targets 0.25-0.33%; use lower bound
+        "GOLD":   0.0008,  # less volatile than OIL per pip; conservative
+        "WHEAT":  0.0010,  # similar class to OIL
+        "SUGAR":  0.0010,
+        "LWB":    0.0010,
+        "HO":     0.0012,
+    }
+    if sym in _cold_tp:
+        return _cold_tp[sym]
+    return 0.0002    # FX pairs (EURUSD, GBPUSD, AUDUSD, USDCAD, EURGBP, NZDUSD, USDCHF…)
 
 
 def _sim_get_dynamic_stop(sym: str) -> float:
