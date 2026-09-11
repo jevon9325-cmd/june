@@ -8791,17 +8791,16 @@ def _live_check_exit(signals: dict, regime: str) -> None:
 
 # ── Instrument selection (Part 2 — mirrors _sim_select_instrument) ────────────
 
-def _live_select_instrument(signals: dict, regime: str) -> Optional[str]:
+def _live_select_instrument(signals: dict, regime: str) -> list:
     """Candidate selection using live balance and real IG margin rates.
 
-    Uses _live_is_eligible which caps effective leverage at 1/margin_rate for
-    instruments with margin_rate <= 1.0 — prevents selecting instruments
-    that IG would reject with INSUFFICIENT_FUNDS.
+    Returns all qualifying candidates ranked by effective volatility (desc).
+    Callers use [0] as primary pick; subsequent entries are notional-gate runner-ups.
     """
-    bal        = _live.get("balance", 0.0)
+    bal = _live.get("balance", 0.0)
     if bal <= 0:
-        return None
-    best_sym, best_vol = None, 0.0
+        return []
+    candidates: list = []   # [(sym, eff_vol)]
 
     for sym in _sim_eligible:
         if not _live_is_eligible(sym):
@@ -8837,11 +8836,10 @@ def _live_select_instrument(signals: dict, regime: str) -> Optional[str]:
             continue  # performance filter: below 30% WR or chronic wide Spread/ATR
         if sig.get("spread_atr_wide"):
             eff_vol *= 0.5   # rank penalty: spread > ATR threshold
-        if eff_vol > best_vol:
-            best_vol = eff_vol
-            best_sym = sym
+        candidates.append((sym, eff_vol))
 
-    return best_sym
+    candidates.sort(key=lambda x: -x[1])
+    return [s for s, _ in candidates]
 
 
 # ── Entry logic (Part 5 — mirrors _sim_try_entry) ─────────────────────────────
@@ -9353,7 +9351,7 @@ def _live_check_phase() -> None:
         _live_save_state()
 
 
-def _live_try_entry(signals: dict, regime: str) -> None:
+def _live_try_entry(signals: dict, regime: str, _notional_skip: set = None) -> None:
     """Evaluate entry for live trading. Reuses all sim decision functions.
     Calls _live_open_position which is the only place orders are placed.
     """
@@ -9396,8 +9394,15 @@ def _live_try_entry(signals: dict, regime: str) -> None:
     if _gmode == "defensive" and regime == "neutral":
         _live_log(f"No live candidate — global DEFENSIVE + regime=neutral")
         return
-    sym = _live_select_instrument(_ext, regime)
-    if not sym or sym not in _ext:
+    _ranked = _live_select_instrument(_ext, regime)
+    if _notional_skip:
+        _ranked = [s for s in _ranked if s not in _notional_skip]
+    if not _ranked:
+        if not _notional_skip:
+            _live_log(f"No live candidate — regime={regime} bal=${bal:.2f}")
+        return
+    sym = _ranked[0]
+    if sym not in _ext:
         _live_log(f"No live candidate — regime={regime} bal=${bal:.2f}")
         return
 
@@ -9613,6 +9618,12 @@ def _live_try_entry(signals: dict, regime: str) -> None:
         if not _sim_check_min_feasible(sym, 2.0, lev):
             _live_log(f"skip {sym}: notional ${notional:.2f} < IG min "
                       f"${_sim_min_notional.get(sym, 0):.2f}")
+            # Hard structural gate — try the next ranked candidate (max 3 fallbacks)
+            _skip = (_notional_skip or set()) | {sym}
+            if len(_skip) <= 3:
+                if len(_skip) == 1:
+                    _live_log(f"  -> notional hard gate — trying ranked fallback")
+                _live_try_entry(signals, regime, _notional_skip=_skip)
             return
         pos_size = 2.0
         notional = pos_size * lev
