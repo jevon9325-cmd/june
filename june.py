@@ -392,6 +392,9 @@ _live_min_stop_pts: dict = {}  # sym -> minNormalStopOrLimitDistance (pts) from 
 _live_min_stop_pct: dict = {}  # sym -> minStop fraction for PERCENTAGE-unit instruments (BTC/ETH)
 _live_elig_publish_next: float = 0.0  # rate-limiter for barbie_june_eligible_instruments (1h)
 _MACRO_STALE_SECS  = 2 * 3600   # Claudia freshness gate: beyond this treat directional bias as stale
+_HTF_COMBO_MIN_N    = 25      # per-combo min matched outcomes before gate activates
+_HTF_COMBO_CI_FLOOR = 0.55   # 99% Wilson CI lower bound must exceed this for a positive call
+_HTF_COMBO_ALPHA    = 0.05   # family-wise alpha; Bonferroni-corrected over active combos
 
 # Rolling price history: {sym: deque([(epoch, mid), ...])}
 _history: dict = {sym: deque(maxlen=HISTORY_LEN) for sym in INSTRUMENTS}
@@ -3373,6 +3376,42 @@ def _sim_combo_wr_gate(sym: str, direction: str) -> tuple:
     return False, ""
 
 
+def _htf_combo_gate(sym: str, direction: str, htf_bias: str) -> tuple:
+    """Per-combo HTF predictive gate with Bonferroni-corrected Wilson CI.
+
+    Returns (verdict: str, pts: int, note: str).
+    verdict: "positive" | "negative" | "inconclusive"
+    pts: +1 | -1 | 0. Gate only fires when N >= _HTF_COMBO_MIN_N outcomes exist
+    and 99% Wilson CI lower bound > _HTF_COMBO_CI_FLOOR (positive)
+    or CI upper bound < 1 - _HTF_COMBO_CI_FLOOR (negative).
+    z is Bonferroni-corrected: Phi^-1(1 - alpha/(2K)) via rational PPF approx.
+    """
+    combo_key  = f"{sym}_{direction}_{htf_bias}"
+    all_combos = _live.get("htf_combo_outcomes") or {}
+    outcomes   = all_combos.get(combo_key, [])
+    n          = len(outcomes)
+    if n < _HTF_COMBO_MIN_N:
+        return "inconclusive", 0, f"N={n}<{_HTF_COMBO_MIN_N}"
+    K = max(1, sum(1 for v in all_combos.values() if len(v) >= _HTF_COMBO_MIN_N))
+    # Bonferroni-corrected z via rational approx of normal PPF (A&S 26.2.17, max err ~1e-3)
+    _p_c = 1.0 - _HTF_COMBO_ALPHA / (2.0 * K)   # always >0.5 for any K>=1
+    _t_c = math.sqrt(-2.0 * math.log(1.0 - _p_c))
+    z    = _t_c - (2.515517 + 0.802853*_t_c + 0.010328*_t_c*_t_c) / (1.0 + 1.432788*_t_c + 0.189269*_t_c*_t_c + 0.001308*_t_c*_t_c*_t_c)
+    wins  = sum(1 for w, _ in outcomes if w)
+    p     = wins / n
+    denom  = 1.0 + z * z / n
+    center = (p + z * z / (2 * n)) / denom
+    margin = z * math.sqrt(p * (1 - p) / n + z * z / (4 * n * n)) / denom
+    ci_lo  = center - margin
+    ci_hi  = center + margin
+    note   = f"N={n} WR={p:.0%} z={z:.2f} CI=[{ci_lo:.0%},{ci_hi:.0%}] K={K}"
+    if ci_lo > _HTF_COMBO_CI_FLOOR:
+        return "positive", 1, note
+    if ci_hi < (1.0 - _HTF_COMBO_CI_FLOOR):
+        return "negative", -1, note
+    return "inconclusive", 0, note
+
+
 def _sim_is_paused(combo: str) -> bool:
     exp = (_sim.get("pause_expiry") or {}).get(combo, 0.0)
     return time.time() < exp
@@ -6141,6 +6180,7 @@ def _htf_self_calibrate():
                 pass
         trade_hist = _live.get("trade_history", []) + _sim.get("trade_history", [])
         results = {"aligned": [], "opposed": [], "neutral": []}
+        per_combo: dict = {}   # {sym_dir_bias: [(won, pnl), ...]}
         matched = 0
         for ev in events:
             ev_ts  = ev.get("ts", 0)
@@ -6165,9 +6205,12 @@ def _htf_self_calibrate():
                        (ev_dir == "short" and htf_b == "bull"))
             bucket  = "aligned" if aligned else ("opposed" if opposed else "neutral")
             results[bucket].append((won, pnl))
+            _ck = f"{ev_sym}_{ev_dir}_{htf_b}"
+            per_combo.setdefault(_ck, []).append((won, pnl))
         if matched - _htf_calib_last_n < _HTF_CALIB_RERUN_EVERY and _htf_calib_last_n > 0:
             return
         _htf_calib_last_n = matched
+        _live["htf_combo_outcomes"] = per_combo   # rebuilt each full calibration run
         _live_log("[HTF CALIB] n_raw=%d matched=%d | aligned=%d opposed=%d neutral=%d"
                   % (n_raw, matched, len(results["aligned"]),
                      len(results["opposed"]), len(results["neutral"])))
@@ -9534,8 +9577,15 @@ def _live_try_entry(signals: dict, regime: str, _notional_skip: set = None) -> N
     # Conviction and leverage
     thresh  = _sim_get_threshold(sym, direction)
     weight  = _sim_regime_weight(sym, direction)
+    _htf_b, _htf_m, _htf_note = _compute_htf_alignment(sym, direction)
     conv    = _sim_conviction_gauge(sym, direction, vol, thresh, weight, combo,
                                     gate_mode, rel_score)
+    # HTF per-combo gate: Bonferroni-corrected Wilson CI (dormant until N≥25 per combo)
+    _htf_cg_verdict, _htf_cg_pts, _htf_cg_note = _htf_combo_gate(sym, direction, _htf_b)
+    if _htf_cg_pts != 0:
+        conv = min(10, max(1, conv + _htf_cg_pts))
+        _live_log(f"  📊 [HTF COMBO] {sym}/{direction}/{_htf_b}: "
+                  f"{_htf_cg_verdict} → conv {conv}/10 | {_htf_cg_note}")
     # Conviction floor — applied only in DEFENSIVE mode (global or instrument-level).
     # In NORMAL mode, all conviction levels are permitted.
     _in_defensive = (_gmode == "defensive" or _imode == "defensive")
@@ -9678,8 +9728,8 @@ def _live_try_entry(signals: dict, regime: str, _notional_skip: set = None) -> N
         f"conv {conv}/10 lev {lev}:1 pos ${pos_size:.2f} notional ${notional:.2f}"
     )
 
-    _htf_b, _htf_m, _htf_note = _compute_htf_alignment(sym, direction)
-    _live_log("  📏 [HTF DIAG] %s/%s: %s" % (sym, direction, _htf_note))
+    _live_log("  📏 [HTF DIAG] %s/%s: %s | combo=%s [%s]"
+              % (sym, direction, _htf_note, _htf_cg_verdict, _htf_cg_note))
 
     # DRY-RUN gate: when live is halted (CB fired or kill-switch off), all
     # observation logs above (ex_ratio obs, HTF diag, SIM->live WR, block log)
