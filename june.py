@@ -387,6 +387,7 @@ _live_fx_instruments: set = set() # syms whose epic matches CS.D.*.CFD.IP — FX
 _METALS_INSTRUMENTS: frozenset = frozenset({"SILVER", "OIL"})  # CME/COMEX-linked; separate weekend gate from FX
 _CONTINUOUS_INSTRUMENTS: frozenset = frozenset({"BTC", "ETH"})  # 24/7 markets (crypto CFDs) — bypasses FX weekend closure gate
 _IG_EQUITY_COMMISSION_USD = 9.0       # IG charges $9/side = $18 round-trip on equity CFDs
+_PRESUBMIT_DRIFT_CAP = 0.005          # 0.5% drift cap on pre-submission price re-check
 _live_min_stop_pts: dict = {}  # sym -> minNormalStopOrLimitDistance (pts) from IG at startup
 _live_elig_publish_next: float = 0.0  # rate-limiter for barbie_june_eligible_instruments (1h)
 _MACRO_STALE_SECS  = 2 * 3600   # Claudia freshness gate: beyond this treat directional bias as stale
@@ -7550,6 +7551,29 @@ def _live_open_position(sym: str, direction: str, signals: dict,
 
     if not _live_trade_guard():  # ← structural gate: no order without this passing
         return
+
+    # ── Pre-submission price re-check (staleness guard) ────────────────────────────
+    # Fetch a fresh mid price immediately before the POST. If price has drifted
+    # > _PRESUBMIT_DRIFT_CAP since signal time, sizing/stop calculations are based
+    # on a stale reference. Fail-open on fetch error (transient API failures must
+    # not block legitimate trades). Dormant on current instruments (max observed
+    # 70s drift ~0.30% Sep-11 OIL worst-case); fires for high-velocity instruments
+    # (BTC/ETH intra-minute velocity commonly exceeds 0.5% in fast conditions).
+    _precheck_fresh = fetch_price(epic)
+    if _precheck_fresh is not None and mid_price > 0:
+        _fresh_mid = _precheck_fresh["mid"]
+        _drift = abs(_fresh_mid - mid_price) / mid_price
+        if _drift > _PRESUBMIT_DRIFT_CAP:
+            _live_log(
+                f"🚫 PRESUBMIT DRIFT: {sym} {ig_direction} aborted — "
+                f"signal mid={mid_price:.5f} fresh mid={_fresh_mid:.5f} "
+                f"drift={_drift*100:.3f}% > {_PRESUBMIT_DRIFT_CAP*100:.1f}% cap"
+            )
+            return
+    elif _precheck_fresh is None:
+        _live_log(
+            f"⚠️  presubmit check: {sym} price fetch failed — proceeding (fail-open)"
+        )
 
     # ── Real order placement ──────────────────────────────────────────────────
     order_body = {
