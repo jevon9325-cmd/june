@@ -6730,11 +6730,27 @@ def _live_fetch_market_data(sym: str, epic: str) -> bool:
     _ms_unit = _ms_obj.get("unit", "POINTS")
     _ms_val  = float(_ms_obj.get("value") or 4.0)
     if _ms_unit == "PERCENTAGE":
-        # PERCENTAGE unit would need a price reference to convert to points;
-        # all live instruments observed use POINTS — log and use safe fallback.
-        _live_log(f"\u26a0\ufe0f  {sym}: minStop unit=PERCENTAGE, expected POINTS "
-                  f"— using 4pt fallback instead of {_ms_val}")
-        _ms_val = 4.0
+        # Convert PERCENTAGE to pts using snapshot price (accurate at startup).
+        # Also stored in _live_min_stop_pct for dynamic recomputation at order time
+        # in _live_compute_stop_pts — ensures minimum stays current-price-correct
+        # as BTC/ETH price drifts after startup.
+        _pct_frac = _ms_val / 100.0
+        _live_min_stop_pct[sym] = _pct_frac
+        _snap_d = data.get("snapshot", {})
+        _s_bid = float(_snap_d.get("bid") or 0)
+        _s_off = float(_snap_d.get("offer") or 0)
+        if _s_bid and _s_off:
+            _ref_p = (_s_bid + _s_off) / 2.0
+        else:
+            _mn = _sim_min_notional.get(sym, 0.0)
+            _denom = min_val * lot_sz * price_unit
+            _ref_p = _mn / _denom if (_mn > 0 and _denom > 0) else 0.0
+        if _ref_p > 0:
+            _ms_val = _ref_p * _pct_frac
+            _live_log(f"  {sym}: minStop=PERCENTAGE({_pct_frac*100:.2f}%) -> {_ms_val:.1f}pts at ref {_ref_p:.2f}")
+        else:
+            _ms_val = 4.0
+            _live_log(f"\u26a0\ufe0f  {sym}: minStop=PERCENTAGE but no price ref -- 4pt fallback (dynamic check active)")
     _live_min_stop_pts[sym] = max(1, int(_ms_val))  # real IG value; +1 buffer in _live_compute_stop_pts
     if epic.upper().endswith(".CASH.IP"):
         _live_equity_cfd.add(sym)
@@ -7328,7 +7344,11 @@ def _live_compute_stop_pts(sym: str, stop_pct: float, mid_price: float = 0.0) ->
     price_unit = _live_price_unit.get(sym, 1.0)
     ref_price  = mid_price if mid_price > 0 else _live_entry_price_ref(sym)
     pts        = int(ref_price * price_unit * stop_pct / pip_sz)
-    return max(_live_min_stop_pts.get(sym, 4) + 1, pts)
+    ig_min     = _live_min_stop_pts.get(sym, 4) + 1
+    _pct_min   = _live_min_stop_pct.get(sym)
+    if _pct_min and ref_price > 0:
+        ig_min = max(ig_min, int(ref_price * price_unit * _pct_min / pip_sz) + 1)
+    return max(ig_min, pts)
 
 
 def _live_entry_price_ref(sym: str) -> float:
