@@ -389,6 +389,7 @@ _CONTINUOUS_INSTRUMENTS: frozenset = frozenset({"BTC", "ETH"})  # 24/7 markets (
 _IG_EQUITY_COMMISSION_USD = 9.0       # IG charges $9/side = $18 round-trip on equity CFDs
 _PRESUBMIT_DRIFT_CAP = 0.005          # 0.5% drift cap on pre-submission price re-check
 _live_min_stop_pts: dict = {}  # sym -> minNormalStopOrLimitDistance (pts) from IG at startup
+_live_min_stop_pct: dict = {}  # sym -> minStop fraction for PERCENTAGE-unit instruments (BTC/ETH)
 _live_elig_publish_next: float = 0.0  # rate-limiter for barbie_june_eligible_instruments (1h)
 _MACRO_STALE_SECS  = 2 * 3600   # Claudia freshness gate: beyond this treat directional bias as stale
 
