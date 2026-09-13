@@ -281,6 +281,9 @@ INSTRUMENTS: dict = {
 
 # Reverse lookup: epic → base symbol (used to route .CASH.IP epics to Finnhub)
 _INSTRUMENTS_REVERSE: dict = {v: k for k, v in INSTRUMENTS.items()}
+_EQUITY_CFD_INSTRUMENTS: frozenset = frozenset(  # .CASH.IP equity CFDs — higher ATR/stop tier
+    k for k, v in INSTRUMENTS.items() if v.upper().endswith(".CASH.IP")
+)
 
 _SEARCH_FALLBACKS: dict = {
     "BTC":    "Bitcoin",
@@ -2752,6 +2755,8 @@ _SIM_STOP_VOL_MULT   = 2.0     # stop = vol_mean + MULT * vol_std
 _SIM_STOP_FLOOR      = 0.0008  # 0.08% floor (covers spread+noise for all instruments)
 _SIM_STOP_CAP        = 0.005   # 0.50% max stop (at 10x = 5% leveraged)
 _SIM_ATR_CAP_MULT    = 1.5     # high-ATR gate: block entry when 5m ATR > 1.5× stop cap (0.75%)
+_EQUITY_CFD_STOP_CAP     = 0.015  # 1.5% max stop for equity CFDs (NVDA/TSLA/AAPL etc.)
+_EQUITY_CFD_ATR_CAP_MULT = 2.5   # ATR gate: 2.5× stop cap = 3.75% ceil for equity CFDs
 _SIM_STOP_COLD       = 0.0020  # 0.20% cold-start when no vol_history available
 
 # Spread-aware stop floors — fallback when june_spread_baselines unavailable (fractions)
@@ -3653,7 +3658,8 @@ def _sim_get_dynamic_stop(sym: str) -> float:
     else:
         _brb_mult = _SIM_STOP_VOL_MULT
     stop_p = mean_p + _brb_mult * (var_p ** 0.5)   # still in percent
-    return round(max(_SIM_STOP_FLOOR, min(_SIM_STOP_CAP, stop_p / 100.0)), 6)
+    _stop_cap = _EQUITY_CFD_STOP_CAP if sym in _EQUITY_CFD_INSTRUMENTS else _SIM_STOP_CAP
+    return round(max(_SIM_STOP_FLOOR, min(_stop_cap, stop_p / 100.0)), 6)
 
 
 def _sim_get_spread_floor(sym: str) -> float:
@@ -4456,12 +4462,16 @@ def _sim_try_entry(signals: dict, regime: str, leverage: int) -> None:
         _atr5_price = sig.get("price", 0.0)
         if _atr5_price > 0:
             _atr5_pct  = _atr5 / _atr5_price * 100.0
-            _atr5_ceil = _SIM_ATR_CAP_MULT * _SIM_STOP_CAP * 100.0   # 0.75%
+            if sym in _EQUITY_CFD_INSTRUMENTS:
+                _atr5_ceil = _EQUITY_CFD_ATR_CAP_MULT * _EQUITY_CFD_STOP_CAP * 100.0  # 3.75%
+                _atr5_tag  = f"{_EQUITY_CFD_ATR_CAP_MULT:.1f}× eq_stop_cap {_EQUITY_CFD_STOP_CAP*100:.1f}%"
+            else:
+                _atr5_ceil = _SIM_ATR_CAP_MULT * _SIM_STOP_CAP * 100.0   # 0.75%
+                _atr5_tag  = f"{_SIM_ATR_CAP_MULT:.1f}× stop cap {_SIM_STOP_CAP*100:.1f}%"
             if _atr5_pct > _atr5_ceil:
                 _sim_log(
                     f"⛔ [ATR-CAP GATE] {sym}: 5m ATR {_atr5_pct:.2f}% > "
-                    f"{_SIM_ATR_CAP_MULT:.1f}× stop cap {_SIM_STOP_CAP*100:.1f}% "
-                    f"({_atr5_ceil:.2f}%) — needs LEVERAGED_EQUITY tier"
+                    f"{_atr5_tag} ({_atr5_ceil:.2f}%)"
                 )
                 return
 
