@@ -2738,6 +2738,8 @@ _SIM_COMBO_WINDOW        = 50   # rolling storage for combo_outcomes (separate f
 _BARBIE_COMBO_THRESH_KEY = "barbie_june_combo_thresholds"
 _BARBIE_COMBO_THRESH_MIN = 0.10  # safety floor for Barbie override (~10% = floor meaningful)
 _BARBIE_COMBO_THRESH_MAX = 0.55  # safety ceiling (~55% = stricter than any real breakeven)
+_SIM_COMBO_CI_MIN_N  = 25    # Bonferroni-corrected CI gate activates at N>=25 (matches HTF)
+_SIM_COMBO_CI_ALPHA  = 0.05  # family-wise alpha; Bonferroni-divided over active combos
 
 # Dynamic TP (all fractions — same units as pnl_pct; vol_history is in %, divided /100)
 _SIM_TP_WIN_FRACTION = 0.82    # TP from win history: 82% of avg winning move (was 0.70; raised to reduce dilution from breakeven-stop exits)
@@ -3319,35 +3321,32 @@ def _sim_combo_key(sym: str, direction: str) -> str:
 
 
 def _sim_combo_wr_gate(sym: str, direction: str) -> tuple:
-    """Per-combo breakeven gate using exponentially-weighted win rate.
+    """Per-combo WR gate with Bonferroni-corrected Wilson CI.
 
-    Returns (should_skip: bool, log_line: str).
-    Gate only fires when combo has >= _SIM_COMBO_MIN_SAMPLES outcomes.
-
-    Threshold priority:
-      1. Barbie override from barbie_june_combo_thresholds (clamped to safety bounds)
-      2. Formula: avg_loss / (avg_win + avg_loss) from win/loss move sizes (>= 5 each)
-      3. Fallback 0.30 when size data insufficient
-
-    WR uses exponential decay (alpha=_SIM_COMBO_DECAY) so recent outcomes dominate
-    without the cliff-edge eviction problem of a hard rolling window.
+    Returns (should_skip: bool, pts: int, log_line: str).
+    Gate stages:
+      N < _SIM_COMBO_CI_MIN_N  -> (False, 0, "") — dormant, no effect
+      N >= _SIM_COMBO_CI_MIN_N:
+        CI_hi < breakeven      -> (True, -1, reason) — confident below breakeven, block entry
+        CI_lo > breakeven      -> (False, +1, reason) — confident above breakeven, +1 conviction
+        else                   -> (False, 0, note)   — inconclusive
+    Breakeven threshold: Barbie override -> avg_loss/(avg_win+avg_loss) formula -> 0.30 fallback.
+    Wilson CI uses plain WR (wins/n); z is Bonferroni-corrected over K active combos.
     """
     combo    = f"{sym}_{direction}"
     outcomes = (_sim.get("combo_outcomes") or {}).get(combo, [])
     n        = len(outcomes)
-    if n < _SIM_COMBO_MIN_SAMPLES:
-        return False, ""
+    if n < _SIM_COMBO_CI_MIN_N:
+        return False, 0, ""
 
-    # Exponentially weighted win rate (i=0 oldest, i=n-1 newest → weight 1.0)
-    alpha   = _SIM_COMBO_DECAY
-    w_sum   = w_wins = 0.0
-    for i, outcome in enumerate(outcomes):
-        w       = alpha ** (n - 1 - i)
-        w_sum  += w
-        w_wins += w * outcome
-    weighted_wr = w_wins / w_sum if w_sum > 0 else 0.0
+    all_combos = _sim.get("combo_outcomes") or {}
+    K = max(1, sum(1 for v in all_combos.values() if len(v) >= _SIM_COMBO_CI_MIN_N))
+    # Bonferroni-corrected z via rational approx of normal PPF (A&S 26.2.17, max err ~1e-3)
+    _p_c = 1.0 - _SIM_COMBO_CI_ALPHA / (2.0 * K)
+    _t_c = math.sqrt(-2.0 * math.log(1.0 - _p_c))
+    z    = _t_c - (2.515517 + 0.802853*_t_c + 0.010328*_t_c*_t_c) / (1.0 + 1.432788*_t_c + 0.189269*_t_c*_t_c + 0.001308*_t_c*_t_c*_t_c)
 
-    # Threshold: Barbie override → formula → fallback
+    # Breakeven threshold: Barbie override -> formula -> fallback (same as before)
     thresh_src = "fallback"
     threshold  = None
     brb_t = (_barbie_combo_thresholds or {}).get(combo)
@@ -3367,13 +3366,25 @@ def _sim_combo_wr_gate(sym: str, direction: str) -> tuple:
             threshold  = 0.30
             thresh_src = "fallback"
 
-    if weighted_wr < threshold:
-        return True, (
+    # Wilson CI on plain WR (i.i.d. Bernoulli; EWWR not used — not a proper binomial proportion)
+    wins   = sum(outcomes)
+    p      = wins / n
+    denom  = 1.0 + z * z / n
+    center = (p + z * z / (2 * n)) / denom
+    margin = z * math.sqrt(p * (1 - p) / n + z * z / (4 * n * n)) / denom
+    ci_lo  = center - margin
+    ci_hi  = center + margin
+    note   = (f"N={n} WR={p:.0%} z={z:.2f} CI=[{ci_lo:.0%},{ci_hi:.0%}]"
+              f" brk={threshold:.0%}[{thresh_src}] K={K}")
+
+    if ci_hi < threshold:
+        return True, -1, (
             f"⏭️  Skip {sym} {direction.upper()}: "
-            f"weighted WR {weighted_wr:.0%} (n={n}) "
-            f"< {threshold:.0%} breakeven [{thresh_src}]"
+            f"CI_hi={ci_hi:.0%} < breakeven {threshold:.0%} [{thresh_src}] | {note}"
         )
-    return False, ""
+    if ci_lo > threshold:
+        return False, 1, f"CI_lo={ci_lo:.0%} > breakeven {threshold:.0%} [{thresh_src}] | {note}"
+    return False, 0, note
 
 
 def _htf_combo_gate(sym: str, direction: str, htf_bias: str) -> tuple:
@@ -4226,7 +4237,7 @@ def _sim_select_instrument(signals: dict, regime: str):
         if regime in ("volatile", "neutral") and dirn == "neutral":
             continue
         if direction_str:
-            _co_skip, _co_reason = _sim_combo_wr_gate(sym, direction_str)
+            _co_skip, _, _co_reason = _sim_combo_wr_gate(sym, direction_str)
             if _co_skip:
                 _sim_log(_co_reason)
                 continue
@@ -8913,7 +8924,7 @@ def _live_select_instrument(signals: dict, regime: str) -> list:
         if regime == "bear" and dirn != "bear": continue
         if regime in ("volatile", "neutral") and dirn == "neutral": continue
         if direction_str:
-            skip, reason = _sim_combo_wr_gate(sym, direction_str)
+            skip, _, reason = _sim_combo_wr_gate(sym, direction_str)
             if skip:
                 _live_log(f"skip {sym}: {reason}")
                 continue
@@ -9517,15 +9528,6 @@ def _live_try_entry(signals: dict, regime: str, _notional_skip: set = None) -> N
     direction = "long" if chg > 0 else "short"
     combo     = _sim_combo_key(sym, direction)
 
-    # [SIM→LIVE OBS]: read SIM per-combo WR for this candidate
-    # OBSERVATION-ONLY: pure read of _sim dict, no write-back, zero gate or conviction effect.
-    _slob_co = (_sim.get("combo_outcomes") or {}).get(combo, [])
-    _slob_n  = len(_slob_co)
-    if _slob_n >= 20:
-        _slob_wr = sum(_slob_co) / _slob_n
-        _live_log("[SIM→LIVE OBS] %s/%s: SIM WR=%.0f%% (n=%d)"
-                  % (sym, direction, _slob_wr * 100, _slob_n))
-
     # Hybrid Spread/ATR gate — tiered threshold using 5-minute ATR baseline (fail-open)
     _atr5, _atr5_fb = _compute_atr_5m(sym)
     if _atr5 is not None and _atr5 > 0:
@@ -9586,6 +9588,15 @@ def _live_try_entry(signals: dict, regime: str, _notional_skip: set = None) -> N
         conv = min(10, max(1, conv + _htf_cg_pts))
         _live_log(f"  📊 [HTF COMBO] {sym}/{direction}/{_htf_b}: "
                   f"{_htf_cg_verdict} → conv {conv}/10 | {_htf_cg_note}")
+    # SIM->LIVE combo-WR CI gate: skip handled upstream in _live_rank_candidates;
+    # positive CI signal adds +1 conviction here (dormant until N>=_SIM_COMBO_CI_MIN_N)
+    _, _cwg_pts, _cwg_note = _sim_combo_wr_gate(sym, direction)
+    if _cwg_pts > 0:
+        conv = min(10, max(1, conv + _cwg_pts))
+        _live_log(f"  📈 [COMBO-WR CI] {sym}/{direction}: "
+                  f"+{_cwg_pts} → conv {conv}/10 | {_cwg_note}")
+    elif _cwg_note:
+        _live_log(f"  [COMBO-WR CI] {sym}/{direction}: inconclusive | {_cwg_note}")
     # Conviction floor — applied only in DEFENSIVE mode (global or instrument-level).
     # In NORMAL mode, all conviction levels are permitted.
     _in_defensive = (_gmode == "defensive" or _imode == "defensive")
