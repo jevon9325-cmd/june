@@ -392,6 +392,8 @@ _live_price_unit: dict = {}  # sym -> USD-per-native-price-unit (0.01 for cents,
 _live_margin:    dict = {}   # sym -> IG margin rate (0.0-1.0 fraction) from LIVE API, e.g. 0.8=80%
 _live_equity_cfd: set = set() # syms whose epic ends .CASH.IP — IG size field is shares, not lots
 _live_fx_instruments: set = set() # syms whose epic matches CS.D.*.CFD.IP — FX pairs (correct sizing: lot_sz/pip_sz)
+_live_ccy:    dict = {}   # sym -> ISO currency code from IG currencies[0].name ("USD", "GBP", …)
+_live_fx_base: dict = {}  # sym -> baseExchangeRate from IG currencies[0]; GBP instrument: ~0.739 (GBP per USD); USD: 1.0
 _METALS_INSTRUMENTS: frozenset = frozenset({"SILVER", "OIL"})  # CME/COMEX-linked; separate weekend gate from FX
 _CONTINUOUS_INSTRUMENTS: frozenset = frozenset({"BTC", "ETH"})  # 24/7 markets (crypto CFDs) — bypasses FX weekend closure gate
 _IG_EQUITY_COMMISSION_USD = 9.0       # IG charges $9/side = $18 round-trip on equity CFDs
@@ -6862,6 +6864,9 @@ def _live_fetch_market_data(sym: str, epic: str) -> bool:
     if (epic.upper().startswith("CS.D.") and epic.upper().endswith("CFD.IP")
             and _SPREAD_ATR_ASSET_CLASS.get(sym) != "CRYPTO"):
         _live_fx_instruments.add(sym)
+    _ccy0 = inst.get("currencies", [{}])[0] if inst.get("currencies") else {}
+    _live_ccy[sym]     = _ccy0.get("name", "USD") or "USD"
+    _live_fx_base[sym] = float(_ccy0.get("baseExchangeRate") or 1.0) or 1.0
     _live_log(f"LIVE mkt: {sym} lot={lot_sz} minDeal={min_val} pip={pip_sz} unit={price_unit} margin={margin_rate:.0%} min_stop={_live_min_stop_pts[sym]}pts")
     return True
 
@@ -7417,7 +7422,10 @@ def _live_compute_ig_size(sym: str, desired_notional_usd: float, mid_price: floa
         return 0.0
     if sym in _live_equity_cfd:
         # .CASH.IP equity CFDs: IG size = shares; lot_sz is pip-tick value, not a size multiplier
-        sized = round(desired_notional_usd / price_usd, 2)
+        # price_usd may be in GBP for GBP-quoted instruments; /fx_base converts to USD equivalent
+        _eq_fx       = _live_fx_base.get(sym, 1.0) or 1.0
+        price_in_usd = price_usd / _eq_fx
+        sized        = round(desired_notional_usd / price_in_usd, 2)
     elif sym in _live_fx_instruments:
         # FX pairs (CS.D.*.CFD.IP): IG lot_sz is pip VALUE per lot (e.g. $10/pip for EURUSD),
         # NOT the base-currency lot size. Correct unit value = lot_sz / pip_sz = 100,000 units/lot.
@@ -7663,8 +7671,9 @@ def _live_open_position(sym: str, direction: str, signals: dict,
             _live_log(f"🚫 MARGIN GATE: {sym} skip — margin not loaded (fail-closed) — no cooldown")
             return
         _mfrac  = _real_margin_fraction(sym, _margin_raw)
-        _usd_n  = (ig_size * mid_price * price_unit if sym in _live_equity_cfd
-                   else ig_size * lot_sz * mid_price * price_unit)
+        _eq_fx  = (_live_fx_base.get(sym, 1.0) or 1.0) if sym in _live_equity_cfd else 1.0
+        _usd_n  = ((ig_size * mid_price * price_unit if sym in _live_equity_cfd
+                    else ig_size * lot_sz * mid_price * price_unit) / _eq_fx)
         _req_mg = _usd_n * _mfrac
         _avail  = _live.get("balance_total", 0.0)
         if _req_mg > _avail:
@@ -7710,7 +7719,7 @@ def _live_open_position(sym: str, direction: str, signals: dict,
         "timeInForce":   "FILL_OR_KILL",
         "guaranteedStop": False,
         "forceOpen":     True,
-        "currencyCode":  "USD",
+        "currencyCode":  _live_ccy.get(sym, "USD") if sym in _live_equity_cfd else "USD",
         # stopDistance omitted for FX (CS.D.*.CFD.IP): prior 404-on-confirm rejections
         # were caused by FX lot-formula sizing issues, not the stop field itself.
         # Non-FX instruments (OIL, SILVER, GOLD) attach a broker-side hard stop below.
@@ -9341,7 +9350,7 @@ def _live_add_pyramid_leg(signals: dict) -> None:
         "timeInForce":    "FILL_OR_KILL",
         "forceOpen":      True,         # REQUIRED: opens separate deal in same instrument
         "guaranteedStop": False,
-        "currencyCode":   "USD",
+        "currencyCode":  _live_ccy.get(sym, "USD") if sym in _live_equity_cfd else "USD",
         "stopDistance":   approx_stop_dist,
     }
     resp = _ig_live_post("/positions/otc", body, version="1")
