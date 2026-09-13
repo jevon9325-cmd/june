@@ -284,6 +284,11 @@ _INSTRUMENTS_REVERSE: dict = {v: k for k, v in INSTRUMENTS.items()}
 _EQUITY_CFD_INSTRUMENTS: frozenset = frozenset(  # .CASH.IP equity CFDs — higher ATR/stop tier
     k for k, v in INSTRUMENTS.items() if v.upper().endswith(".CASH.IP")
 )
+_LEV_FUND_INSTRUMENTS: frozenset = frozenset({  # genuine 3x leveraged ETFs (SOXL/SOXS/DFEN-class)
+    # Add instrument names here AND to INSTRUMENTS dict when ready to enable this tier.
+    # Tier stays fully dormant until instruments appear here and evidence gate is satisfied.
+    # e.g. "SOXL", "SOXS", "DFEN"
+})
 
 _SEARCH_FALLBACKS: dict = {
     "BTC":    "Bitcoin",
@@ -2757,6 +2762,14 @@ _SIM_STOP_CAP        = 0.005   # 0.50% max stop (at 10x = 5% leveraged)
 _SIM_ATR_CAP_MULT    = 1.5     # high-ATR gate: block entry when 5m ATR > 1.5× stop cap (0.75%)
 _EQUITY_CFD_STOP_CAP     = 0.015  # 1.5% max stop for equity CFDs (NVDA/TSLA/AAPL etc.)
 _EQUITY_CFD_ATR_CAP_MULT = 2.5   # ATR gate: 2.5× stop cap = 3.75% ceil for equity CFDs
+# Genuinely leveraged fund tier (SOXL/SOXS/DFEN-class 3x ETFs) — PROVISIONAL / UNVALIDATED
+# Derived: SOXL/SOXS 5m ATR ~1.6%; stop_cap=2.5×ATR=4%; ATR_ceil=2×4%=8%; lev cap
+# keeps fund 3x × IG 3x = 9x effective equity exposure (vs commodity tier's ~10x)
+_LEV_FUND_STOP_CAP      = 0.04   # 4% provisional max stop (2.5× max observed 5m ATR 1.6%)
+_LEV_FUND_ATR_CAP_MULT  = 2.0    # ATR gate: 2.0× stop cap = 8.0% ceil (clears SOXL typical)
+_LEV_FUND_MAX_LEV       = 3      # hard IG leverage cap: fund 3x × IG 3x = 9x effective
+_LEV_FUND_EVIDENCE_KEY  = "june_lev_fund_sim_evidence"   # Redis incr counter
+_LEV_FUND_EVIDENCE_REQUIRED = 25  # sim completions needed before tier can activate
 _SIM_STOP_COLD       = 0.0020  # 0.20% cold-start when no vol_history available
 
 # Spread-aware stop floors — fallback when june_spread_baselines unavailable (fractions)
@@ -3658,7 +3671,12 @@ def _sim_get_dynamic_stop(sym: str) -> float:
     else:
         _brb_mult = _SIM_STOP_VOL_MULT
     stop_p = mean_p + _brb_mult * (var_p ** 0.5)   # still in percent
-    _stop_cap = _EQUITY_CFD_STOP_CAP if sym in _EQUITY_CFD_INSTRUMENTS else _SIM_STOP_CAP
+    if sym in _LEV_FUND_INSTRUMENTS:
+        _stop_cap = _LEV_FUND_STOP_CAP
+    elif sym in _EQUITY_CFD_INSTRUMENTS:
+        _stop_cap = _EQUITY_CFD_STOP_CAP
+    else:
+        _stop_cap = _SIM_STOP_CAP
     return round(max(_SIM_STOP_FLOOR, min(_stop_cap, stop_p / 100.0)), 6)
 
 
@@ -4335,6 +4353,11 @@ def _sim_close_position(prices: dict, exit_reason: str) -> None:
         _sim["phase_consec_losses"] = _sim.get("phase_consec_losses", 0) + 1
     _sim["total_wins"]    += int(won)
     _sim["total_losses"]  += int(not won)
+    if pos["instrument"] in _LEV_FUND_INSTRUMENTS:  # evidence counter for tier activation gate
+        try:
+            _redis().incr(_LEV_FUND_EVIDENCE_KEY)
+        except Exception:
+            pass
 
     trade_rec = {
         "instrument": pos["instrument"], "direction": dirn,
@@ -4462,7 +4485,22 @@ def _sim_try_entry(signals: dict, regime: str, leverage: int) -> None:
         _atr5_price = sig.get("price", 0.0)
         if _atr5_price > 0:
             _atr5_pct  = _atr5 / _atr5_price * 100.0
-            if sym in _EQUITY_CFD_INSTRUMENTS:
+            if sym in _LEV_FUND_INSTRUMENTS:
+                # Evidence gate: provisional thresholds must be validated by N sim completions
+                try:
+                    _lf_obs = int(_redis().get(_LEV_FUND_EVIDENCE_KEY) or 0)
+                except Exception:
+                    _lf_obs = 0
+                if _lf_obs < _LEV_FUND_EVIDENCE_REQUIRED:
+                    _sim_log(
+                        f"[LEV-FUND EVIDENCE GATE] {sym}: "
+                        f"{_lf_obs}/{_LEV_FUND_EVIDENCE_REQUIRED} sim completions "
+                        f"required — tier dormant (provisional thresholds unvalidated)"
+                    )
+                    return
+                _atr5_ceil = _LEV_FUND_ATR_CAP_MULT * _LEV_FUND_STOP_CAP * 100.0  # 8.0%
+                _atr5_tag  = f"{_LEV_FUND_ATR_CAP_MULT:.1f}× lev_fund_stop_cap {_LEV_FUND_STOP_CAP*100:.1f}%"
+            elif sym in _EQUITY_CFD_INSTRUMENTS:
                 _atr5_ceil = _EQUITY_CFD_ATR_CAP_MULT * _EQUITY_CFD_STOP_CAP * 100.0  # 3.75%
                 _atr5_tag  = f"{_EQUITY_CFD_ATR_CAP_MULT:.1f}× eq_stop_cap {_EQUITY_CFD_STOP_CAP*100:.1f}%"
             else:
@@ -4557,6 +4595,8 @@ def _sim_try_entry(signals: dict, regime: str, leverage: int) -> None:
 
     stage     = _sim.get("stage", "sprout")
     leverage  = _sim_conviction_leverage(stage, conviction)
+    if sym in _LEV_FUND_INSTRUMENTS:  # fund 3x × IG 3x = 9x effective; cap before sizing
+        leverage = min(leverage, _LEV_FUND_MAX_LEV)
 
     if stage == "sprout":
         # Rotation schedule with escalation if notional too small
