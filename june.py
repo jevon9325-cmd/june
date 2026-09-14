@@ -1070,7 +1070,7 @@ def is_overnight() -> bool:
 def _current_sub_session(sym: str) -> str:
     """Trading sub-session label for SAR block bucketing.
 
-    OIL / SILVER: day session split into three independent buckets so that
+    OIL / SILVER / NATGAS: day session split into three independent buckets so that
     afternoon chop cannot block the next morning's primary trading window.
       pre_nyse:       07:00 UTC - NYSE open     (London + pre-market hours)
       nyse_morning:   NYSE open - 12:00 ET noon (highest volume, tightest spreads)
@@ -1080,7 +1080,7 @@ def _current_sub_session(sym: str) -> str:
     """
     if is_overnight():
         return "overnight"
-    if sym not in ("OIL", "SILVER"):
+    if sym not in ("OIL", "SILVER", "NATGAS"):
         return "day"
     now_et       = datetime.now(_US_EAST_TZ)
     nyse_open_et = now_et.replace(hour=9,  minute=30, second=0, microsecond=0)
@@ -7160,7 +7160,7 @@ _perf_block_cache: dict = {}   # {sym: cache_expire_ts} — in-memory, refreshed
 def _perf_block_sar_ttl(sym: str = "", sub_session: str = "") -> int:
     """Seconds until end of the given sub-session for SAR perf blocks.
 
-    Sub-session boundaries (OIL / SILVER):
+    Sub-session boundaries (OIL / SILVER / NATGAS):
       overnight:      expires 07:00 UTC (next day when called after 21:00)
       pre_nyse:       expires NYSE open (DST-aware, floor _PERF_SAR_OIL_BOUNDARY_FLOOR_SECS)
       nyse_morning:   expires 12:00 ET (NYSE midday boundary)
@@ -7198,7 +7198,7 @@ def _live_perf_blocked(sym: str) -> bool:
     """True if sym is blocked by the instrument performance filter.
     Checks legacy (june_perf_block:{sym}), WR (june_perf_block_wr:{sym}),
     and SAR (june_perf_block_sar:{sym}:{sub_session}) keys — any active key blocks.
-    SAR blocks are sub-session specific (OIL/SILVER): a bad afternoon never blocks the next morning.
+    SAR blocks are sub-session specific (OIL/SILVER/NATGAS): a bad afternoon never blocks the next morning.
     Caches Redis state locally: instrument-wide blocks under sym, SAR blocks under sym:sub_session.
     On Redis error: blocks the trade (fail-closed) to prevent trading through an active block.
     Caches for the full block TTL at fire time — no Redis check needed during the block window.
