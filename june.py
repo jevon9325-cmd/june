@@ -761,7 +761,8 @@ def _finnhub_price(sym: str) -> Optional[dict]:
         # Synthetic spread: 1% of day range, floored at 0.05% of mid
         spread = max((h - l) * 0.01, mid * 0.0005)
         half   = spread / 2.0
-        return {"bid": mid - half, "offer": mid + half, "mid": mid, "spread": spread}
+        pc     = float(d.get("pc") or 0.0)
+        return {"bid": mid - half, "offer": mid + half, "mid": mid, "spread": spread, "prev_close": pc}
     except Exception as exc:
         print(f"[{_ts()}] ⚠️  Finnhub {sym}: {exc}", flush=True)
         return None
@@ -784,7 +785,23 @@ def fetch_price(epic: str) -> Optional[dict]:
     global _live_price_scale, _live_fallback_active
     if ".CASH." in epic:
         sym = _INSTRUMENTS_REVERSE.get(epic)
-        return _finnhub_price(sym) if sym else None
+        if not sym:
+            return None
+        fh = _finnhub_price(sym)
+        if fh is None:
+            return None
+        # Stale detection: Finnhub returns last regular-session close during pre/post-market.
+        # When price is within 0.1% of prev_close, cross-check IG snapshot percentageChange.
+        # No IG call during NYSE hours -- Finnhub is live then and price has diverged.
+        fh_pc = fh.pop("prev_close", None)
+        if fh_pc and fh_pc > 0 and abs(fh["mid"] - fh_pc) / fh_pc < 0.001:
+            _ig_snap = _ig_get(f"/markets/{epic}")
+            _ig_pct  = (_ig_snap or {}).get("snapshot", {}).get("percentageChange")
+            if _ig_pct is not None and abs(_ig_pct) >= 0.3:
+                _adj  = fh_pc * (1.0 + _ig_pct / 100.0)
+                _half = fh["spread"] / 2.0
+                fh    = {"bid": _adj - _half, "offer": _adj + _half, "mid": _adj, "spread": fh["spread"]}
+        return fh
     data = _ig_get(f"/markets/{epic}")
     if not data:
         return None
@@ -1880,6 +1897,12 @@ def _refresh_direct_cfd_signals() -> None:
         _bid_f    = float(_bid_raw) if _bid_raw is not None else 0.0
         _off_f    = float(_off_raw) if _off_raw is not None else 0.0
         _mid_f    = round((_bid_f + _off_f) / 2.0, 6) if _bid_f > 0 and _off_f > 0 else 0.0
+        if _mid_f == 0.0:
+            _fh_fb = _finnhub_price(base)
+            if _fh_fb:
+                _bid_f = _fh_fb["bid"]
+                _off_f = _fh_fb["offer"]
+                _mid_f = round(_fh_fb["mid"], 6)
         _direct_cfd_signals[base] = {
             "pct":       round(pct, 3),
             "direction": direction,
