@@ -4941,7 +4941,7 @@ def _sim_check_exit(signals: dict, regime: str) -> None:
     if pnl_pct >= pos.get("tp_pct", _sim_get_tp(sym, dirn, pos.get("conviction", 5))):
         if not pos.get("partial_exit_done"):
             _sim_partial_tp_exit(prices); return
-        _sim_close_position(prices, "take_profit"); return
+        # Residual half: DPLE M2 trail active (floor=0.5*peak>=0.5*tp). Hard ceiling removed.
     if hold_sec >= _SIM_MAX_HOLD_SECS:
         _sim_close_position(prices, "max_hold"); return
 
@@ -8923,9 +8923,8 @@ def _live_check_exit(signals: dict, regime: str) -> None:
     if pnl_pct >= tp_pct:
         if not pos.get("partial_exit_done"):
             _live_partial_tp_exit(signals)
-        else:
-            _live_close_position("take_profit", signals)
-        return
+            return
+        # Residual half: DPLE M2 trail active (floor=0.5*peak>=0.5*tp). Hard ceiling removed.
 
     # Asymmetric reversal — mirrors sim logic including Barbie reversal_confirm_secs override
     opposing = (dirn == "long"  and (regime == "bear" or sig_dir == "bear")) or \
