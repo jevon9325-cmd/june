@@ -274,6 +274,14 @@ INSTRUMENTS: dict = {
     "INTC": "UB.D.INTC.CASH.IP",       # Intel Corp
     "MU":   "UC.D.MU.CASH.IP",         # Micron Technology
     "SPCX": "UD.D.SPCXUS.CASH.IP",     # SpaceX — IPO June 12 2026, Nasdaq
+    # LSE ETF CFDs — priced via Yahoo Finance REST (IG LS MARKET items return
+    # Insufficient permissions on both demo and live accounts; bid/offer null
+    # from IG REST snapshot. streamingPricesAvailable=True is instrument capability,
+    # not account permission to stream MARKET items via Lightstreamer.)
+    "VUSD": "KA.D.VUSDLN.CASH.IP",     # Vanguard S&P 500 UCITS ETF - USD (London; USD-quoted)
+    "VUAA": "KA.D.VUAALN.CASH.IP",     # Vanguard S&P 500 UCITS ETF - USD Acc (London; USD-quoted)
+    "VWRA": "KA.D.VWRALN.CASH.IP",     # Vanguard FTSE All-World UCITS ETF - Acc (London; USD-quoted)
+    "VWRD": "KA.D.VWRDLN.CASH.IP",     # Vanguard FTSE All-World UCITS ETF - Dist (London; USD-quoted)
     # Crypto CFDs — 24/7, bypasses FX weekend gate via _CONTINUOUS_INSTRUMENTS
     "BTC":  "CS.D.BITCOIN.CFD.IP",      # Bitcoin ($1) — lot=1, minDeal=0.001
     "ETH":  "CS.D.ETHUSD.CFD.IP",       # Ether ($1) — lot=1, minDeal=0.04 (live) — demo showed 0.0001 (wrong)
@@ -281,6 +289,10 @@ INSTRUMENTS: dict = {
 
 # Reverse lookup: epic → base symbol (used to route .CASH.IP epics to Finnhub)
 _INSTRUMENTS_REVERSE: dict = {v: k for k, v in INSTRUMENTS.items()}
+_LSE_CASH_EPICS: frozenset = frozenset({  # LSE ETF epics -- routed to Yahoo Finance, not Finnhub
+    "KA.D.VUSDLN.CASH.IP", "KA.D.VUAALN.CASH.IP",
+    "KA.D.VWRALN.CASH.IP", "KA.D.VWRDLN.CASH.IP",
+})
 _EQUITY_CFD_INSTRUMENTS: frozenset = frozenset(  # .CASH.IP equity CFDs — higher ATR/stop tier
     k for k, v in INSTRUMENTS.items() if v.upper().endswith(".CASH.IP")
 )
@@ -768,6 +780,42 @@ def _finnhub_price(sym: str) -> Optional[dict]:
         return None
 
 
+def _yahoo_lse_price(sym: str):
+    """Return bid/offer/mid/spread for an LSE ETF using Yahoo Finance chart API.
+
+    LSE ETF CFDs (KA.D.*.CASH.IP) have streamingPricesAvailable=True on IG, but
+    Lightstreamer MARKET item subscriptions return Insufficient permissions (-1)
+    on both demo and live accounts. Yahoo Finance v8/chart is the fallback.
+    During LSE hours regularMarketPrice is live; after close returns last traded
+    price (static per cycle, produces 0 pct change, no signal, no trade).
+    """
+    try:
+        r = requests.get(
+            "https://query1.finance.yahoo.com/v8/finance/chart/" + sym + ".L",
+            params={"interval": "1m", "range": "1d"},
+            headers={"User-Agent": "Mozilla/5.0"},
+            timeout=8,
+        )
+        if not r.ok:
+            return None
+        chart  = r.json().get("chart") or {}
+        result = (chart.get("result") or [None])[0]
+        if not result:
+            return None
+        meta   = result["meta"]
+        mid    = float(meta.get("regularMarketPrice") or 0)
+        if mid <= 0:
+            return None
+        high   = float(meta.get("regularMarketDayHigh") or mid)
+        low    = float(meta.get("regularMarketDayLow")  or mid)
+        spread = max((high - low) * 0.01, mid * 0.001)
+        half   = spread / 2.0
+        return {"bid": mid - half, "offer": mid + half, "mid": mid, "spread": spread}
+    except Exception as exc:
+        print("[" + _ts() + "] WARNING Yahoo LSE " + sym + ": " + str(exc), flush=True)
+        return None
+
+
 def fetch_price(epic: str) -> Optional[dict]:
     """Return bid/offer/mid/spread for an epic, or None on any error.
 
@@ -787,6 +835,8 @@ def fetch_price(epic: str) -> Optional[dict]:
         sym = _INSTRUMENTS_REVERSE.get(epic)
         if not sym:
             return None
+        if epic in _LSE_CASH_EPICS:
+            return _yahoo_lse_price(sym)
         fh = _finnhub_price(sym)
         if fh is None:
             return None
