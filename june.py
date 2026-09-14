@@ -120,7 +120,7 @@ SPREAD_ATR_THRESHOLD = 1.00   # spread > 100% of 14-period ATR → rank/size pen
 ATR_PERIOD           = 14     # periods for ATR from rolling mid-price history
 # Hybrid tiered Spread/ATR thresholds — per asset class, used by entry gate with 5m ATR
 _SPREAD_ATR_TIERS:        dict  = {"FX": 0.35, "METAL": 0.60, "ENERGY": 0.85, "CRYPTO": 1.50}  # CRYPTO tier confirmed for BTC (ratio 0.531) and ETH (ratio 0.598) at worst-case Asian session; XRP/SOL pending measurement
-_SPREAD_ATR_ASSET_CLASS:  dict  = {"GOLD": "METAL", "SILVER": "METAL", "OIL": "ENERGY", "NATGAS": "ENERGY", "WHEAT": "METAL", "COCOA": "METAL", "LWB": "METAL", "SUGAR": "METAL", "HO": "ENERGY", "BTC": "CRYPTO", "ETH": "CRYPTO"}
+_SPREAD_ATR_ASSET_CLASS:  dict  = {"GOLD": "METAL", "SILVER": "METAL", "OIL": "ENERGY", "NATGAS": "ENERGY", "WHEAT": "METAL", "COCOA": "METAL", "LWB": "METAL", "SUGAR": "METAL", "HO": "ENERGY", "BTC": "CRYPTO", "ETH": "CRYPTO", "SOYBEANS": "METAL", "SEMI": "METAL"}
 _SPREAD_ATR_FALLBACK_BUMP: float = 0.15  # added to tier threshold when using 1m-ATR fallback
 SPREAD_MIN_READINGS = 5      # minimum readings before anomaly detection active
 
@@ -282,6 +282,10 @@ INSTRUMENTS: dict = {
     "VUAA": "KA.D.VUAALN.CASH.IP",     # Vanguard S&P 500 UCITS ETF - USD Acc (London; USD-quoted)
     "VWRA": "KA.D.VWRALN.CASH.IP",     # Vanguard FTSE All-World UCITS ETF - Acc (London; USD-quoted)
     "VWRD": "KA.D.VWRDLN.CASH.IP",     # Vanguard FTSE All-World UCITS ETF - Dist (London; USD-quoted)
+    # Agricultural commodity CFDs — priced via IG REST snapshot (same path as WHEAT/COCOA)
+    "SOYBEANS": "CC.D.S.BMU.IP",       # Chicago Soybeans (CBOT/CME) — S/ATR 0.622 active hours; METAL class
+    # LSE ETF CFDs (GBP-quoted) — priced via Yahoo Finance; GBP path: currencyCode=GBP, fx_base~0.739
+    "SEMI":     "KA.D.SEMILN.CASH.IP",  # iShares MSCI Global Semiconductors UCITS ETF (London; GBP-quoted) — S/ATR 0.365 LSE hours; METAL class
     # Crypto CFDs — 24/7, bypasses FX weekend gate via _CONTINUOUS_INSTRUMENTS
     "BTC":  "CS.D.BITCOIN.CFD.IP",      # Bitcoin ($1) — lot=1, minDeal=0.001
     "ETH":  "CS.D.ETHUSD.CFD.IP",       # Ether ($1) — lot=1, minDeal=0.04 (live) — demo showed 0.0001 (wrong)
@@ -292,6 +296,7 @@ _INSTRUMENTS_REVERSE: dict = {v: k for k, v in INSTRUMENTS.items()}
 _LSE_CASH_EPICS: frozenset = frozenset({  # LSE ETF epics -- routed to Yahoo Finance, not Finnhub
     "KA.D.VUSDLN.CASH.IP", "KA.D.VUAALN.CASH.IP",
     "KA.D.VWRALN.CASH.IP", "KA.D.VWRDLN.CASH.IP",
+    "KA.D.SEMILN.CASH.IP",
 })
 _EQUITY_CFD_INSTRUMENTS: frozenset = frozenset(  # .CASH.IP equity CFDs — higher ATR/stop tier
     k for k, v in INSTRUMENTS.items() if v.upper().endswith(".CASH.IP")
@@ -319,6 +324,8 @@ _SEARCH_FALLBACKS: dict = {
     "LWB":    "London Wheat",
     "SUGAR":  "Sugar No 5",
     "HO":     "Heating Oil",
+    "SOYBEANS": "Chicago Soybeans",
+    "SEMI":     "iShares MSCI Global Semiconductors",
     "AUDUSD": "AUD/USD",
     "USDCAD": "USD/CAD",
     "EURGBP": "EUR/GBP",
