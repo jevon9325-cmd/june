@@ -424,6 +424,15 @@ _MACRO_STALE_SECS  = 2 * 3600   # Claudia freshness gate: beyond this treat dire
 _HTF_COMBO_MIN_N    = 25      # per-combo min matched outcomes before gate activates
 _HTF_COMBO_CI_FLOOR = 0.55   # 99% Wilson CI lower bound must exceed this for a positive call
 _HTF_COMBO_ALPHA    = 0.05   # family-wise alpha; Bonferroni-corrected over active combos
+# Per-instrument minimum conviction when local direction opposes confirmed HTF bias.
+# Dormant-until-earned: instruments not listed here pass through unchanged.
+# Auto-extends to any future _HTF_INSTRUMENTS member added to the dict.
+# OIL activated Sep 14: repeated 1-3/10-conviction longs against bear HTF drove session losses.
+# SILVER dormant: 75% WR today, losses small, no HTF-opposition concentration.
+# NATGAS dormant: insufficient directional evidence against HTF state.
+_HTF_OPPOSITION_FLOOR: dict = {
+    "OIL": 5,
+}
 
 # Rolling price history: {sym: deque([(epoch, mid), ...])}
 _history: dict = {sym: deque(maxlen=HISTORY_LEN) for sym in INSTRUMENTS}
@@ -3521,6 +3530,27 @@ def _htf_combo_gate(sym: str, direction: str, htf_bias: str) -> tuple:
     if ci_hi < (1.0 - _HTF_COMBO_CI_FLOOR):
         return "negative", -1, note
     return "inconclusive", 0, note
+
+
+def _htf_opposed_floor_gate(sym: str, direction: str, htf_bias: str, conv: int) -> tuple:
+    """Block entry when HTF is confirmed-opposed and conviction < per-instrument floor.
+
+    Returns (blocked: bool, note: str).
+    Dormant (False, "") for instruments not in _HTF_OPPOSITION_FLOOR.
+    Zero effect when HTF is aligned or neutral.  Zero effect on instruments
+    not yet activated.  Auto-extends to future _HTF_INSTRUMENTS members when
+    they are added to _HTF_OPPOSITION_FLOOR.
+    """
+    floor = _HTF_OPPOSITION_FLOOR.get(sym)
+    if floor is None:
+        return False, ""
+    opposed = ((direction == "long"  and htf_bias == "bear") or
+               (direction == "short" and htf_bias == "bull"))
+    if not opposed:
+        return False, ""
+    if conv >= floor:
+        return False, f"HTF opposed ({htf_bias}) conv {conv}/10 \u2265 floor {floor} \u2014 passes"
+    return True, f"HTF opposed ({htf_bias}) conv {conv}/10 < floor {floor}"
 
 
 def _sim_is_paused(combo: str) -> bool:
@@ -9735,6 +9765,22 @@ def _live_try_entry(signals: dict, regime: str, _notional_skip: set = None) -> N
                   f"+{_cwg_pts} → conv {conv}/10 | {_cwg_note}")
     elif _cwg_note:
         _live_log(f"  [COMBO-WR CI] {sym}/{direction}: inconclusive | {_cwg_note}")
+    # HTF opposition floor — blocks low-conviction entries when HTF is confirmed opposed.
+    # Only fires for instruments in _HTF_OPPOSITION_FLOOR (currently OIL=5).
+    # SILVER and NATGAS dormant (insufficient evidence); gate auto-extends to
+    # any future _HTF_INSTRUMENTS member added to _HTF_OPPOSITION_FLOOR.
+    if sym in _HTF_INSTRUMENTS:
+        _htf_opp_blocked, _htf_opp_note = _htf_opposed_floor_gate(sym, direction, _htf_b, conv)
+        if _htf_opp_blocked:
+            _live_log(
+                f"  \U0001f4cf [HTF OPP FLOOR] {sym}/{direction}: {_htf_opp_note} \u2014 skip"
+            )
+            _live_write_block_log(sym, direction, "htf_opp_floor",
+                                  {"htf_bias": _htf_b, "conv": conv,
+                                   "floor": _HTF_OPPOSITION_FLOOR.get(sym, 0)})
+            return
+        if _htf_opp_note:
+            _live_log(f"  \U0001f4cf [HTF OPP FLOOR] {sym}/{direction}: {_htf_opp_note}")
     # Conviction floor — applied only in DEFENSIVE mode (global or instrument-level).
     # In NORMAL mode, all conviction levels are permitted.
     _in_defensive = (_gmode == "defensive" or _imode == "defensive")
