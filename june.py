@@ -9922,12 +9922,13 @@ def _live_try_entry(signals: dict, regime: str, _notional_skip: set = None) -> N
     # $1 risk-ceiling — additive cap on top of existing sizing, never a replacement.
     # Preserves approach-rotation learning in _sim_position_size.
     # stop_pct is read-only here — this formula ONLY consumes it as a divisor.
-    # balance cap (min(bal, ...)) prevents unreasonably large ceilings for
-    # tight-stop FX pairs (EURUSD 0.04% stop → $2,468 without the guard).
+    # No balance cap: leveraged notional legitimately exceeds balance (7x lev ->
+    # $10 pos = $70 notional). Balance cap was suppressing INOD/SEMI (IG mins
+    # $53/$51) while pos_size sizing already limits cash deployed to <=10.
     _rc_stop = max(_sim_get_dynamic_stop(sym), _sim_get_spread_floor(sym))
     if _rc_stop > 0 and bal > 0:
         _rc_risk_dollar  = min(1.0, 0.02 * bal)
-        _rc_max_notional = min(bal, _rc_risk_dollar / _rc_stop)
+        _rc_max_notional = _rc_risk_dollar / _rc_stop
         if (pos_size * lev) > _rc_max_notional:
             _capped_pos = max(2.0, round(_rc_max_notional / lev, 2))
             _live_log(
