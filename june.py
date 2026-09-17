@@ -7856,7 +7856,8 @@ def _live_open_position(sym: str, direction: str, signals: dict,
 
     resp = _ig_live_post("/positions/otc", order_body, version="2")
     if not resp:
-        _live_log(f"open_position: POST failed for {sym}")
+        _live_log(f"open_position: POST failed for {sym} — 5min cooldown")
+        _live.setdefault("pause_expiry", {})[_sim_combo_key(sym, direction)] = time.time() + 300
         return
 
     deal_ref = resp.get("dealReference", "")
