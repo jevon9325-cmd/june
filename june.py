@@ -3365,14 +3365,26 @@ def _sim_check_min_feasible(sym: str, pos_size: float, leverage: int) -> bool:
     return (pos_size * leverage) >= _sim_min_notional.get(sym, 0.0)
 
 
-def _sim_is_eligible(sym: str, balance: float, leverage: int) -> bool:
-    """Concentration-cap formula: True when min_notional/leverage <= 20% of balance.
-    Replaces curated stage-specific eligible-instrument lists.
-    Any instrument with known min_notional data is evaluated automatically.
+def _sim_is_eligible(sym: str, balance: float, leverage: int,
+                     margin_rate: float = 0.0) -> bool:
+    """Concentration-cap eligibility.
+
+    When margin_rate > 0 (real IG margin data available): uses the actual
+    IG margin cost — min_notional × margin_rate ≤ concentration_cap × balance.
+    This correctly handles instruments like GOLD where IG leverage (200×) far
+    exceeds the sim ceiling (10×), making the legacy formula overly restrictive.
+
+    Fallback (margin_rate == 0): legacy sim-leverage-based formula —
+    (min_notional / leverage) ≤ concentration_cap × balance.
     """
     min_n = _sim_min_notional.get(sym)
     if min_n is None:
         return False
+    if margin_rate and 0 < margin_rate <= 1.0:
+        # Margin-based: actual IG margin cost must fit within concentration cap.
+        # GOLD example: $173.98 × 0.005 = $0.87 ≤ 0.20 × $48.49 = $9.70 → eligible
+        return (min_n * margin_rate) <= (_SIM_CONCENTRATION_CAP * balance)
+    # Legacy: sim-leverage divisor (no margin data — conservative fallback)
     return (min_n / leverage) <= (_SIM_CONCENTRATION_CAP * balance)
 
 
@@ -4338,7 +4350,8 @@ def _sim_select_instrument(signals: dict, regime: str):
     _sel_stage = _sim.get("stage", "sprout")
     _sel_lev   = _SIM_LEV_RANGES.get(_sel_stage, (3, 10))[1]  # ceiling: broadest eligibility
     for sym in _sim_eligible:
-        if not _sim_is_eligible(sym, _sel_bal, _sel_lev):
+        _sel_mr = _live_margin.get(sym, 0.0)
+        if not _sim_is_eligible(sym, _sel_bal, _sel_lev, margin_rate=_sel_mr):
             continue
         if sym not in signals:
             continue
@@ -7147,7 +7160,9 @@ def _live_is_eligible(sym: str) -> bool:
     margin_rate = _live_margin.get(sym)
     if margin_rate and margin_rate > 0:
         lev = _ig_margin_to_max_lev(margin_rate, lev)
-    return _sim_is_eligible(sym, bal, lev)
+    # Pass real margin_rate so _sim_is_eligible uses the margin-based check
+    # when data is available (correct for GOLD, SILVER, equity CFDs etc).
+    return _sim_is_eligible(sym, bal, lev, margin_rate=margin_rate or 0.0)
 
 
 def _live_is_paused(combo: str) -> bool:
@@ -9903,6 +9918,25 @@ def _live_try_entry(signals: dict, regime: str, _notional_skip: set = None) -> N
         notional = pos_size * lev
         _live_log(f"  📉 Observer MODERATE: position scaled x0.70 -> ${pos_size:.2f}")
 
+
+    # $1 risk-ceiling — additive cap on top of existing sizing, never a replacement.
+    # Preserves approach-rotation learning in _sim_position_size.
+    # stop_pct is read-only here — this formula ONLY consumes it as a divisor.
+    # balance cap (min(bal, ...)) prevents unreasonably large ceilings for
+    # tight-stop FX pairs (EURUSD 0.04% stop → $2,468 without the guard).
+    _rc_stop = max(_sim_get_dynamic_stop(sym), _sim_get_spread_floor(sym))
+    if _rc_stop > 0 and bal > 0:
+        _rc_risk_dollar  = min(1.0, 0.02 * bal)
+        _rc_max_notional = min(bal, _rc_risk_dollar / _rc_stop)
+        if (pos_size * lev) > _rc_max_notional:
+            _capped_pos = max(2.0, round(_rc_max_notional / lev, 2))
+            _live_log(
+                f"  💰 Risk ceil: ${_rc_risk_dollar:.2f} ÷ stop "
+                f"{_rc_stop * 100:.3f}% → max notional ${_rc_max_notional:.2f} "
+                f"| pos ${pos_size:.2f} → ${_capped_pos:.2f}"
+            )
+            pos_size = _capped_pos
+            notional = pos_size * lev
 
     # Check IG minimum feasibility
     if not _sim_check_min_feasible(sym, pos_size, lev):
