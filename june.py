@@ -147,6 +147,7 @@ _KNOWN_MIN_NOTIONALS: dict = {
     "USDCHF": 4000.0,   # (10/0.0001)×0.04×1.0 = $4,000*   | base=USD; minDeal=0.04 assumed*
     "SILVER":  0.05,  # eligibility floor: bypasses 20% concentration cap; actual IG min ~$2.79 (minDeal×lot×spot×pu)
     "OIL":     0.04,  # eligibility floor: bypasses 20% concentration cap; actual IG min ~$2.75 (minDeal×lot×spot×pu)
+    "GOLD":    0.04,  # seed; live API overwrites to real minNotional (~$171.66 at $4291); eligible at ~$858+ balance (20% cap)
     "BTC":   807.20,  # minDeal=0.01 × lot=1 × ~$80,720 (live API) — blocks at <~$1,345 balance (20% cap, 10% margin, lev capped at 3)
     "ETH":   100.16,  # minDeal=0.04 × lot=1 × ~$2,504 (live API) — blocks at <~$167 balance (20% cap, 10% margin, lev capped at 3)
 }
@@ -6237,6 +6238,7 @@ _HTF_INSTRUMENTS = {
     "OIL":    "CC.D.LCO.BMU.IP",
     "SILVER": "CS.D.CFDSILVER.BMU.IP",
     "NATGAS": "CC.D.NG.BMU.IP",
+    "GOLD":   "CS.D.CFDGOLD.BMU.IP",  # Track hourly candles & HTF trend for micro Gold
 }
 _HTF_NOISE_FLOOR_PROV  = 0.003   # 0.3% provisional noise floor
 _HTF_SATURATION_PROV   = 0.008   # 0.8% provisional saturation
