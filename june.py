@@ -7146,6 +7146,36 @@ def _live_fetch_market_data(sym: str, epic: str) -> bool:
     _ccy0 = inst.get("currencies", [{}])[0] if inst.get("currencies") else {}
     _live_ccy[sym]     = _ccy0.get("name", "USD") or "USD"
     _live_fx_base[sym] = float(_ccy0.get("baseExchangeRate") or 1.0) or 1.0
+    # Min-notional staleness reconciliation: detects stale Redis cache values caused by
+    # IG changing contract specs (minDeal, lotSize) between cache writes.
+    # Compares live API snapshot data against _sim_min_notional[sym]; corrects if
+    # ratio is >3x or <0.33x — thresholds that catch real spec changes (17-50x seen)
+    # without reacting to normal 7-day price drift (~5-15%).
+    # FX pairs skipped (lot_formula_suspect). Seeds ($0.04/$0.05) skipped via >$1 guard.
+    _snap_d = data.get("snapshot", {})
+    _s_bid  = float(_snap_d.get("bid")   or 0)
+    _s_off  = float(_snap_d.get("offer") or 0)
+    if _s_bid and _s_off and sym not in _live_fx_instruments:
+        _recon_mid  = (_s_bid + _s_off) / 2.0
+        if epic.upper().endswith(".CASH.IP"):
+            _recon_min_n = round(min_val * _recon_mid * price_unit, 4)
+        else:
+            _recon_min_n = round(min_val * lot_sz * _recon_mid * price_unit, 4)
+        _cached_n = _sim_min_notional.get(sym)
+        if _cached_n and _cached_n > 1.0 and _recon_min_n > 0.001:
+            _ratio = _cached_n / _recon_min_n
+            if _ratio > 3.0 or _ratio < 0.33:
+                _sim_min_notional[sym] = round(_recon_min_n, 2)
+                _sim_eligible.add(sym)
+                try:
+                    _redis().set(_NOTIONAL_REDIS_KEY, json.dumps(_sim_min_notional),
+                                 ex=_NOTIONAL_REDIS_TTL)
+                except Exception:
+                    pass
+                _live_log(
+                    f"⚠️  min_notional reconciled: {sym} ${_cached_n:.2f} → "
+                    f"${_recon_min_n:.2f} (ratio {_ratio:.1f}x — stale cache corrected)"
+                )
     _live_log(f"LIVE mkt: {sym} lot={lot_sz} minDeal={min_val} pip={pip_sz} unit={price_unit} margin={margin_rate:.0%} min_stop={_live_min_stop_pts[sym]}pts")
     return True
 
