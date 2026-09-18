@@ -10642,6 +10642,35 @@ def _live_startup() -> None:
     else:
         _live_log(f"Market data: all {len(INSTRUMENTS)} instruments loaded")
 
+    # Third pass: direct_cfd_map instruments not covered by the INSTRUMENTS loop above.
+    # These are equity CFDs discovered via T212 (e.g. INOD, STNG, AEIS, RKLB, AG)
+    # that live only in _direct_cfd_map and would otherwise stay margin=0 → fail-closed.
+    _dcm_extras = [
+        (sym, epic)
+        for sym, epic in _direct_cfd_map.items()
+        if sym not in INSTRUMENTS and _live_margin.get(sym, 0.0) == 0.0
+    ]
+    if _dcm_extras:
+        _live_log(
+            f"Market data: loading {len(_dcm_extras)} direct_cfd_map instrument(s) "
+            f"not in startup fetch: {[s for s, _ in _dcm_extras]}"
+        )
+        time.sleep(2.0)
+        _dcm_still_missing: list = []
+        for _dcm_sym, _dcm_epic in _dcm_extras:
+            if not _live_fetch_market_data(_dcm_sym, _dcm_epic):
+                _dcm_still_missing.append(_dcm_sym)
+            time.sleep(0.3)
+        if _dcm_still_missing:
+            _live_log(
+                f"Market data: {len(_dcm_still_missing)} direct_cfd instrument(s) "
+                f"still missing margin after retry (fail-closed): {_dcm_still_missing}"
+            )
+        else:
+            _live_log(
+                f"Market data: all {len(_dcm_extras)} direct_cfd_map instrument(s) loaded"
+            )
+
     # Startup reconciliation: compare June state against IG real open positions
     _live_reconcile_positions()
     _live_migrate_perf_blocks()
