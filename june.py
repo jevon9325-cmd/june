@@ -10166,6 +10166,17 @@ def _live_try_entry(signals: dict, regime: str, _notional_skip: set = None) -> N
             f"lev={lev}:1 pos=${pos_size:.2f} — live halted, no order placed"
         )
         return
+    # Pre-flight margin check: mirrors MARGIN GATE inside _live_open_position()
+    # but catches it here so fallback to the next ranked candidate works.
+    # Without this, a margin-less candidate wins selection every cycle and blocks
+    # all lower-ranked instruments — the return inside _live_open_position()
+    # exits without trying _ranked[1], _ranked[2], etc.
+    if sym not in _live_fx_instruments and _live_margin.get(sym, 0.0) <= 0:
+        _live_log(f"🚫 MARGIN PRECHECK: {sym} margin not loaded — trying next ranked candidate")
+        _skip = (_notional_skip or set()) | {sym}
+        if len(_skip) <= 3:
+            _live_try_entry(signals, regime, _notional_skip=_skip)
+        return
     _live_open_position(sym, direction, _ext, pos_size, lev, conv,
                        stop_mult=0.8 if _compress_sl else 1.0,
                        htf_bias=_htf_b)
