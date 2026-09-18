@@ -10677,9 +10677,25 @@ def _live_startup() -> None:
             time.sleep(0.3)
         if _still_failed:
             _live_log(
-                f"Market data: {len(_still_failed)} instrument(s) still missing after retry "
-                f"(margin gate will block them — fail-closed): {_still_failed}"
+                f"Market data: {len(_still_failed)} still missing after 5s retry — "
+                f"30s rate-limit backoff then final attempt: {_still_failed}"
             )
+            time.sleep(30.0)
+            _persist_failed: list = []
+            for _lfd_sym in _still_failed:
+                _lfd_epic = INSTRUMENTS.get(_lfd_sym)
+                if _lfd_epic and _live_fetch_market_data(_lfd_sym, _lfd_epic):
+                    pass
+                else:
+                    _persist_failed.append(_lfd_sym)
+                time.sleep(0.3)
+            if _persist_failed:
+                _live_log(
+                    f"Market data: {len(_persist_failed)} instrument(s) still missing after extended retry "
+                    f"(margin gate will block them — fail-closed): {_persist_failed}"
+                )
+            else:
+                _live_log(f"Market data: 30s backoff retry succeeded — all failed instruments recovered")
         else:
             _live_log(f"Market data retry succeeded — all {len(INSTRUMENTS)} instruments loaded")
     else:
