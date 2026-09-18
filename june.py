@@ -294,6 +294,39 @@ INSTRUMENTS: dict = {
 
 # Reverse lookup: epic → base symbol (used to route .CASH.IP epics to Finnhub)
 _INSTRUMENTS_REVERSE: dict = {v: k for k, v in INSTRUMENTS.items()}
+
+# Snapshot of INSTRUMENTS at startup — the known-good epics.
+# verify_epics() retries these before falling back to fuzzy search.
+# Discovery is a last resort only; incorrect products (wrong lot/margin) are rejected.
+_PINNED_EPICS: dict = dict(INSTRUMENTS)
+
+# Expected lot sizes for economics validation when a fallback epic is found.
+# Fallback candidate is rejected and instrument dropped if lot differs by >1%.
+_PINNED_EXPECTED_LOT: dict = {
+    "EURUSD":    10.0,
+    "GBPUSD":    10.0,
+    "USDJPY":  1000.0,
+    "AUDUSD":    10.0,
+    "USDCAD":    10.0,
+    "EURGBP":    10.0,
+    "NZDUSD":    10.0,
+    "USDCHF":    10.0,
+    "SPX500":    50.0,
+    "GER40":     25.0,
+    "UK100":     10.0,
+    "GOLD":       1.0,
+    "SILVER":     1.0,
+    "OIL":        1.0,
+    "NATGAS":     1.0,
+    "WHEAT":      1.0,
+    "COCOA":      1.0,
+    "LWB":        1.0,
+    "SUGAR":      1.0,
+    "HO":         1.0,
+    "SOYBEANS":   1.0,
+    "BTC":        1.0,
+    "ETH":        1.0,
+}
 _LSE_CASH_EPICS: frozenset = frozenset({  # LSE ETF epics -- routed to Yahoo Finance, not Finnhub
     "KA.D.VUSDLN.CASH.IP", "KA.D.VUAALN.CASH.IP",
     "KA.D.VWRALN.CASH.IP", "KA.D.VWRDLN.CASH.IP",
@@ -420,6 +453,7 @@ _IG_EQUITY_COMMISSION_USD = 9.0       # IG charges $9/side = $18 round-trip on e
 _PRESUBMIT_DRIFT_CAP = 0.005          # 0.5% drift cap on pre-submission price re-check
 _live_min_stop_pts: dict = {}  # sym -> minNormalStopOrLimitDistance (pts) from IG at startup
 _live_min_stop_pct: dict = {}  # sym -> minStop fraction for PERCENTAGE-unit instruments (BTC/ETH)
+_fallback_epics: set = set()     # instruments trading on discovery fallback (not pinned epic); tagged in logs
 _live_elig_publish_next: float = 0.0  # rate-limiter for barbie_june_eligible_instruments (1h)
 _MACRO_STALE_SECS  = 2 * 3600   # Claudia freshness gate: beyond this treat directional bias as stale
 _HTF_COMBO_MIN_N    = 25      # per-combo min matched outcomes before gate activates
@@ -976,7 +1010,16 @@ def discover_epic(sym: str) -> Optional[str]:
 
 # ── Startup epic verification ─────────────────────────────────────────────────
 def verify_epics():
-    """Verify each configured epic against IG API; discover replacements for failures."""
+    """Verify each configured epic; retry pinned epic before fuzzy discovery.
+
+    Rate-limit 403s are transient — always retry the correct pinned epic first
+    (up to 3 times, 2s/4s/6s backoff) before falling back to search-based
+    discovery, which may return a different product (wrong lot size, wrong margin,
+    unauthorized exchange access).  Any fallback epic that IS accepted is validated
+    against the expected lot size and tagged distinctly in logs.
+    """
+    global _fallback_epics
+    _fallback_epics = set()
     print(f"[{_ts()}] 🔍 Verifying IG epic codes ({len(INSTRUMENTS)} instruments)...", flush=True)
     failed = []
     for sym, epic in list(INSTRUMENTS.items()):
@@ -989,27 +1032,85 @@ def verify_epics():
         time.sleep(1.5)
 
     for sym in failed:
-        # CRYPTO instruments have stable hardcoded epics — a transient 403 during
-        # verify must NOT trigger search-based discovery, which risks finding unrelated
-        # instruments (e.g. 'Ether' -> Etherstack PLC via IG search).
+        # CRYPTO: stable hardcoded epics — search fallback risks wrong product (e.g. Etherstack PLC).
         if _SPREAD_ATR_ASSET_CLASS.get(sym) == 'CRYPTO':
-            print(f"[{_ts()}]   ⚠️  {sym} verify rate-limited — keeping hardcoded epic (no search fallback for CRYPTO)", flush=True)
+            print(f"[{_ts()}]   ⚠️  {sym} verify rate-limited — keeping pinned epic (no search fallback for CRYPTO)", flush=True)
             continue
+
+        # Step 1: Retry the pinned epic before falling back to discovery.
+        # 403s at startup are rate-limit artifacts (transient); retrying the correct epic
+        # is always safer than fuzzy search that may return a different product.
+        pinned_epic = _PINNED_EPICS.get(sym)
+        if pinned_epic:
+            retry_ok = False
+            for attempt in range(1, 4):
+                print(f"[{_ts()}]   🔄 {sym} retry {attempt}/3 pinned epic {pinned_epic} (rate-limit backoff)...", flush=True)
+                time.sleep(2 * attempt)
+                result = fetch_price(pinned_epic)
+                if result:
+                    print(f"[{_ts()}]   ✅ {sym:7s} {pinned_epic:30s} mid={result['mid']:.5f} (retry {attempt} OK — pinned epic lives)", flush=True)
+                    retry_ok = True
+                    break
+            if retry_ok:
+                continue  # pinned epic confirmed — no discovery needed
+
+            print(f"[{_ts()}]   ❌ {sym} pinned epic {pinned_epic} failed all 3 retries — attempting discovery", flush=True)
+
+        # Step 2: Fallback to discovery — only reached if all retries exhausted or no pin.
         print(f"[{_ts()}]   🔍 Attempting discovery for {sym}...", flush=True)
         new_epic = discover_epic(sym)
-        if new_epic:
-            INSTRUMENTS[sym] = new_epic
-            if sym not in _history:
-                _history[sym] = deque(maxlen=HISTORY_LEN)
-            if sym not in _spread_hist:
-                _spread_hist[sym] = deque(maxlen=SPREAD_HISTORY_LEN)
-            print(f"[{_ts()}]   🔁 {sym} epic updated → {new_epic}", flush=True)
-        else:
+        if not new_epic:
             print(f"[{_ts()}]   ⚠️  {sym} could not be verified — dropping from this session", flush=True)
             INSTRUMENTS.pop(sym, None)
             _history.pop(sym, None)
             _spread_hist.pop(sym, None)
+            continue
 
+        # Step 3: Validate economics of the discovered epic vs. known-good values.
+        # Wrong product (e.g. CS.D.CFDSILVER.CFM.IP Mini 500oz instead of BMU.IP $1)
+        # has a different lot size — reject it before it can trade.
+        expected_lot = _PINNED_EXPECTED_LOT.get(sym)
+        if expected_lot is not None:
+            mkt_data = _ig_get(f"/markets/{new_epic}")
+            if mkt_data:
+                disc_lot = float((mkt_data.get("instrument") or {}).get("lotSize") or 0)
+                if disc_lot and abs(disc_lot - expected_lot) / max(expected_lot, 1.0) > 0.01:
+                    print(
+                        f"[{_ts()}]   🚨 EPIC ECONOMICS MISMATCH: {sym} discovered {new_epic} "
+                        f"has lot={disc_lot}, expected {expected_lot} — REJECTING fallback "
+                        f"(wrong product). Dropping {sym} from this session.", flush=True
+                    )
+                    INSTRUMENTS.pop(sym, None)
+                    _history.pop(sym, None)
+                    _spread_hist.pop(sym, None)
+                    continue
+                print(
+                    f"[{_ts()}]   ✅ FALLBACK VALIDATED: {sym} {new_epic} lot={disc_lot} "
+                    f"matches expected {expected_lot}", flush=True
+                )
+            else:
+                print(
+                    f"[{_ts()}]   ⚠️  {sym} fallback {new_epic}: market data fetch failed — "
+                    f"accepting with caution (unvalidated)", flush=True
+                )
+
+        # Step 4: Accept fallback — tag it distinctly in _fallback_epics.
+        _fallback_epics.add(sym)
+        INSTRUMENTS[sym] = new_epic
+        if sym not in _history:
+            _history[sym] = deque(maxlen=HISTORY_LEN)
+        if sym not in _spread_hist:
+            _spread_hist[sym] = deque(maxlen=SPREAD_HISTORY_LEN)
+        print(
+            f"[{_ts()}]   🟡 FALLBACK EPIC: {sym} → {new_epic} "
+            f"(pinned {pinned_epic or 'none'} exhausted all retries)", flush=True
+        )
+
+    if _fallback_epics:
+        print(
+            f"[{_ts()}]   ⚠️  {len(_fallback_epics)} instrument(s) on FALLBACK epics: "
+            f"{sorted(_fallback_epics)} — will be tagged [FALLBACK EPIC] in all trade logs", flush=True
+        )
     print(f"[{_ts()}] ✅ Epic verification complete — {len(INSTRUMENTS)} active instruments", flush=True)
 
 
@@ -7880,6 +7981,13 @@ def _live_open_position(sym: str, direction: str, signals: dict,
     fill_price = float(confirm.get("level", mid_price))
     deal_id    = confirm.get("dealId", "")
 
+    if sym in _fallback_epics:
+        _live_log(
+            f"  ⚠️  [FALLBACK EPIC] {sym} order ACCEPTED on non-pinned epic "
+            f"{INSTRUMENTS.get(sym, '?')!r} (pinned was {_PINNED_EPICS.get(sym, '?')!r}) "
+            f"— deal {deal_id}"
+        )
+
     # Verify broker-side stop was echoed in the confirm (non-FX only).
     # IG returns stopLevel when the stop was accepted alongside the position.
     _broker_stop_level = None
@@ -9956,9 +10064,11 @@ def _live_try_entry(signals: dict, regime: str, _notional_skip: set = None) -> N
         pos_size = 2.0
         notional = pos_size * lev
 
+    _fallback_tag = " [⚠️ FALLBACK EPIC]" if sym in _fallback_epics else ""
     _live_log(
         f"🎯 LIVE candidate: {sym} {direction.upper()} vol {vol:.3f}% "
         f"conv {conv}/10 lev {lev}:1 pos ${pos_size:.2f} notional ${notional:.2f}"
+        f"{_fallback_tag}"
     )
 
     _live_log("  📏 [HTF DIAG] %s/%s: %s | combo=%s [%s]"
