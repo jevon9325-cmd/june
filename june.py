@@ -10678,9 +10678,9 @@ def _live_startup() -> None:
         if _still_failed:
             _live_log(
                 f"Market data: {len(_still_failed)} still missing after 5s retry — "
-                f"30s rate-limit backoff then final attempt: {_still_failed}"
+                f"60s rate-limit backoff then final attempt: {_still_failed}"
             )
-            time.sleep(30.0)
+            time.sleep(60.0)
             _persist_failed: list = []
             for _lfd_sym in _still_failed:
                 _lfd_epic = INSTRUMENTS.get(_lfd_sym)
