@@ -3017,10 +3017,10 @@ _LIVE_PHASE_DROP_PNL         = -0.05  # -5% from phase entry triggers drop-back
 
 # MinDeal over-sizing guard: max acceptable ratio of (minDeal-clamped lots) / (formula lots).
 # Derived from circuit-breaker headroom: 10% daily limit / (2 positions × 2% per-stop budget) = 2.5×,
-# rounded to 3.0 for fractional sizing flexibility. At threshold, two simultaneous stops remain
-# within the circuit-breaker's daily window under typical conditions. Above it they cannot.
+# rounded to 3.5 for fractional sizing flexibility. At threshold, two simultaneous stops remain
+# within the circuit-breaker's daily window under typical conditions (3.5× × 2 = 7% daily). Above they cannot.
 # Self-heals as balance grows: formula lots approach minDeal and ratio naturally drops to ~1×.
-_MINDEAL_OVERSIZE_MAX = 3.0
+_MINDEAL_OVERSIZE_MAX = 3.5
 
 # ── Sprout sizing rotation ─────────────────────────────────────────────────────
 _SIM_SIZING_ORDER        = ["fixed_5", "fixed_10", "pct_5", "pct_10"]
