@@ -3015,6 +3015,13 @@ _LIVE_P2_TO_P3_PNL           = 0.05   # +5% from phase entry balance
 _LIVE_PHASE_DROP_LOSSES      = 5      # consecutive losses triggers drop-back
 _LIVE_PHASE_DROP_PNL         = -0.05  # -5% from phase entry triggers drop-back
 
+# MinDeal over-sizing guard: max acceptable ratio of (minDeal-clamped lots) / (formula lots).
+# Derived from circuit-breaker headroom: 10% daily limit / (2 positions × 2% per-stop budget) = 2.5×,
+# rounded to 3.0 for fractional sizing flexibility. At threshold, two simultaneous stops remain
+# within the circuit-breaker's daily window under typical conditions. Above it they cannot.
+# Self-heals as balance grows: formula lots approach minDeal and ratio naturally drops to ~1×.
+_MINDEAL_OVERSIZE_MAX = 3.0
+
 # ── Sprout sizing rotation ─────────────────────────────────────────────────────
 _SIM_SIZING_ORDER        = ["fixed_5", "fixed_10", "pct_5", "pct_10"]
 _SIM_MIN_APPROACH_TRADES = 5    # min per-instrument trades before approach is trusted
@@ -10177,6 +10184,31 @@ def _live_try_entry(signals: dict, regime: str, _notional_skip: set = None) -> N
         if len(_skip) <= 3:
             _live_try_entry(signals, regime, _notional_skip=_skip)
         return
+    # MinDeal over-sizing guard: pre-screens commodity CFDs where IG's minimum lot
+    # forces actual exposure beyond _MINDEAL_OVERSIZE_MAX × the risk-ceiling-approved
+    # desired_notional. Mirrors MARGIN PRECHECK pattern so the next ranked candidate
+    # is tried rather than the cycle aborting. Equity minDeal is handled separately
+    # by the EQUITY LEV GATE inside _live_open_position().
+    if sym not in _live_equity_cfd and sym not in _live_fx_instruments:
+        _md_mid = sig.get("price", 0.0)
+        _md_lot = _live_lot_sizes.get(sym, _LIVE_LOT_SIZE_FX)
+        _md_mdl = _live_min_deal.get(sym, 1.0)
+        if _md_mid > 0 and _md_lot > 0 and notional > 0:
+            _md_formula = notional / (_md_lot * _md_mid)  # unclamped lot count
+            if _md_formula > 0 and _md_mdl > _md_formula:
+                _md_ratio = round(_md_mdl / _md_formula, 2)
+                if _md_ratio > _MINDEAL_OVERSIZE_MAX:
+                    _live_log(
+                        f"🚫 MINDEAL GUARD: {sym} blocked — minDeal {_md_mdl} forces "
+                        f"{_md_ratio:.1f}× intended risk "
+                        f"(desired ${notional:.2f} → "
+                        f"actual ${_md_mdl * _md_lot * _md_mid:.2f} native notional) "
+                        f"— trying next ranked candidate"
+                    )
+                    _skip = (_notional_skip or set()) | {sym}
+                    if len(_skip) <= 3:
+                        _live_try_entry(signals, regime, _notional_skip=_skip)
+                    return
     _live_open_position(sym, direction, _ext, pos_size, lev, conv,
                        stop_mult=0.8 if _compress_sl else 1.0,
                        htf_bias=_htf_b)
