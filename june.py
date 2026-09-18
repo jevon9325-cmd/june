@@ -3091,9 +3091,11 @@ _SIM_STAGE_ORDER = ["sprout", "seedling", "germination", "vegetative", "full_blo
 
 # Balance floors: on graduation, inject to max(organic_balance, floor) so the sim
 # operates at realistic dollar levels for each stage's intended leverage tier.
+# Aligned to unified live tier boundaries: Seedling=$50, Germination=$200,
+# Vegetative=$1000, Full Bloom=$5000 (same thresholds as _live_tier_risk_pct).
 _SIM_STAGE_FLOORS = {
-    "seedling":    70.0,
-    "germination": 300.0,
+    "seedling":    50.0,
+    "germination": 200.0,
     "vegetative":  1_000.0,
     "full_bloom":  5_000.0,
 }
@@ -6294,6 +6296,45 @@ _LIVE_DEF_INSTR_STOPOUTS   = 1      # stop-outs on one instrument before instrum
 _LIVE_DEF_TIMEOUT_SECS     = 1800   # 30-min safety valve (recovery time gate)
 
 
+# ── Unified tier system (live account risk allocation) ───────────────────────
+# Single source of truth for how much balance is deployed per trade.
+# Smaller accounts take MORE risk (faster compounding); risk steps DOWN as
+# account grows, protecting capital at scale.
+#
+# Tier     Balance       Risk%   Intent
+# Sprout   < $50         90%     Max compounding — every $1 working
+# Seedling $50-$200      80%     Fast growth, still aggressive
+# Germin.  $200-$1000    60→50%  Linear taper — risk starts stepping down
+# Veget.   $1000-$5000   30→20%  Wealth preservation takes priority
+# FullBlm  > $5000       10%     Capital protection, lower per-trade risk
+#
+# REPLACES the $1/2%-ceiling formula entirely (not stacked on top of it).
+# _LIVE_PHASE_GATE_BAL ($200) aligns with Germination boundary — confirmed.
+
+def _live_tier_risk_pct(bal: float) -> float:
+    """Fraction of balance to deploy as margin per primary entry."""
+    if bal < 50.0:
+        return 0.90   # Sprout
+    if bal < 200.0:
+        return 0.80   # Seedling
+    if bal < 1000.0:
+        # Germination: linear 60% at $200 -> 50% at $1000
+        return 0.60 - (bal - 200.0) / (1000.0 - 200.0) * 0.10
+    if bal < 5000.0:
+        # Vegetative: linear 30% at $1000 -> 20% at $5000
+        return 0.30 - (bal - 1000.0) / (5000.0 - 1000.0) * 0.10
+    return 0.10   # Full Bloom
+
+
+def _live_tier_name(bal: float) -> str:
+    """Human-readable tier name for logging."""
+    if bal < 50.0:    return "sprout"
+    if bal < 200.0:   return "seedling"
+    if bal < 1000.0:  return "germination"
+    if bal < 5000.0:  return "vegetative"
+    return "full_bloom"
+
+
 def _live_log(msg: str) -> None:
     print(f"[{_ts()}] 🟢 LIVE: {msg}", flush=True)
 
@@ -6951,9 +6992,19 @@ def _live_check_circuit_breaker() -> None:
         else:
             effective_buffer = max(_LIVE_CB_MICRO_FLOOR_USD, _pct_buf)  # unchanged
     else:
-        # Without cap: at $34.79 the $20 floor requires -57.5% loss before CB fires.
-        # Cap at 10% of account; crossover where 5% pct rule binds: ~$400.
-        _full_floor = min(_LIVE_CB_FLOOR_USD, 0.10 * day_start)
+        # Tier-calibrated floor so the CB gives the same ~3 P90-loss coverage
+        # regardless of tier sizing. Derived from real sim loss distribution:
+        #   P90 loss = 0.54% of notional; median = 0.21% of notional.
+        # Sprout (90% sizing): 15% floor -> $6.90 at $46 -> 3.1x P90 coverage.
+        # Seedling (80% sizing): 12% floor -> $7.20 at $60 -> 2.8x P90 coverage.
+        # Germination+ (<=60% sizing): 10% floor -> crossover at $400 where 5% rule binds.
+        if day_start < 50.0:
+            _cb_floor_pct = 0.15   # Sprout: extra room for 90% position sizing
+        elif day_start < 200.0:
+            _cb_floor_pct = 0.12   # Seedling: extra room for 80% sizing
+        else:
+            _cb_floor_pct = 0.10   # Germination+: unchanged
+        _full_floor = min(_LIVE_CB_FLOOR_USD, _cb_floor_pct * day_start)
         effective_buffer = max(_full_floor, abs(_LIVE_CIRCUIT_BREAKER_PCT) * day_start)
     drawdown         = (current - day_start) / day_start
     if dollar_loss < effective_buffer:
@@ -9505,14 +9556,25 @@ def _live_add_pyramid_leg(signals: dict) -> None:
     epic   = INSTRUMENTS.get(sym, "")
     ig_dir = "BUY" if dirn == "long" else "SELL"
 
-    # Sizing: reuse primary pos_size and leverage for exact size match
+    # Sizing: tier ceiling enforced at addon point.
+    # Combined (primary + addon) cash exposure must not exceed bal * tier_risk_pct.
+    # At Sprout (90%), primary already uses full budget -> no addon budget remains.
     pos_sz   = primary.get("pos_size", 0.0)
     lev      = primary.get("leverage", 1)
     total    = _live.get("balance_total", 0.0)
     skimmed  = _live.get("skimmed_total", 0.0)
     bal      = max(0.0, total - skimmed)
-    _pyr_base = min(10.0, bal) if bal < 100.0 else round(bal * 0.10, 2)
-    notional = pos_sz * lev if pos_sz > 0 else max(2.0, _pyr_base) * lev
+    _tier_budget    = bal * _live_tier_risk_pct(bal) if bal > 0 else 0.0
+    _addon_budget   = max(0.0, _tier_budget - pos_sz)
+    if _addon_budget < 2.0:
+        _live_log(
+            f"[PYRAMID] {sym}: addon budget exhausted "
+            f"(primary ${pos_sz:.2f} vs tier budget ${_tier_budget:.2f} "
+            f"[{_live_tier_name(bal)} {_live_tier_risk_pct(bal):.0%}]) — addon aborted"
+        )
+        return
+    addon_pos_sz = min(pos_sz, _addon_budget)  # addon cannot exceed remaining budget
+    notional = addon_pos_sz * lev
 
     # Dynamic leg index: 2 = first addon, 3 = second addon, 4 = third addon
     leg_index = len(_live.get("pyramid_legs", [])) + 2
@@ -9996,10 +10058,13 @@ def _live_try_entry(signals: dict, regime: str, _notional_skip: set = None) -> N
     if _mr and _mr > 0:
         lev = _ig_margin_to_max_lev(_mr, lev)
 
-    # Sizing — flat $10 target below $100 balance, 10%-of-balance above.
-    # Crossover is continuous: 10% of $100 = $10 exactly (no jump).
-    # $2 floor and downstream minDeal clamp apply unchanged.
-    pos_size = max(2.0, min(10.0, bal) if bal < 100.0 else round(bal * 0.10, 2))
+    # Sizing: unified tier system. Sprout (<$50) 90%, Seedling ($50-$200) 80%,
+    # Germination ($200-$1000) 60->50% linear, Vegetative ($1000-$5000) 30->20% linear,
+    # Full Bloom (>$5000) 10%. Replaces the flat $10/$10%-of-bal formula entirely.
+    # $2 floor (IG minDeal) and downstream clamp unchanged.
+    _tier_pct = _live_tier_risk_pct(bal)
+    pos_size = max(2.0, round(bal * _tier_pct, 2))
+    _live_log(f"  📊 Tier {_live_tier_name(bal)} ({_tier_pct:.0%}): pos_size ${pos_size:.2f}")
     # Proportional size reduction when spread is wide relative to ATR
     _sar_live = sig.get("spread_atr_ratio")
     if sig.get("spread_atr_wide") and _sar_live:
@@ -10028,25 +10093,9 @@ def _live_try_entry(signals: dict, regime: str, _notional_skip: set = None) -> N
         _live_log(f"  📉 Observer MODERATE: position scaled x0.70 -> ${pos_size:.2f}")
 
 
-    # $1 risk-ceiling — additive cap on top of existing sizing, never a replacement.
-    # Preserves approach-rotation learning in _sim_position_size.
-    # stop_pct is read-only here — this formula ONLY consumes it as a divisor.
-    # No balance cap: leveraged notional legitimately exceeds balance (7x lev ->
-    # $10 pos = $70 notional). Balance cap was suppressing INOD/SEMI (IG mins
-    # $53/$51) while pos_size sizing already limits cash deployed to <=10.
-    _rc_stop = max(_sim_get_dynamic_stop(sym), _sim_get_spread_floor(sym))
-    if _rc_stop > 0 and bal > 0:
-        _rc_risk_dollar  = min(1.0, 0.02 * bal)
-        _rc_max_notional = _rc_risk_dollar / _rc_stop
-        if (pos_size * lev) > _rc_max_notional:
-            _capped_pos = max(2.0, round(_rc_max_notional / lev, 2))
-            _live_log(
-                f"  💰 Risk ceil: ${_rc_risk_dollar:.2f} ÷ stop "
-                f"{_rc_stop * 100:.3f}% → max notional ${_rc_max_notional:.2f} "
-                f"| pos ${pos_size:.2f} → ${_capped_pos:.2f}"
-            )
-            pos_size = _capped_pos
-            notional = pos_size * lev
+    # $1 risk-ceiling removed: tier system (_live_tier_risk_pct) is now the
+    # sole sizing authority. Ceiling was a fixed $1 max regardless of balance
+    # growth; tier system scales correctly at every balance level.
 
     # Check IG minimum feasibility
     if not _sim_check_min_feasible(sym, pos_size, lev):
