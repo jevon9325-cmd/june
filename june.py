@@ -1172,17 +1172,19 @@ def is_overnight() -> bool:
 def _current_sub_session(sym: str) -> str:
     """Trading sub-session label for SAR block bucketing.
 
-    OIL / SILVER / NATGAS: day session split into three independent buckets so that
-    afternoon chop cannot block the next morning's primary trading window.
+    OIL / SILVER / NATGAS / WHEAT: day session split into three independent buckets so
+    that a bad early-morning reading cannot block the primary trading window.
       pre_nyse:       07:00 UTC - NYSE open     (London + pre-market hours)
       nyse_morning:   NYSE open - 12:00 ET noon (highest volume, tightest spreads)
       nyse_afternoon: 12:00 ET  - 21:00 UTC     (lower volume, wider spreads)
+    WHEAT added: clearing window is 12:45-15:00 UTC (CBOT morning). A pre_nyse block
+    expires at NYSE open (13:30 UTC), preserving the nyse_morning clearing window.
     Other instruments: plain "day" (single bucket, unchanged behaviour).
     Overnight always returns "overnight" for all instruments.
     """
     if is_overnight():
         return "overnight"
-    if sym not in ("OIL", "SILVER", "NATGAS"):
+    if sym not in ("OIL", "SILVER", "NATGAS", "WHEAT"):
         return "day"
     now_et       = datetime.now(_US_EAST_TZ)
     nyse_open_et = now_et.replace(hour=9,  minute=30, second=0, microsecond=0)
@@ -7367,7 +7369,7 @@ def _live_perf_blocked(sym: str) -> bool:
     """True if sym is blocked by the instrument performance filter.
     Checks legacy (june_perf_block:{sym}), WR (june_perf_block_wr:{sym}),
     and SAR (june_perf_block_sar:{sym}:{sub_session}) keys — any active key blocks.
-    SAR blocks are sub-session specific (OIL/SILVER/NATGAS): a bad afternoon never blocks the next morning.
+    SAR blocks are sub-session specific (OIL/SILVER/NATGAS/WHEAT): a bad early session never blocks the next.
     Caches Redis state locally: instrument-wide blocks under sym, SAR blocks under sym:sub_session.
     On Redis error: blocks the trade (fail-closed) to prevent trading through an active block.
     Caches for the full block TTL at fire time — no Redis check needed during the block window.
