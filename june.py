@@ -6314,7 +6314,7 @@ _LIVE_DEF_TIMEOUT_SECS     = 1800   # 30-min safety valve (recovery time gate)
 def _live_tier_risk_pct(bal: float) -> float:
     """Fraction of balance to deploy as margin per primary entry."""
     if bal < 50.0:
-        return 0.90   # Sprout
+        return 0.85   # Sprout
     if bal < 200.0:
         return 0.80   # Seedling
     if bal < 1000.0:
