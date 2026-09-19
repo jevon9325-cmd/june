@@ -6412,6 +6412,9 @@ _HTF_READY_KEY         = "june_htf_ready_alert"
 _HTF_CALIB_MIN_EVENTS  = 30
 _HTF_CALIB_RERUN_EVERY = 10
 _HTF_CALIB_MIN_SEP     = 0.10    # 10pp aligned vs opposed WR gap required
+_LIVE_TRADE_HIST_KEY   = 'june_live_trade_history_full'
+_LIVE_TRADE_HIST_CAP   = 2000
+_LIVE_TRADE_HIST_TTL   = 86400 * 30
 
 
 def _live_fetch_htf_candles(sym):
@@ -6518,6 +6521,13 @@ def _htf_self_calibrate():
             except Exception:
                 pass
         trade_hist = _live.get("trade_history", []) + _sim.get("trade_history", [])
+        try:
+            _pr = _r.lrange(_LIVE_TRADE_HIST_KEY, 0, -1)
+            _ph = [json.loads(x) for x in _pr]
+            _sk = {(t.get("instrument"),t.get("direction"),t.get("exit_epoch")) for t in trade_hist}
+            trade_hist = trade_hist + [t for t in _ph if (t.get("instrument"),t.get("direction"),t.get("exit_epoch")) not in _sk]
+        except Exception:
+            pass
         results = {"aligned": [], "opposed": [], "neutral": []}
         per_combo: dict = {}   # {sym_dir_bias: [(won, pnl), ...]}
         matched = 0
@@ -8501,6 +8511,13 @@ def _live_close_position(exit_reason: str, signals: dict) -> None:
         hist.append(trade_rec)
         if len(hist) > 50:
             _live["trade_history"] = hist[-50:]
+        try:
+            _rh = _redis()
+            _rh.lpush(_LIVE_TRADE_HIST_KEY, json.dumps(trade_rec))
+            _rh.ltrim(_LIVE_TRADE_HIST_KEY, 0, _LIVE_TRADE_HIST_CAP - 1)
+            _rh.expire(_LIVE_TRADE_HIST_KEY, _LIVE_TRADE_HIST_TTL)
+        except Exception:
+            pass
 
         # Update totals
         _live["total_wins"]   = _live.get("total_wins", 0)   + int(won)
