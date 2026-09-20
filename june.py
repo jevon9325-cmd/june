@@ -3546,11 +3546,20 @@ def _sim_conviction_gauge(
         import logging; logging.getLogger().debug(f"  wknd_pts={wknd_pts:+.3f} for {sym}/{direction}")
     if claudia_pts:
         import logging; logging.getLogger().debug(f"  claudia_pts={claudia_pts:+.3f} for {sym}/{direction}")
+    _final_conv = max(1, min(10, round(raw)))
     if forecast_pts:
-        import logging; logging.getLogger().debug(f"  forecast_pts={forecast_pts:+.3f} for {sym}/{direction}")
+        _conv_without = max(1, min(10, round(raw - forecast_pts)))
+        _f_boundary = (_final_conv != _conv_without)
+        _forecast_boundary_cache[f"{sym}_{direction}"] = _f_boundary
+        _f_btag = "[BOUNDARY-CROSSED]" if _f_boundary else "[absorbed]"
+        import logging as _fcg_log
+        _fcg_log.getLogger().info(
+            f"\U0001f52d FORECAST NUDGE: {sym}/{direction} pts={forecast_pts:+.3f} {_f_btag}"
+            f" conv_before={_conv_without} conv_after={_final_conv}"
+        )
     if grind_pts:
         import logging; logging.getLogger().debug(f"  grind_pts={grind_pts:+.3f} for {sym}/{direction}")
-    return max(1, min(10, round(raw)))
+    return _final_conv
 
 
 def _sim_combo_key(sym: str, direction: str) -> str:
@@ -4186,6 +4195,11 @@ def _sim_claudia_pts(sym: str, direction: str) -> float:
         return 0.0  # short opposes bullish thesis — no boost, not penalised
     return 0.0
 
+# Ephemeral per-eval cache: _sim_conviction_gauge writes here after computing the
+# forecast nudge so that _sim_open_position can store whether a boundary was crossed
+# on the position record — enabling outcome tagging at close without re-computing raw.
+_forecast_boundary_cache: dict = {}
+
 def _sim_forecast_pts(sym: str, direction: str) -> float:
     """Soft conviction adjustment from Barbie's daily forecast folder.
 
@@ -4223,14 +4237,28 @@ def _sim_forecast_pts(sym: str, direction: str) -> float:
             return 0.0
         regime = data.get("regime", "neutral")
         corr   = float(data.get("corr_eurusd", 0.0))
+        import logging as _flog
+        _flog_inst = _flog.getLogger()
         if abs(corr) < 0.20:
+            _flog_inst.info(
+                f"\U0001f52d FORECAST TIER-A: {sym}/{direction} "
+                f"regime={regime} corr={corr:.3f} pts=0.000 [neutral - no nudge]"
+            )
             return 0.0
         if regime == "usd_weak_favors_long":
             pts = _MAX if direction == "long" else -_MAX
         elif regime == "usd_strong_favors_long":
             pts = _MAX if direction == "short" else -_MAX
         else:
+            _flog_inst.info(
+                f"\U0001f52d FORECAST TIER-A: {sym}/{direction} "
+                f"regime={regime} corr={corr:.3f} pts=0.000 [unhandled regime]"
+            )
             return 0.0
+        _flog_inst.info(
+            f"\U0001f52d FORECAST TIER-A: {sym}/{direction} "
+            f"regime={regime} corr={corr:.3f} pts={pts:+.3f}"
+        )
         return round(pts, 3)
     except Exception:
         return 0.0
@@ -4659,7 +4687,20 @@ def _sim_close_position(prices: dict, exit_reason: str) -> None:
         "stage": _sim.get("stage", "sprout"), "phase": _sim.get("phase", 1),
         "conviction": pos.get("conviction", 5),
         "claudia_pts": pos.get("claudia_pts", 0.0),
+        "forecast_pts": pos.get("forecast_pts", 0.0),
+        "forecast_boundary_crossed": pos.get("forecast_boundary_crossed", False),
     }
+    _fc_pts = pos.get("forecast_pts", 0.0)
+    if _fc_pts:
+        _fc_bnd = pos.get("forecast_boundary_crossed", False)
+        _fc_btag = "[BOUNDARY-CROSSED]" if _fc_bnd else "[absorbed]"
+        import logging as _fco_log
+        _fc_instr = pos.get("instrument", "?")
+        _fco_log.getLogger().info(
+            f"\U0001f52d FORECAST OUTCOME: {_fc_instr}/{dirn}"
+            f" pts={_fc_pts:+.3f} {_fc_btag}"
+            f" won={won} pnl=${(dollar_pnl + _partial_pnl):+.4f}"
+        )
     history = _sim.setdefault("trade_history", [])
     history.append(trade_rec)
     _sim_save_trade(trade_rec)
@@ -4985,6 +5026,8 @@ def _sim_try_entry(signals: dict, regime: str, leverage: int) -> None:
         "conviction": conviction,
         "initial_sl_pct": stop_pct,  # baseline for time-decay SL compression
         "claudia_pts": _sim_claudia_pts(sym, direction),
+        "forecast_pts": _sim_forecast_pts(sym, direction),
+        "forecast_boundary_crossed": _forecast_boundary_cache.get(f"{sym}_{direction}", False),
         "htf_bias": _htf_b_sim,
     }
 
