@@ -3538,13 +3538,16 @@ def _sim_conviction_gauge(
     else:
         rel_pts = 0.0
     wknd_pts    = _sim_weekend_pts(sym, direction)
-    claudia_pts = _sim_claudia_pts(sym, direction)
-    grind_pts   = _slow_grind_pts(sym, direction)
-    raw = clearance + regime_pts + bucket_pts + streak_pts + rel_pts + wknd_pts + claudia_pts + grind_pts
+    claudia_pts   = _sim_claudia_pts(sym, direction)
+    forecast_pts  = _sim_forecast_pts(sym, direction)
+    grind_pts     = _slow_grind_pts(sym, direction)
+    raw = clearance + regime_pts + bucket_pts + streak_pts + rel_pts + wknd_pts + claudia_pts + forecast_pts + grind_pts
     if wknd_pts:
         import logging; logging.getLogger().debug(f"  wknd_pts={wknd_pts:+.3f} for {sym}/{direction}")
     if claudia_pts:
         import logging; logging.getLogger().debug(f"  claudia_pts={claudia_pts:+.3f} for {sym}/{direction}")
+    if forecast_pts:
+        import logging; logging.getLogger().debug(f"  forecast_pts={forecast_pts:+.3f} for {sym}/{direction}")
     if grind_pts:
         import logging; logging.getLogger().debug(f"  grind_pts={grind_pts:+.3f} for {sym}/{direction}")
     return max(1, min(10, round(raw)))
@@ -4183,6 +4186,54 @@ def _sim_claudia_pts(sym: str, direction: str) -> float:
         return 0.0  # short opposes bullish thesis — no boost, not penalised
     return 0.0
 
+def _sim_forecast_pts(sym: str, direction: str) -> float:
+    """Soft conviction adjustment from Barbie's daily forecast folder.
+
+    Reads barbie_forecast:{sym} from Redis.  ONLY fires for Tier A
+    (≥20 bars + stable 3/3 sub-windows).  Returns 0.0 for Tier B/C,
+    missing/stale data, or instruments not in the forecast set.
+
+    Cap: ±0.2 — deliberately more conservative than Claudia's ±0.3.
+    Reasoning: Claudia has 8+ months of validation and multiple data
+    inputs per decision.  This is a brand-new, single correlation-based
+    signal with no track record; 2/3 of Claudia's ceiling is appropriate
+    until calibrated.  The nudge is additive inside _sim_conviction_gauge,
+    contributing to `raw` before the max(1, min(10, round(raw))) clamp.
+
+    Sign logic (EURUSD is inverse DXY proxy):
+      usd_weak_favors_long  → long aligns with normal commodity/USD pattern → +0.2
+                            → short conflicts → -0.2
+      usd_strong_favors_long → unusual regime; short aligns → +0.2
+                             → long conflicts → -0.2
+      neutral               → |corr| < 0.20 — no signal → 0.0
+
+    Zero reference to any _htf_* function or _HTF_* Redis key.
+    Never a gate — additive only, never modifies direction.
+    """
+    _MAX = 0.2
+    _FORECAST_SYMS = frozenset({"GOLD", "SILVER", "OIL", "NATGAS", "COCOA"})
+    if sym not in _FORECAST_SYMS:
+        return 0.0
+    try:
+        raw = _redis().get(f"barbie_forecast:{sym}")
+        if not raw:
+            return 0.0
+        data = json.loads(raw)
+        if data.get("tier") != "A":
+            return 0.0
+        regime = data.get("regime", "neutral")
+        corr   = float(data.get("corr_eurusd", 0.0))
+        if abs(corr) < 0.20:
+            return 0.0
+        if regime == "usd_weak_favors_long":
+            pts = _MAX if direction == "long" else -_MAX
+        elif regime == "usd_strong_favors_long":
+            pts = _MAX if direction == "short" else -_MAX
+        else:
+            return 0.0
+        return round(pts, 3)
+    except Exception:
+        return 0.0
 
 def _sim_check_barbie_alarm(signals: dict) -> None:
     """Compare live vol against what Barbie assumed when she set stop_vol_mult overrides.
