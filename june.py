@@ -8081,6 +8081,7 @@ def _live_open_position(sym: str, direction: str, signals: dict,
                 f"expected gross ${_exp_gross:.2f} < ${_rt_comm:.2f} round-trip "
                 f"commission (notional ${actual_n:.2f} TP {tp_pct*100:.2f}%)."
             )
+            _live.setdefault("pause_expiry", {})[_sim_combo_key(sym, direction)] = time.time() + 600
             return
 
     # Pre-order margin check — catches weekend-uplifted margins that slip past eligibility filter.
