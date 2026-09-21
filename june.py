@@ -9107,6 +9107,17 @@ def _live_partial_tp_exit(signals: dict) -> None:
                     f"Running reconciliation."
                 )
                 _live_reconcile_positions()
+                # Orphan guard: unexpected dealId means the partial-TP close order
+                # may have opened a new opposite position (original already stopped
+                # by broker before the close fired — same class as SILVER incident).
+                _ptp_orphan_margin = _ls_get_margin()
+                if _ptp_orphan_margin is not None and _ptp_orphan_margin > 0.0:
+                    _live_log(
+                        f"🚨 PARTIAL-TP ORPHAN: LS ACCT MARGIN={_ptp_orphan_margin:.2f} after "
+                        f"{sym} partial close — close order opened a new position "
+                        f"(original already stopped by broker). manual_review_required=True"
+                    )
+                    _live["manual_review_required"] = True
                 _live_save_state()
                 return
             # Single position with matching dealId confirmed — proceed with update
@@ -9559,6 +9570,7 @@ def _live_close_addon_leg(leg: dict, exit_reason: str, signals: dict) -> None:
         "currencyCode":   "USD",
         "dealId":         deal_id,
     }
+    _addon_margin_pre = _ls_get_margin()  # orphan guard: capture before sending close
     resp = _ig_live_post("/positions/otc", close_body, version="1")
     if not resp:
         _live_log(f"[PYRAMID] {sym}: addon close POST failed -- state preserved")
@@ -9581,6 +9593,18 @@ def _live_close_addon_leg(leg: dict, exit_reason: str, signals: dict) -> None:
             except Exception:
                 pass
             _live["pyramid_agg_stop_level"] = None
+        # Orphan guard: if close order landed on an already-stopped addon leg,
+        # IG opens a new opposite position — LS ACCT MARGIN increases instead of
+        # decreasing. Use 0.10 threshold to clear rounding noise.
+        _addon_margin_post = _ls_get_margin()
+        if (_addon_margin_pre is not None and _addon_margin_post is not None
+                and _addon_margin_post > _addon_margin_pre + 0.10):
+            _live_log(
+                f"🚨 PYRAMID ORPHAN: LS ACCT MARGIN {_addon_margin_pre:.2f}→{_addon_margin_post:.2f} "
+                f"INCREASED after {sym} addon close — close order opened a new position "
+                f"(original already stopped by broker). manual_review_required=True"
+            )
+            _live["manual_review_required"] = True
         _live_save_state()
     else:
         status = confirm.get("dealStatus", "?") if confirm else "no-confirm"
