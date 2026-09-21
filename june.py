@@ -8426,7 +8426,19 @@ def _ls_position_guard_check(sym: str, deal_id: str) -> tuple:
             # LS received explicit FULLY_CLOSED event for this deal → gone.
             _guard_consecutive_unavail.pop(deal_id, None)
             return (False, "LS-confirmed")
-        # Connected + no FULLY_CLOSED seen → deal is open → proceed with close.
+        # Cross-check: IG broker-stop events send FULLY_CLOSED with a NEW dealId
+        # (not the original open dealId). _ls_deal_closed() misses these.
+        # On this single-position account, MARGIN=0 means account is flat —
+        # the position was stopped by IG before this close scan fired.
+        _grd_margin = _ls_get_margin()
+        if _grd_margin is not None and _grd_margin == 0.0:
+            _live_log(
+                f"[{sym}] [guard] LS ACCT MARGIN=0 with no FULLY_CLOSED for {deal_id} "
+                f"\u2192 broker-stop detected (IG stop-close uses different dealId). Suppressing."
+            )
+            _guard_consecutive_unavail.pop(deal_id, None)
+            return (False, "LS-margin-zero")
+        # Connected + no FULLY_CLOSED seen + margin>0 → deal open → proceed.
         _guard_consecutive_unavail.pop(deal_id, None)
         return (True, "LS-primary")
 
@@ -8832,6 +8844,18 @@ def _live_close_position(exit_reason: str, signals: dict) -> None:
                 f"✅ POST-CLOSE VERIFY {_vi_n}/{_VERIFY_MAX}: "
                 f"REST-only: deal {_pv_deal_id} absent from /positions for {sym}"
             )
+            # Orphan guard: if close order landed on an already-stopped position,
+            # IG opens a new opposite position instead. Catch it via LS ACCT MARGIN.
+            _pv_margin_chk = _ls_get_margin()
+            if _pv_margin_chk is not None and _pv_margin_chk > 0.0:
+                _live_log(
+                    f"🚨 POST-CLOSE ORPHAN: LS ACCT MARGIN={_pv_margin_chk:.2f} after "
+                    f"{sym} close — close order opened a new position "
+                    f"(original already stopped by broker). manual_review_required=True"
+                )
+                _live["manual_review_required"] = True
+                _live_save_state()
+                return False
             return True
         if _ls_ok:
             # REST unavailable -- LS only
@@ -9172,6 +9196,21 @@ def _live_check_exit(signals: dict, regime: str) -> None:
         _live_reconcile_positions()
         _live_save_state()
         return
+
+    # Margin-based broker-stop detection: IG stop-close events use a NEW dealId
+    # so _ls_deal_closed() above misses them. If LS ACCT MARGIN=0 but a
+    # position is still tracked, the broker stop fired and must be reconciled.
+    if _ls_connected:
+        _bsd_margin = _ls_get_margin()
+        if _bsd_margin is not None and _bsd_margin == 0.0:
+            _live_log(
+                f"[LS MARGIN=0] {sym}: broker stop detected via LS ACCT "
+                f"(no FULLY_CLOSED for deal {_ls_chk_id} — IG stop-close uses different dealId). "
+                f"Reconciling."
+            )
+            _live_reconcile_positions()
+            _live_save_state()
+            return
 
     # Max hold — always fires regardless of price availability
     if hold_sec >= _SIM_MAX_HOLD_SECS:
