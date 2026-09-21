@@ -439,6 +439,7 @@ _ls_confirms_closed: set    = set()          # deal_ids confirmed FULLY_CLOSED v
 _ls_confirms_lock           = threading.Lock()
 _june_live_trading_enabled: bool = False  # kill switch: must be True via Redis to place live orders
 _live_lot_sizes: dict = {}   # sym -> IG lotSize from LIVE API (populated in _live_startup)
+_recon_consecutive_404_with_deposit: int = 0  # persistent-404+deposit counter for orphan escalation
 _live_min_deal:  dict = {}   # sym -> minDealSize.value from LIVE API (populated in _live_startup)
 _live_pip_sizes: dict = {}   # sym -> pip size in price units from LIVE API (populated in _live_startup)
 _live_price_unit: dict = {}  # sym -> USD-per-native-price-unit (0.01 for cents, 1.0 otherwise)
@@ -6317,6 +6318,10 @@ _PYRAMID_3LEG_THRESHOLD  = 10     # completions needed to unlock leg 3
 _PYRAMID_4LEG_THRESHOLD  = 20     # completions needed to unlock leg 4
 _PYRAMID_3LEG_SIZE_DECAY = 0.75   # leg 3 notional = leg2_notional * 0.75
 _PYRAMID_4LEG_SIZE_DECAY = 0.50   # leg 4 notional = leg2_notional * 0.50
+_RECON_ORPHAN_ESCALATION_THRESHOLD = 4  # consecutive 404+deposit>0 cycles before escalating
+# 4 cycles ~2-4 min: past any plausible IG API settling window for OTC positions.
+# /positions (DMA) confirmed NOT to list OTC positions on this account. No alternate list
+# endpoint known. On escalation: entry blocked; operator must inspect IG app.
 
 # Daily drawdown circuit breaker for the live account.
 # Derivation: max per-trade loss = 10% position × 10× leverage × 0.5% max stop = 0.5%/trade.
@@ -9983,6 +9988,12 @@ def _live_try_entry(signals: dict, regime: str, _notional_skip: set = None) -> N
     if _live.get("open_position"):
         return     # one position at a time
 
+    if _live.get("orphan_suspected"):
+        _live_log(f"⚠️ Entry BLOCKED: orphan_suspected -- /positions/otc 404 + deposit>0 "
+                  f"persisted >={_RECON_ORPHAN_ESCALATION_THRESHOLD} cycles. "
+                  f"Check IG app for unmanaged open positions.")
+        return
+
     total   = _live.get("balance_total", 0.0)
     skimmed = _live.get("skimmed_total", 0.0)
     bal     = max(0.0, total - skimmed)   # tradeable capital = total equity minus set-aside
@@ -10543,6 +10554,7 @@ def run_live_step(signals: dict) -> None:
 
 
 def _live_reconcile_positions() -> None:
+    global _recon_consecutive_404_with_deposit
     # Reconcile _live["open_position"] against IG real open positions.
     # Called at startup and mid-cycle after a failed close confirmation.
     # Catches two failure modes:
@@ -10563,17 +10575,37 @@ def _live_reconcile_positions() -> None:
                     _recon_dep = float(_recon_ac.get("balance", {}).get("deposit", 0) or 0)
                     break
             if _recon_dep == 0.0:
+                _recon_consecutive_404_with_deposit = 0  # reset — no margin in use
+                _live.pop("orphan_suspected", None)       # unblock entry if previously set
                 _live_log("Reconciliation: /positions/otc 404 but balance deposit=0 "
                           "-- treating as flat (no margin in use)")
                 data = {"positions": []}
             else:
+                _recon_consecutive_404_with_deposit += 1
+                _streak = _recon_consecutive_404_with_deposit
                 _live_log(f"Reconciliation: /positions/otc 404 but deposit={_recon_dep:.2f}>0 "
-                          f"-- possible transitional state, skipping to preserve state")
+                          f"-- skipping [404_streak={_streak}/{_RECON_ORPHAN_ESCALATION_THRESHOLD}]")
+                if _streak >= _RECON_ORPHAN_ESCALATION_THRESHOLD:
+                    _live["orphan_suspected"] = True
+                    _live_log("=" * 62)
+                    _live_log("!!! ORPHAN POSITION ALERT -- ESCALATION THRESHOLD REACHED !!!")
+                    _live_log(f"    /positions/otc returned 404 for {_streak} consecutive cycles")
+                    _live_log(f"    while deposit=${_recon_dep:.2f} (real margin in use).")
+                    _live_log(f"    At least one REAL OPEN POSITION exists that June")
+                    _live_log(f"    cannot locate, track, or manage. ACTIVE BLIND SPOT.")
+                    _live_log(f"    /positions (DMA) does not list OTC on this account.")
+                    _live_log(f"    ACTION: CHECK IG APP NOW -- open position(s) unmanaged.")
+                    _live_log(f"    ACTION: Close any unmanaged position manually if needed.")
+                    _live_log(f"    New entry: BLOCKED until /positions/otc returns 200.")
+                    _live_log("=" * 62)
                 return
         else:
             _live_log("Reconciliation: /positions/otc AND /accounts both failed -- skipping")
             return
 
+    # /positions/otc returned 200 — clear streak and unblock entry if previously escalated
+    _recon_consecutive_404_with_deposit = 0
+    _live.pop("orphan_suspected", None)
     ig_positions = data.get("positions", [])
     june_pos     = _live.get("open_position")
 
