@@ -8800,13 +8800,16 @@ def _live_close_position(exit_reason: str, signals: dict) -> None:
                 )
                 return None
             if _ls_flat and not _rs_flat:
-                # LS CONFIRMS received but REST still shows this deal -- REST lag, retry.
+                # LS received explicit FULLY_CLOSED for this deal.
+                # REST still shows the deal -- OTC cache lag is expected on this account type
+                # (/positions/otc always returns 404; /positions DMA is secondary).
+                # LS-primary: consistent with guard rebuild. Treat LS as authoritative.
                 _live_log(
-                    f"⚠️  POST-CLOSE VERIFY {_vi_n}/{_VERIFY_MAX}: "
-                    f"LS CONFIRMS for {_pv_deal_id} received but REST still shows deal "
-                    f"[{sym}] — REST lag, retrying"
+                    f"✅ POST-CLOSE VERIFY {_vi_n}/{_VERIFY_MAX}: "
+                    f"LS-primary: deal {_pv_deal_id} FULLY_CLOSED for {sym} "
+                    f"(REST still shows deal — OTC cache lag, LS authoritative)"
                 )
-                return None
+                return True
             # _rs_flat=True but no LS CONFIRMS: REST says deal gone, LS not yet confirmed.
             # REST is ground truth for position existence -- treat as flat.
             _live_log(
