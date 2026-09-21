@@ -8017,10 +8017,10 @@ def _live_open_position(sym: str, direction: str, signals: dict,
     else:
         actual_n = ig_size * lot_sz * mid_price  # native-price notional; pnl_pct uses same native prices, price_unit cancels
     # Display-only USD notional for logs — isolated from pos["notional"] and dollar_pnl.
-    # Commodity instruments: native notional * price_unit -> USD. Equity/FX: already USD.
-    _log_n = (actual_n * price_unit
-               if sym not in _live_equity_cfd and sym not in _live_fx_instruments
-               else actual_n)
+    # actual_n is already USD-scale for all instrument types: the native-price formula
+    # (ig_size * lot_sz * mid_price) produces USD notional because pnl_pct uses the same
+    # native prices and they cancel. price_unit belongs to per-pip values, not notional.
+    _log_n = actual_n
     # Equity CFD leverage gate — minDeal = 1 share inflates effective leverage when
     # account is too small for pos_size × leverage to cover one share. Block cleanly
     # rather than allow effective leverage to silently exceed the phase ceiling.
@@ -8096,7 +8096,7 @@ def _live_open_position(sym: str, direction: str, signals: dict,
         _mfrac  = _real_margin_fraction(sym, _margin_raw)
         _eq_fx  = (_live_fx_base.get(sym, 1.0) or 1.0) if sym in _live_equity_cfd else 1.0
         _usd_n  = ((ig_size * mid_price * price_unit if sym in _live_equity_cfd
-                    else ig_size * lot_sz * mid_price * price_unit) / _eq_fx)
+                    else ig_size * lot_sz * mid_price) / _eq_fx)
         _req_mg = _usd_n * _mfrac
         _avail  = _live.get("balance_total", 0.0)
         if _req_mg > _avail:
