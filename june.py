@@ -3024,7 +3024,18 @@ _LIVE_PHASE_DROP_PNL         = -0.05  # -5% from phase entry triggers drop-back
 # within the circuit-breaker's daily window under typical conditions (3.5× × 2 = 7% daily). Above they cannot.
 # Self-heals as balance grows: formula lots approach minDeal and ratio naturally drops to ~1×.
 _MINDEAL_OVERSIZE_MAX = 3.5
-_LIVE_SPROUT_MINDEAL_MULT = 4       # Sprout tier: ig_size floor = N × minDeal (12 losses to CB at 15% floor)
+# Per-instrument Sprout-tier floor multipliers (balance < $50).
+# DEFAULT=4 gives ~3× CB losses at typical ATR stop for GOLD/NATGAS/COCOA etc.
+# OIL/SILVER reduced to 2×: at 4× their single-trade max loss exceeds the $5.03
+#   CB buffer at $33 balance ($5.88/$5.28 vs buffer — confirmed 2026-09-21).
+# HO set to 1× (no floor boost): even at IG min stop (51 pts × 0.04 lots = $2.04)
+#   the 4× floor loss ($4.08 minimum) would consume 81% of the CB buffer.
+_LIVE_SPROUT_MINDEAL_MULTS: dict = {
+    "DEFAULT": 4,   # GOLD, NATGAS, COCOA, WHEAT, SUGAR, SOYBEANS, LWB — ~3× CB coverage
+    "OIL":     2,   # 2× → 0.06 lots → typical stop ~$1.44 → ~3.5× CB coverage
+    "SILVER":  2,   # 2× → 0.08 lots → typical stop ~$1.28 → ~3.9× CB coverage
+    "HO":      1,   # 1× = formula sizing; HO price ~47k makes any larger floor unsafe
+}
 _LIVE_MARGIN_FALLBACKS: dict = {
     "GOLD": 0.012,  # IG API returns 0% marginFactor (known anomaly); real ~1.2% from deposit observations
 }
@@ -8023,7 +8034,10 @@ def _live_open_position(sym: str, direction: str, signals: dict,
         return
 
     notional  = pos_size * leverage
-    _sprout_floor_mult = _LIVE_SPROUT_MINDEAL_MULT if _live.get("balance", 0.0) < 50.0 else 1
+    _sprout_floor_mult = (
+        _LIVE_SPROUT_MINDEAL_MULTS.get(sym, _LIVE_SPROUT_MINDEAL_MULTS["DEFAULT"])
+        if _live.get("balance", 0.0) < 50.0 else 1
+    )
     ig_size    = _live_compute_ig_size(sym, notional, mid_price, floor_mult=_sprout_floor_mult)
     if _sprout_floor_mult > 1:
         _live_log(
