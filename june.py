@@ -440,6 +440,8 @@ _ls_confirms_lock           = threading.Lock()
 _june_live_trading_enabled: bool = False  # kill switch: must be True via Redis to place live orders
 _live_lot_sizes: dict = {}   # sym -> IG lotSize from LIVE API (populated in _live_startup)
 _recon_consecutive_404_with_deposit: int = 0  # persistent-404+deposit counter for orphan escalation
+_guard_consecutive_unavail: dict = {}          # deal_id -> consecutive unavail count in _ls_position_guard_check
+_GUARD_UNAVAIL_ESCALATION_THRESHOLD = 3        # cycles before loud alert on persistent guard unavail
 _live_min_deal:  dict = {}   # sym -> minDealSize.value from LIVE API (populated in _live_startup)
 _live_pip_sizes: dict = {}   # sym -> pip size in price units from LIVE API (populated in _live_startup)
 _live_price_unit: dict = {}  # sym -> USD-per-native-price-unit (0.01 for cents, 1.0 otherwise)
@@ -8375,92 +8377,77 @@ def _ls_deal_closed(deal_id: str) -> bool:
 def _ls_position_guard_check(sym: str, deal_id: str) -> tuple:
     """Pre-send guard: confirm THIS SPECIFIC DEAL still open before sending close.
 
-    Per-deal check replaces account-level margin/deposit signals:
-    - LS: _ls_deal_closed(deal_id) -- FULLY_CLOSED CONFIRMS received via TRADE stream?
-    - REST: /positions list filtered by deal_id -- is this deal still present?
+    Signal hierarchy — LS-PRIMARY, deposit-SECONDARY:
 
-    On disagreement (LS says closed, REST still shows deal): treat as OPEN for this
-    cycle and let _post_dual_verify resolve on the next attempt. Does NOT set
-    manual_review_required -- transient REST lag resolves automatically.
+    1. LS CONFIRMS (primary, when _ls_connected):
+       IG pushes a real-time snapshot of recent FULLY_CLOSED events on every new
+       LS session. If we are connected and have NOT received FULLY_CLOSED for this
+       deal, the deal is open. If we HAVE received FULLY_CLOSED, it is gone.
+       /positions (DMA endpoint) is REMOVED — it never lists OTC positions on this
+       account and carries zero discriminating power for OTC deal detection.
+
+    2. Deposit check (secondary, only when LS offline):
+       /accounts -> preferred.balance.deposit.
+       deposit>0 → margin in use → treat as open.
+       deposit=0 → flat account → suppress.
+       /accounts failure → (None, "unavailable") + escalation counter.
 
     Return codes:
-      (True,  "LS+REST")       both agree deal is open
-      (True,  "LS-only")       LS connected, no CONFIRMS yet (REST unavailable)
-      (True,  "REST-fallback") LS offline, REST shows deal present
-      (True,  "DISAGREEMENT")  LS CONFIRMS received but REST still shows deal (REST lag)
-      (False, "LS+REST")       both agree deal is gone
-      (False, "REST-absent")   LS no CONFIRMS but REST shows deal gone (cautious flat)
-      (None,  "unavailable")   both systems failed or no deal_id
+      (True,  "LS-primary")        LS connected, no FULLY_CLOSED → deal open → proceed
+      (True,  "deposit-secondary") LS offline, deposit>0 → margin in use → proceed
+      (False, "LS-confirmed")      LS received FULLY_CLOSED for this deal → suppress
+      (False, "deposit-zero")      LS offline, deposit=0 → flat → suppress
+      (None,  "unavailable")       /accounts failed while LS offline → skip (with escalation)
     """
+    global _guard_consecutive_unavail
+
     if not deal_id:
         return (None, "unavailable")
 
-    # LS: has this specific deal been confirmed FULLY_CLOSED via TRADE stream?
-    # None when LS is offline (can't distinguish "not closed" from "not received").
-    ls_confirmed_closed: Optional[bool] = _ls_deal_closed(deal_id) if _ls_connected else None
+    # ─── PRIMARY: LS CONFIRMS ─────────────────────────────────────────────────
+    if _ls_connected:
+        if _ls_deal_closed(deal_id):
+            # LS received explicit FULLY_CLOSED event for this deal → gone.
+            _guard_consecutive_unavail.pop(deal_id, None)
+            return (False, "LS-confirmed")
+        # Connected + no FULLY_CLOSED seen → deal is open → proceed with close.
+        _guard_consecutive_unavail.pop(deal_id, None)
+        return (True, "LS-primary")
 
-    # REST: is this specific deal_id present in /positions?
-    # /positions (not /positions/otc, which 404s on this account) returns all open deals.
-    rest_deal_open: Optional[bool] = None
-    _pos_data = _ig_live_get("/positions", version="1")
-    if _pos_data is not None:
-        _all_deals = {p.get("position", {}).get("dealId", "")
-                      for p in _pos_data.get("positions", [])}
-        rest_deal_open = deal_id in _all_deals
-
-    # Both systems available
-    if ls_confirmed_closed is not None and rest_deal_open is not None:
-        ls_open   = not ls_confirmed_closed  # True = LS has NOT seen CONFIRMS (deal may be open)
-        rest_open = rest_deal_open
-        if ls_open and rest_open:
-            return (True, "LS+REST")
-        if not ls_open and not rest_open:
-            return (False, "LS+REST")  # both agree this deal is gone
-        if not ls_open and rest_open:
-            # LS CONFIRMS received but REST still shows deal -- transient REST lag.
-            # Treat as open this cycle; _post_dual_verify resolves after close.
+    # ─── SECONDARY: deposit check (LS offline only) ───────────────────────────
+    _dep_chk = _ig_live_get("/accounts", version="1")
+    if _dep_chk is not None:
+        _dep_val = 0.0
+        for _dep_ac in _dep_chk.get("accounts", []):
+            if _dep_ac.get("preferred"):
+                _dep_val = float(_dep_ac.get("balance", {}).get("deposit", 0) or 0)
+                break
+        _guard_consecutive_unavail.pop(deal_id, None)
+        if _dep_val > 0:
             _live_log(
-                f"POSITION GUARD DISAGREEMENT [{sym}]: LS CONFIRMS for {deal_id} "
-                f"received but REST still shows deal open "
-                f"-- treating as OPEN (cautious, REST lag expected)."
+                f"[{sym}] [guard] LS offline, deposit={_dep_val:.2f}>0 "
+                f"→ margin in use → treat as open (deposit-secondary)"
             )
-            return (True, "DISAGREEMENT")
-        # ls_open=True but REST says deal gone -- LS hasn't received CONFIRMS yet.
-        # /positions is the DMA endpoint and does NOT include OTC positions on this account.
-        # A "200 but absent" result here can be a false negative for OTC deals.
-        # Guard: check account deposit before declaring closure. If deposit > 0, this
-        # account still has margin in use -- the OTC deal may simply not appear in
-        # /positions. Return unavailable so the caller skips this cycle instead of
-        # permanently suppressing the sell.
-        _dep_chk = _ig_live_get("/accounts", version="1")
-        if _dep_chk is not None:
-            _dep_val = 0.0
-            for _dep_ac in _dep_chk.get("accounts", []):
-                if _dep_ac.get("preferred"):
-                    _dep_val = float(_dep_ac.get("balance", {}).get("deposit", 0) or 0)
-                    break
-            if _dep_val > 0:
-                _live_log(
-                    f"[{sym}] [guard] LS no CONFIRMS, REST absent from /positions but "
-                    f"deposit={_dep_val:.2f}>0 -- OTC position may not appear in /positions; "
-                    f"treating as unavailable (cautious, not suppressing)"
-                )
-                return (None, "unavailable")
-        _live_log(f"[{sym}] [guard] LS no CONFIRMS yet, REST absent, deposit=0 -- treating as closed")
-        return (False, "REST-absent")
+            return (True, "deposit-secondary")
+        _live_log(
+            f"[{sym}] [guard] LS offline, deposit=0 → flat → suppress close"
+        )
+        return (False, "deposit-zero")
 
-    # LS only (REST unavailable)
-    if ls_confirmed_closed is not None:
-        return (not ls_confirmed_closed, "LS-only")
-
-    # REST only (LS offline)
-    if rest_deal_open is not None:
-        if rest_deal_open:
-            _live_log(f"[{sym}] [guard] LS offline -- deal present in /positions")
-        else:
-            _live_log(f"[{sym}] [guard] LS offline -- deal absent from /positions")
-        return (rest_deal_open, "REST-fallback")
-
+    # /accounts failed while LS also offline → genuinely unavailable.
+    _guard_consecutive_unavail[deal_id] = _guard_consecutive_unavail.get(deal_id, 0) + 1
+    _streak = _guard_consecutive_unavail[deal_id]
+    _live_log(
+        f"[{sym}] [guard] LS offline + /accounts failed — skipping close "
+        f"(unavail_streak={_streak}/{_GUARD_UNAVAIL_ESCALATION_THRESHOLD})"
+    )
+    if _streak >= _GUARD_UNAVAIL_ESCALATION_THRESHOLD:
+        _live_log("=" * 62)
+        _live_log(f"!!! GUARD ESCALATION: {sym} / {deal_id} !!!")
+        _live_log(f"    LS offline + /accounts failed for {_streak} consecutive guard checks.")
+        _live_log(f"    Cannot confirm whether this position is open or closed.")
+        _live_log(f"    ACTION: CHECK IG APP NOW — manual close may be required.")
+        _live_log("=" * 62)
     return (None, "unavailable")
 
 
