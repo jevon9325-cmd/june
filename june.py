@@ -3024,6 +3024,10 @@ _LIVE_PHASE_DROP_PNL         = -0.05  # -5% from phase entry triggers drop-back
 # within the circuit-breaker's daily window under typical conditions (3.5× × 2 = 7% daily). Above they cannot.
 # Self-heals as balance grows: formula lots approach minDeal and ratio naturally drops to ~1×.
 _MINDEAL_OVERSIZE_MAX = 3.5
+_LIVE_SPROUT_MINDEAL_MULT = 4       # Sprout tier: ig_size floor = N × minDeal (12 losses to CB at 15% floor)
+_LIVE_MARGIN_FALLBACKS: dict = {
+    "GOLD": 0.012,  # IG API returns 0% marginFactor (known anomaly); real ~1.2% from deposit observations
+}
 
 # ── Sprout sizing rotation ─────────────────────────────────────────────────────
 _SIM_SIZING_ORDER        = ["fixed_5", "fixed_10", "pct_5", "pct_10"]
@@ -7230,6 +7234,11 @@ def _live_fetch_market_data(sym: str, epic: str) -> bool:
     _live_pip_sizes[sym]  = pip_sz
     _live_price_unit[sym] = price_unit
     _live_margin[sym]     = margin_rate
+    if margin_rate == 0.0:
+        _mf_fb = _LIVE_MARGIN_FALLBACKS.get(sym, 0.0)
+        if _mf_fb > 0.0:
+            _live_margin[sym] = _mf_fb
+            _live_log(f"  {sym} marginFactor=0% from IG API — fallback {_mf_fb:.1%} applied")
     _ms_obj  = deal.get("minNormalStopOrLimitDistance") or {}
     _ms_unit = _ms_obj.get("unit", "POINTS")
     _ms_val  = float(_ms_obj.get("value") or 4.0)
@@ -7830,7 +7839,8 @@ def _live_update_streak(sym: str, direction: str, won: bool) -> None:
 
 # ── Sizing helpers ────────────────────────────────────────────────────────────
 
-def _live_compute_ig_size(sym: str, desired_notional_usd: float, mid_price: float) -> float:
+def _live_compute_ig_size(sym: str, desired_notional_usd: float,
+                           mid_price: float, floor_mult: int = 1) -> float:
     """Convert desired USD notional to IG order size using per-instrument lot sizes.
 
     Formula: ig_size = desired_notional / (lot_sz x mid_price)
@@ -7871,7 +7881,7 @@ def _live_compute_ig_size(sym: str, desired_notional_usd: float, mid_price: floa
         if unit_val <= 0:
             return 0.0
         sized = round(desired_notional_usd / unit_val, 2)
-    return max(min_deal, sized)
+    return max(min_deal * floor_mult, sized)
 
 
 def _live_compute_stop_pts(sym: str, stop_pct: float, mid_price: float = 0.0) -> int:
@@ -8013,7 +8023,13 @@ def _live_open_position(sym: str, direction: str, signals: dict,
         return
 
     notional  = pos_size * leverage
-    ig_size    = _live_compute_ig_size(sym, notional, mid_price)
+    _sprout_floor_mult = _LIVE_SPROUT_MINDEAL_MULT if _live.get("balance", 0.0) < 50.0 else 1
+    ig_size    = _live_compute_ig_size(sym, notional, mid_price, floor_mult=_sprout_floor_mult)
+    if _sprout_floor_mult > 1:
+        _live_log(
+            f"  [SPROUT {_sprout_floor_mult}× FLOOR] {sym}: ig_size={ig_size} lots "
+            f"(floor={_live_min_deal.get(sym, 1.0) * _sprout_floor_mult})"
+        )
     lot_sz     = _live_lot_sizes.get(sym, _LIVE_LOT_SIZE_FX)  # per-instrument lot size
     price_unit = _live_price_unit.get(sym, 1.0)
     if sym in _live_equity_cfd:
