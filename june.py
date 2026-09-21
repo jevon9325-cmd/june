@@ -10584,10 +10584,68 @@ def _live_reconcile_positions() -> None:
             )
             _live["manual_review_required"] = True
         else:
-            _live_log(
-                f"Reconciliation: MISMATCH -- IG has {len(ig_positions)} position(s) "
-                f"(expected {expected_n}), June deal={june_deal} -- manual check needed"
-            )
+            if len(ig_positions) > expected_n:
+                # IG has more open deals than June tracks — recover the untracked ones
+                # as pyramid legs so exit management is immediately active.
+                _untracked = [
+                    p for p in ig_positions
+                    if p.get("position", {}).get("dealId", "") not in all_june_deals
+                ]
+                _recovered_ids = []
+                for _ig_p in _untracked:
+                    _pos_info = _ig_p.get("position", {})
+                    _mkt_info = _ig_p.get("market", {})
+                    _epic2    = _mkt_info.get("epic", "")
+                    _sym2     = {v: k for k, v in INSTRUMENTS.items()}.get(_epic2, _epic2)
+                    _ig_dir2  = _pos_info.get("direction", "BUY")
+                    _dirn2    = "long" if _ig_dir2 == "BUY" else "short"
+                    _ig_sz2   = float(_pos_info.get("size", 0))
+                    _fp2      = float(_pos_info.get("level", 0.0))
+                    _did2     = _pos_info.get("dealId", "")
+                    _dref2    = _pos_info.get("dealReference", "")
+                    _entry2   = time.time()
+                    try:
+                        _cr2 = _pos_info.get("createdDateUTC", "")
+                        if _cr2:
+                            _entry2 = datetime.fromisoformat(_cr2.split(".")[0]).replace(tzinfo=timezone.utc).timestamp()
+                    except Exception:
+                        pass
+                    _lot_sz2   = _live_lot_sizes.get(_sym2, _LIVE_LOT_SIZE_FX)
+                    _notional2 = _ig_sz2 * _lot_sz2 * _fp2 if _fp2 > 0 else 0.0
+                    _leg2 = {
+                        "instrument": _sym2,
+                        "direction":  _dirn2,
+                        "deal_id":    _did2,
+                        "deal_ref":   _dref2,
+                        "fill_price": _fp2,
+                        "ig_size":    _ig_sz2,
+                        "notional":   _notional2,
+                        "stop_pct":   0.0,
+                        "tp_pct":     0.0,
+                        "entry_time": _entry2,
+                        "leg_index":  len(_live.get("pyramid_legs", [])) + len(_recovered_ids) + 1,
+                        "reconciled": True,
+                    }
+                    _live.setdefault("pyramid_legs", []).append(_leg2)
+                    _recovered_ids.append(_did2)
+                    _live_log("=" * 58)
+                    _live_log("*** PYRAMID LEG RECOVERED -- STATE RECONSTRUCTED ***")
+                    _live_log(f"   Instrument : {_sym2} {_ig_dir2}  size={_ig_sz2}  fill={_fp2}")
+                    _live_log(f"   Deal ID    : {_did2}")
+                    _live_log(f"   Root cause : pyramid leg lost across restart (Redis state loss)")
+                    _live_log(f"   Action     : leg appended to pyramid_legs -- exit management ACTIVE")
+                    _live_log(f"   stop/tp    : 0.0 (unknown) -- agg stop will recalculate next cycle")
+                    _live_log("=" * 58)
+                _live_log(
+                    f"Reconciliation: recovered {len(_recovered_ids)} pyramid leg(s) -- "
+                    f"total tracked={1 + len(_live.get('pyramid_legs', []))} "
+                    f"({june_pos['instrument']} {june_pos['direction'].upper()})"
+                )
+            else:
+                _live_log(
+                    f"Reconciliation: MISMATCH -- IG has {len(ig_positions)} position(s) "
+                    f"(expected {expected_n}), June deal={june_deal} -- manual check needed"
+                )
         return
 
     # Critical: IG has position(s) but June state is None
@@ -10644,9 +10702,53 @@ def _live_reconcile_positions() -> None:
         _live_log(f"   *** VERIFY : Check IG app -- confirm position is intentional ***")
         _live_log("=" * 58)
         if len(ig_positions) > 1:
+            _extra_positions = ig_positions[1:]
+            _extra_ids = []
+            for _ig_p2 in _extra_positions:
+                _pos_info2 = _ig_p2.get("position", {})
+                _mkt_info2 = _ig_p2.get("market", {})
+                _epic3     = _mkt_info2.get("epic", "")
+                _sym3      = {v: k for k, v in INSTRUMENTS.items()}.get(_epic3, _epic3)
+                _ig_dir3   = _pos_info2.get("direction", "BUY")
+                _dirn3     = "long" if _ig_dir3 == "BUY" else "short"
+                _ig_sz3    = float(_pos_info2.get("size", 0))
+                _fp3       = float(_pos_info2.get("level", 0.0))
+                _did3      = _pos_info2.get("dealId", "")
+                _dref3     = _pos_info2.get("dealReference", "")
+                _entry3    = time.time()
+                try:
+                    _cr3 = _pos_info2.get("createdDateUTC", "")
+                    if _cr3:
+                        _entry3 = datetime.fromisoformat(_cr3.split(".")[0]).replace(tzinfo=timezone.utc).timestamp()
+                except Exception:
+                    pass
+                _lot_sz3   = _live_lot_sizes.get(_sym3, _LIVE_LOT_SIZE_FX)
+                _notional3 = _ig_sz3 * _lot_sz3 * _fp3 if _fp3 > 0 else 0.0
+                _leg3 = {
+                    "instrument": _sym3,
+                    "direction":  _dirn3,
+                    "deal_id":    _did3,
+                    "deal_ref":   _dref3,
+                    "fill_price": _fp3,
+                    "ig_size":    _ig_sz3,
+                    "notional":   _notional3,
+                    "stop_pct":   0.0,
+                    "tp_pct":     0.0,
+                    "entry_time": _entry3,
+                    "leg_index":  len(_extra_ids) + 1,
+                    "reconciled": True,
+                }
+                _live.setdefault("pyramid_legs", []).append(_leg3)
+                _extra_ids.append(_did3)
+                _live_log("=" * 58)
+                _live_log("*** PYRAMID LEG RECOVERED (ORPHAN CONTEXT) -- STATE RECONSTRUCTED ***")
+                _live_log(f"   Instrument : {_sym3} {_ig_dir3}  size={_ig_sz3}  fill={_fp3}")
+                _live_log(f"   Deal ID    : {_did3}")
+                _live_log(f"   Action     : leg appended to pyramid_legs -- exit management ACTIVE")
+                _live_log("=" * 58)
             _live_log(
-                f"Reconciliation: {len(ig_positions)} IG positions total -- only first "
-                f"(deal={deal_id}) reconstructed. Additional positions need manual management."
+                f"Reconciliation: {len(ig_positions)} IG positions total -- "
+                f"1 primary + {len(_extra_ids)} pyramid leg(s) reconstructed"
             )
         return
 
