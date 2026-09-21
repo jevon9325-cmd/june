@@ -8421,8 +8421,27 @@ def _ls_position_guard_check(sym: str, deal_id: str) -> tuple:
             )
             return (True, "DISAGREEMENT")
         # ls_open=True but REST says deal gone -- LS hasn't received CONFIRMS yet.
-        # REST is ground truth for position existence; treat as closed.
-        _live_log(f"[{sym}] [guard] LS no CONFIRMS yet but REST shows deal absent -- treating as closed")
+        # /positions is the DMA endpoint and does NOT include OTC positions on this account.
+        # A "200 but absent" result here can be a false negative for OTC deals.
+        # Guard: check account deposit before declaring closure. If deposit > 0, this
+        # account still has margin in use -- the OTC deal may simply not appear in
+        # /positions. Return unavailable so the caller skips this cycle instead of
+        # permanently suppressing the sell.
+        _dep_chk = _ig_live_get("/accounts", version="1")
+        if _dep_chk is not None:
+            _dep_val = 0.0
+            for _dep_ac in _dep_chk.get("accounts", []):
+                if _dep_ac.get("preferred"):
+                    _dep_val = float(_dep_ac.get("balance", {}).get("deposit", 0) or 0)
+                    break
+            if _dep_val > 0:
+                _live_log(
+                    f"[{sym}] [guard] LS no CONFIRMS, REST absent from /positions but "
+                    f"deposit={_dep_val:.2f}>0 -- OTC position may not appear in /positions; "
+                    f"treating as unavailable (cautious, not suppressing)"
+                )
+                return (None, "unavailable")
+        _live_log(f"[{sym}] [guard] LS no CONFIRMS yet, REST absent, deposit=0 -- treating as closed")
         return (False, "REST-absent")
 
     # LS only (REST unavailable)
