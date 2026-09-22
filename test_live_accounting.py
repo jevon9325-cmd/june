@@ -38,6 +38,7 @@ def close_harness(direction="long", symbol="GOLD"):
               _IG_EQUITY_COMMISSION_USD=9., _LIVE_PHASE_GATE_BAL=200.,
               _LIVE_DEF_INSTR_STOPOUTS=1, _sim_combo_key=lambda s, d: s + "_" + d)
     for name in ("_live_log", "_live_save_state", "_live_reconcile_positions",
+                 "_live_capture_evidence", "_live_capture_active",
                  "_live_update_streak", "_live_write_htf_event", "_live_perf_record",
                  "_sim_15m_record", "_live_check_phase"):
         ns[name] = Mock()

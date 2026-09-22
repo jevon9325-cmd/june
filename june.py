@@ -47,6 +47,8 @@ import threading
 import requests
 import redis as redis_lib
 from broker_identity import opening_evidence, response_account_evidence
+from broker_capture import EvidenceCapture
+from broker_pending import PendingCloseStore
 
 # ── Environment ─────────────────────────────────────────────────────────────
 IG_BASE    = "https://demo-api.ig.com/gateway/deal"
@@ -2856,6 +2858,7 @@ def poll_cycle() -> bool:
     # Live trading step (real orders gated behind june_live_enabled kill switch)
     if _live:
         run_live_step(signals)
+        _live_replay_evidence()  # bounded accounting retry AFTER risk management
 
     # Log summary
     alert_tag = f"  🚨 ALERTS → {alerts}" if alerts else ""
@@ -6734,7 +6737,47 @@ def _htf_self_calibrate():
 
 # ── Redis persistence ─────────────────────────────────────────────────────────
 
+_live_evidence_journal = None
+
+
+def _live_evidence_capture():
+    """Lazy local journal; constructing it performs no broker/Redis writes."""
+    global _live_evidence_journal
+    if _live_evidence_journal is None:
+        _live_evidence_journal = EvidenceCapture(
+            os.environ.get("JUNE_EVIDENCE_PATH", os.path.join(os.path.dirname(__file__), ".broker-evidence.sqlite3")),
+            lambda account: PendingCloseStore(_redis(), account), _live_log)
+    return _live_evidence_journal
+
+
+def _live_capture_evidence(position, event, **details) -> None:
+    """Accounting must never become a gate on an existing protective action."""
+    if not position:
+        return
+    try:
+        _live_evidence_capture().capture(
+            position, event, session_account=_live_sess.get("account_id"),
+            current_role="add_on" if "leg_index" in position else "primary", details=details)
+    except Exception as exc:
+        # Last-resort guard for initialization/unexpected capture failures.
+        import logging
+        logging.critical("EVIDENCE UNRESOLVED: capture failed (%s); protective action continues", type(exc).__name__)
+
+
+def _live_capture_active(event) -> None:
+    for position in [_live.get("open_position"), *list(_live.get("pyramid_legs", []))]:
+        _live_capture_evidence(position, event)
+
+
+def _live_replay_evidence() -> None:
+    try:
+        _live_evidence_capture().replay(limit=10)
+    except Exception as exc:
+        _live_log(f"EVIDENCE REPLAY PENDING: {type(exc).__name__}; no reconciliation claimed")
+
+
 def _live_save_state() -> None:
+    _live_capture_active("state_snapshot")
     try:
         _redis().set(_LIVE_REDIS_KEY, json.dumps(_live), ex=_LIVE_REDIS_TTL)
     except Exception as _e:
@@ -6748,7 +6791,9 @@ def _live_load_state() -> bool:
     try:
         raw = _redis().get(_LIVE_REDIS_KEY)
         if raw:
+            _live_capture_active("before_state_load")
             _live.update(json.loads(raw))
+            _live_capture_active("state_loaded")
             return True
     except Exception:
         pass
@@ -8272,6 +8317,7 @@ def _live_open_position(sym: str, direction: str, signals: dict,
                 f"⚠️  open_position: {sym} — broker stop NOT in IG confirm "
                 f"(sent {stop_dist}pts, stopLevel absent); polling-only exits active"
             )
+    _live_capture_active("before_primary_replace")
     _live["open_position"] = {
         "instrument":   sym,
         "direction":    direction,
@@ -8300,6 +8346,7 @@ def _live_open_position(sym: str, direction: str, signals: dict,
     _live["open_position"]["broker_entry_evidence"] = _live_entry_evidence(
         sym, "primary", order_body, resp, confirm,
         {"entry_time": _live["open_position"]["entry_time"], "conviction": conviction})
+    _live_capture_evidence(_live["open_position"], "accepted_opening")
     _live["total_trades"]    = _live.get("total_trades", 0) + 1
     _live_log(
         f"✅ LIVE POSITION OPENED: {sym} {ig_direction} @ {fill_price:.5f} "
@@ -8594,6 +8641,7 @@ def _live_close_position(exit_reason: str, signals: dict) -> None:
             )
             return
         if not _guard_open:
+            _live_capture_evidence(pos, "position_absence_observed", observation_source=_guard_src, expected_exit_reason=exit_reason)
             _live_log(
                 f"⚠️  {sym}: position already gone [{_guard_src}] — "
                 f"suppressed. Reconciling."
@@ -8654,13 +8702,16 @@ def _live_close_position(exit_reason: str, signals: dict) -> None:
         "currencyCode":   "USD",         # required by IG v1 API — absent field treated as null → HTTP 400
         "dealId":         deal_id,
     }
+    _live_capture_evidence(pos, "close_intent", order=close_body, expected_exit_reason=exit_reason, local_request_time=time.time())
     resp = _ig_live_post("/positions/otc", close_body, version="1")
+    _live_capture_evidence(pos, "close_response", response=resp, expected_exit_reason=exit_reason)
     if not resp:
         _live_log(f"close_position: POST failed for {sym} — position may still be open")
         return
 
     deal_ref = resp.get("dealReference", "")
     confirm  = _live_confirm_deal(deal_ref) if deal_ref else None
+    _live_capture_evidence(pos, "close_confirmation_observed", response=resp, confirmation=confirm, expected_exit_reason=exit_reason)
 
     if confirm and confirm.get("dealStatus") == "ACCEPTED":
         real_exit  = float(confirm.get("level", exit_px))
@@ -8869,7 +8920,9 @@ def _live_close_position(exit_reason: str, signals: dict) -> None:
                             f"| promoting addon to primary "
                             f"| fill={_a_fill} broker_stop={_agg_stop}"
                         )
+                        _live_capture_active("before_primary_promotion")
                         _live["open_position"]          = _promoted
+                        _live_capture_active("before_addon_tracking_replace")
                         _live["pyramid_legs"]           = []
                         _live["pyramid_agg_stop_level"] = None
                         _live_save_state()
@@ -8988,6 +9041,7 @@ def _live_close_position(exit_reason: str, signals: dict) -> None:
         _live_save_state()
         return  # intentionally NOT clearing open_position
 
+    _live_capture_active("before_primary_clear")
     _live["open_position"] = None
     _live_save_state()
 
@@ -9073,6 +9127,7 @@ def _live_partial_tp_exit(signals: dict) -> None:
             )
             return
         if not _ptp_guard_open:
+            _live_capture_evidence(pos, "position_absence_observed", observation_source=_ptp_guard_src)
             _live_log(
                 f"⚠️  {sym}: partial TP — position already gone [{_ptp_guard_src}] — "
                 f"suppressed. Reconciling."
@@ -9095,7 +9150,9 @@ def _live_partial_tp_exit(signals: dict) -> None:
         "currencyCode":  "USD",
         "dealId":        deal_id,
     }
+    _live_capture_evidence(pos, "close_intent", order=close_body, expected_exit_reason="partial_take_profit", local_request_time=time.time())
     resp = _ig_live_post("/positions/otc", close_body, version="1")
+    _live_capture_evidence(pos, "close_response", response=resp, expected_exit_reason="partial_take_profit")
     if not resp:
         _live_log(f"partial_tp: POST failed for {sym} — falling back to full close")
         _live_close_position("take_profit", signals)
@@ -9103,6 +9160,7 @@ def _live_partial_tp_exit(signals: dict) -> None:
 
     deal_ref = resp.get("dealReference", "")
     confirm  = _live_confirm_deal(deal_ref) if deal_ref else None
+    _live_capture_evidence(pos, "close_confirmation_observed", response=resp, confirmation=confirm, expected_exit_reason="partial_take_profit")
 
     if confirm and confirm.get("dealStatus") == "ACCEPTED":
         real_exit    = float(confirm.get("level", exit_px))
@@ -9135,6 +9193,7 @@ def _live_partial_tp_exit(signals: dict) -> None:
                     f"⚠️  PARTIAL-TP POST-VERIFY: {sym} — IG flat after partial "
                     f"close (position fully gone). Clearing state."
                 )
+                _live_capture_active("before_primary_clear")
                 _live["open_position"] = None
                 _live_save_state()
                 return
@@ -9149,6 +9208,7 @@ def _live_partial_tp_exit(signals: dict) -> None:
                     f"⚠️  PARTIAL-TP POST-VERIFY: {sym} — IG flat after partial "
                     f"close (position fully gone). Clearing state."
                 )
+                _live_capture_active("before_primary_clear")
                 _live["open_position"] = None
                 _live_save_state()
                 return
@@ -9184,6 +9244,7 @@ def _live_partial_tp_exit(signals: dict) -> None:
             # Single position with matching dealId confirmed — proceed with update
 
         remaining_sz = round(ig_sz - half_sz, 4)
+        _live_capture_active("before_partial_quantity_change")
         _live["open_position"].setdefault("original_ig_size", ig_sz)
         _live["open_position"].setdefault("original_notional", pos.get("notional", partial_notional * ig_sz / half_sz))
         _live["open_position"]["notional"] = pos.get("notional", partial_notional * ig_sz / half_sz) * remaining_sz / ig_sz
@@ -9615,7 +9676,9 @@ def _live_close_addon_leg(leg: dict, exit_reason: str, signals: dict) -> None:
             _live_log(f"[PYRAMID] {sym}: both LS and /accounts unavailable -- preserving addon")
             return
         if not _g_open:
+            _live_capture_evidence(leg, "position_absence_observed", observation_source=_g_src, expected_exit_reason=exit_reason)
             _live_log(f"[PYRAMID] {sym}: addon already gone [{_g_src}] -- clearing tracking")
+            _live_capture_active("before_addon_tracking_replace")
             _live["pyramid_legs"] = [l for l in _live.get("pyramid_legs", [])
                                      if l.get("deal_id") != deal_id]
             if not _live.get("pyramid_legs"):
@@ -9635,12 +9698,15 @@ def _live_close_addon_leg(leg: dict, exit_reason: str, signals: dict) -> None:
         "dealId":         deal_id,
     }
     _addon_margin_pre = _ls_get_margin()  # orphan guard: capture before sending close
+    _live_capture_evidence(leg, "close_intent", order=close_body, expected_exit_reason=exit_reason, local_request_time=time.time())
     resp = _ig_live_post("/positions/otc", close_body, version="1")
+    _live_capture_evidence(leg, "close_response", response=resp, expected_exit_reason=exit_reason)
     if not resp:
         _live_log(f"[PYRAMID] {sym}: addon close POST failed -- state preserved")
         return
     deal_ref = resp.get("dealReference", "")
     confirm  = _live_confirm_deal(deal_ref) if deal_ref else None
+    _live_capture_evidence(leg, "close_confirmation_observed", response=resp, confirmation=confirm, expected_exit_reason=exit_reason)
     if confirm and confirm.get("dealStatus") == "ACCEPTED":
         real_exit  = float(confirm.get("level", mid))
         real_pnl_p = (real_exit - fill_px) / fill_px if dirn == "long" else (fill_px - real_exit) / fill_px
@@ -9648,6 +9714,7 @@ def _live_close_addon_leg(leg: dict, exit_reason: str, signals: dict) -> None:
             f"✅ PYRAMID LEG CLOSED: {sym} @ {real_exit:.5f} "
             f"({real_pnl_p*100:+.3f}%) | {exit_reason}"
         )
+        _live_capture_active("before_addon_tracking_replace")
         _live["pyramid_legs"] = [l for l in _live.get("pyramid_legs", [])
                                   if l.get("deal_id") != deal_id]
         if not _live.get("pyramid_legs"):
@@ -9729,7 +9796,9 @@ def _live_check_pyramid_exits(signals: dict) -> None:
 
         # LS broker-stop detection (proactive, same pattern as _live_check_exit)
         if deal_id and _ls_deal_closed(deal_id):
+            _live_capture_evidence(leg, "position_absence_observed", observation_source="LS.FULLY_CLOSED")
             _live_log(f"[LS] PYRAMID leg {leg_idx}: FULLY_CLOSED by broker -- clearing")
+            _live_capture_active("before_addon_tracking_replace")
             _live["pyramid_legs"] = [l for l in _live["pyramid_legs"]
                                      if l.get("deal_id") != deal_id]
             if not _live["pyramid_legs"]:
@@ -10004,6 +10073,7 @@ def _live_add_pyramid_leg(signals: dict) -> None:
     leg["broker_entry_evidence"] = _live_entry_evidence(
         sym, "add_on", body, resp, confirm,
         {"entry_time": leg["entry_time"], "leg_index": leg_index, "parent_deal_id": primary.get("deal_id")})
+    _live_capture_evidence(leg, "accepted_opening")
     _live.setdefault("pyramid_legs", []).append(leg)
     _live["pyramid_agg_stop_level"] = agg_stop_level
 
@@ -10660,6 +10730,7 @@ def run_live_step(signals: dict) -> None:
     # Belt-and-suspenders: stale addon legs without a primary position
     if _live.get("pyramid_legs"):
         _live_log("⚠️ STALE PYRAMID LEGS: no primary position -- clearing")
+        _live_capture_active("before_addon_tracking_replace")
         _live["pyramid_legs"] = []
         _live["pyramid_agg_stop_level"] = None
         _live_save_state()
@@ -10699,6 +10770,7 @@ def _live_reconcile_positions() -> None:
     #           is immediately active from the next cycle.
     #   Stale:  June state says open but IG shows nothing. Clears it.
     data = _ig_live_get("/positions/otc", version="1")  # 404 → None → skip, not clear
+    _evidence_positions_response = data  # retain raw response before a local margin-proxy inference
     if data is None:
         # /positions/otc returned 404 or failed. Use account balance to disambiguate:
         # deposit=0 means no margin in use -> genuinely flat (treat as empty list).
@@ -10813,6 +10885,7 @@ def _live_reconcile_positions() -> None:
                         "leg_index":  len(_live.get("pyramid_legs", [])) + len(_recovered_ids) + 1,
                         "reconciled": True,
                     }
+                    _live_capture_evidence(_leg2, "broker_recovered_addon", broker_position=_ig_p)
                     _live.setdefault("pyramid_legs", []).append(_leg2)
                     _recovered_ids.append(_did2)
                     _live_log("=" * 58)
@@ -10860,6 +10933,7 @@ def _live_reconcile_positions() -> None:
         notional = ig_size * lot_sz * fill_price if fill_price > 0 else 0.0
         hold_min = (time.time() - entry_time) / 60.0
 
+        _live_capture_active("before_primary_replace")
         _live["open_position"] = {
             "instrument":       sym,
             "direction":        direction,
@@ -10879,6 +10953,7 @@ def _live_reconcile_positions() -> None:
             "reconciled":       True,
         }
         _live_log("=" * 58)
+        _live_capture_evidence(_live.get("open_position"), "broker_recovered_primary", broker_position=ig_p)
         _live_log("*** ORPHAN POSITION DETECTED -- STATE RECONSTRUCTED ***")
         _live_log(f"   Instrument : {sym} {ig_dir}  size={ig_size}  fill={fill_price}")
         _live_log(f"   Deal ID    : {deal_id}")
@@ -10925,6 +11000,7 @@ def _live_reconcile_positions() -> None:
                     "leg_index":  len(_extra_ids) + 1,
                     "reconciled": True,
                 }
+                _live_capture_evidence(_leg3, "broker_recovered_addon", broker_position=_ig_p2)
                 _live.setdefault("pyramid_legs", []).append(_leg3)
                 _extra_ids.append(_did3)
                 _live_log("=" * 58)
@@ -10941,6 +11017,7 @@ def _live_reconcile_positions() -> None:
 
     # Stale: June state has position but IG shows nothing
     if not ig_positions and june_pos:
+        _live_capture_evidence(june_pos, "position_absence_observed", observation_source="reconciliation.flat_check", broker_positions_response=_evidence_positions_response, margin_proxy_response=locals().get("_recon_bal"))
         sym     = june_pos.get("instrument", "?")
         deal_id = june_pos.get("deal_id", "?")
         _live_log("=" * 58)
@@ -10950,6 +11027,7 @@ def _live_reconcile_positions() -> None:
         _live_log(f"   Action    : open_position cleared -- June is now flat")
         _live_log(f"   Likely    : position closed in IG app or before this restart")
         _live_log("=" * 58)
+        _live_capture_active("before_primary_clear")
         _live["open_position"] = None
         _live.pop("manual_review_required", None)  # cascade fully resolved — unblock closes
 

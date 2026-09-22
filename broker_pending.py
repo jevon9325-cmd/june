@@ -1,6 +1,7 @@
 """Durable pending evidence and atomic projections, using an injected Redis client.
 
-Not wired into June yet. No network client is constructed here. All journal
+June forwards pending capture only; history/projections remain unwired.
+No network client is constructed here. All journal
 fields share one account-scoped hash, without TTL. WATCH + one HSET commits
 evidence, realization ownership and delivery state together. Redis persistence
 itself is an operational prerequisite; this protects application restarts and

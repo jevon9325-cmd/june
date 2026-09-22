@@ -1,5 +1,20 @@
 # Broker-truth repair checkpoint and continuation
 
+## Approved integration continuation (2026-09-22)
+
+The active development checkout is now `june-broker-truth-integration`, branch
+`integration/broker-truth-main-20260922`. Pinned-main merge commit `5084f69`
+combines b892271 and 55f4196; integration-only 108 tests and three SOYBEANS
+probes passed before reconstructing C2b-2. The original interrupted repair
+checkout and preservation artifacts remain untouched.
+
+See [C2B_INTEGRATION_REPORT.md](C2B_INTEGRATION_REPORT.md) for the reconstruction,
+new storage/crash tests, lifecycle re-audit, final verification and separate
+PRODUCTION SAFETY FOLLOW-UP. The day-start credit treatment is an unresolved
+risk-accounting policy question, not a Redis correction authorized here.
+No production access/modification, deploy, restart, push or orders in this task.
+Stop after verified C2b-2; C2c/D/E are not authorized by this continuation.
+
 ## C2b work: verified start and pre-change lifecycle trace (2026-09-22)
 
 Authority: attachment `b6d073b9-0da9-445e-9126-13afc9ecff2f/pasted-text.txt`.
@@ -70,6 +85,118 @@ direct lookup and incremental enumeration. All 26 targeted tests passed.
 Full relevant offline suite passed 108 tests; all Python sources compiled.
 Full diff, caller/key searches and whitespace/stat/status review passed. C2b-1
 does not change june.py, strategy constants, sizing, exit policy or order bodies.
+
+### C2b-2 runtime capture and protective-exit recovery
+
+C2b-1 committed as `b8922714cebc8508d58c42ed98dcd6832d5b164a`.
+Added `broker_capture.EvidenceCapture`, using the Python-standard SQLite driver.
+Default local path is `.broker-evidence.sqlite3` beside june.py (ignored by git),
+overridable with `JUNE_EVIDENCE_PATH`. No directory is automatically created.
+POSIX creation mode is 0600; Windows follows directory ACLs. No production file
+has been created or dependency installed by this work.
+
+SQLite rollback-journal commits use `synchronous=EXTRA`, a 100ms lock wait,
+immutable content-hashed evidence and a first-observation UTC timestamp. A commit
+must return before the corresponding destructive statement executes. Local
+capture normally performs no Redis round trip. State-save snapshots are deduped
+by content; no in-memory-only success cache can mask a missing disk record.
+The pending index is `(forwarded)` with rowid order: replay retrieves at most ten
+oldest pending rows, independently of already forwarded history. No records are
+deleted, expired or compacted, including forwarded and quarantined rows.
+
+Failure policy, in order:
+1. Commit locally. Redis can be offline without affecting this durable copy.
+2. If local commit fails, emit `EVIDENCE STORAGE FAILURE` and try the independent
+   account-scoped PendingCloseStore. This fallback uses the existing Redis
+   connection/socket timeouts (5 seconds); it can add latency but is not a gate
+   on the broker action. Local disk I/O itself has no hard wall-clock guarantee.
+3. If neither sink acknowledges durability, retain the detached immutable event
+   in an unbounded RAM retry dictionary and emit `EVIDENCE UNRESOLVED` with the
+   raw, token-free snapshot for forensic recovery. Protective trading execution
+   continues through the existing guards. Do not report reconciliation success.
+   A crash during this simultaneous failure can lose the RAM evidence; no system
+   can promise durable capture when all durable sinks are unavailable. Existing
+   older captures/broker history/journals may assist recovery, not prove it.
+4. After `run_live_step` returns, bounded replay retries RAM->disk (or recovered
+   Redis if disk remains unavailable), then disk->Redis.
+   The forwarded marker is set only after Redis success. Lost acknowledgement
+   causes replay of the identical event, which PendingCloseStore deduplicates.
+   Replay never sends broker requests, restores a position as active, registers
+   June ownership, reconciles P&L or calls learning consumers.
+
+Only matching original opening order/confirmation account evidence and deal ID
+permit routing into the account-scoped journal. A current session ID is retained
+as an observation, never substituted for missing opening provenance. Legacy,
+manual/recovered and conflicting positions remain durable local quarantine
+(`forwarded=-1`, NOT completion), pending C2c identity recovery. Quarantine rows
+do not block verified rows; they are never removed. Account-change observations
+do not rewrite the opening account or the original add_on role.
+
+Capture coverage (all calls are observational; existing statements remain):
+- primary and partial close intents before POST, raw POST responses including
+  failure, and raw confirmation responses before economic estimates/learning;
+- guard/LS/reconciliation absence observations, without guessed price/cost/reason;
+- every primary clear/replace, both partial-flat branches, partial quantity basis;
+- add-on guard/confirmed/LS removal and stale-list removal;
+- primary/add-on snapshots before promotion, original add-on provenance retained;
+- accepted opening snapshots, reconstructed positions/raw broker responses;
+- current position snapshots before active Redis SET, before load replacement,
+  and after state load, independent of successful active-blob persistence.
+
+`close_intent` is intent, not proof that POST reached IG. `close_response` and
+`close_confirmation_observed` retain raw responses, not broker-history economics.
+`before_*` events describe impending local mutation, not proven absence.
+`position_absence_observed` describes the existing guard's observation. In the
+zero-margin reconciliation fallback, raw positions response remains None and
+the accounts proxy is recorded separately; no synthetic empty response is
+presented as broker evidence. Exact broker final-exit chronology remains C2c/d.
+
+No lifecycle clear/removal/quantity/promotion path identified in the pre-edit
+trace is left without a capture hook. Remaining limits: legacy missing fields
+remain missing; broker receipt arriving just before process death may not itself
+be captured (pre-request evidence still survives); accepted-entry-before-first-
+capture crash gaps require broker discovery in C2c/d; complete disk/Redis loss
+cannot guarantee recovery. Existing protective guards and stale-addon clearing
+policy are unchanged, even where they have known limitations.
+Malformed/non-finite snapshots are retained as explicit raw-representation
+quarantine rather than discarded because strict JSON serialization failed.
+They cannot be used as canonical economic facts without later validation.
+
+No Stage D exposure correction: the known roughly $173.57 actual vs $18.21
+retained add-on notional defect remains. Captures preserve that local value as
+an estimate alongside available original broker metadata. No Stage E consumer
+integration, historical migration, retention, strategy or order-payload change.
+
+Failure-injection matrix: actual functions are AST-extracted, never live-imported.
+
+| Failure window | Expected recovery/result tested |
+| --- | --- |
+| Before close capture | Previously persisted opening/state snapshot survives; no close sent |
+| Immediately after capture | Pending intent survives; no close sent |
+| After broker request, before response capture | Original position + intent survive; request result ambiguous |
+| At confirmation delivery / after confirmation capture | Pending request survives missing receipt, or full raw receipt survives; neither proves net P&L |
+| Immediately before clear | Snapshot survives; active state still present |
+| Immediately after clear, before state save | Local evidence survives independent of active-state blob |
+| Restart with pending evidence | SQLite rows reload and idempotently forward; no fabricated completion |
+| Redis failure before write | Disk evidence remains pending for retry |
+| Redis/local acknowledgement lost after commit | Retry preserves one immutable event |
+| Duplicate capture | One content identity; no outcome is emitted by capture |
+| Promotion while primary pending / crash after promotion | Both original deal identities survive; promoted role remains add_on |
+| Partial close then crash | Original quantity/notional and raw receipt survive mutation |
+
+Additional tests cover disk->Redis fallback; both sinks failing while an actual
+extracted protective-close function still sends its unchanged order and clears;
+unknown/mismatched identities; mutable-snapshot detachment; add-on guard/accepted
+removal; LS removal; stale-list clear; both partial-flat branches; broker-flat
+reconciliation; Redis-save failure and load overwrite. Existing C1 tests prove
+atomic fixture projection deduplication, not Stage E production delivery.
+
+AST review: removing ONLY new evidence calls/helpers/imports and the raw-response
+metadata assignment restores the exact C2a AST. Thus all pre-existing constants,
+function signatures, conditions, order payload construction, sizing and entry/
+exit policies are unchanged. June remains CRLF. Existing identity/accounting
+harnesses gained only mocks for the new hooks; dedicated new tests execute the
+real hooks with temporary SQLite and fakeredis.
 
 ## Authority and restrictions
 

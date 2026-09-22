@@ -45,6 +45,7 @@ def runtime():
           "IG_LIVE_BASE": "https://fixture.invalid", "IG_LIVE_KEY": "fixture-key",
           "IG_LIVE_USER": "fixture-user", "IG_LIVE_PASS": "fixture-password",
           "_ensure_live_session": Mock(return_value=True), "_live_log": Mock(),
+          "_live_capture_active": Mock(),
           "_ts": lambda: "fixture", "_ls_init_session": Mock(),
           "response_account_evidence": response_account_evidence,
           "opening_evidence": opening_evidence, "_live_broker_market_evidence": {},

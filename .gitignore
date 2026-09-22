@@ -5,3 +5,4 @@ __pycache__/
 june.env
 *.log
 .DS_Store
+.broker-evidence.sqlite3*
