@@ -9055,6 +9055,10 @@ def _live_partial_tp_exit(signals: dict) -> None:
     if not pos:
         return
 
+    if pos.get("partial_exit_pending"):
+        _live_log("Partial TP outcome unresolved; retaining position and awaiting reconciliation")
+        return
+
     sym     = pos["instrument"]
     dirn    = pos["direction"]
     ig_sz   = pos["ig_size"]
@@ -9139,17 +9143,25 @@ def _live_partial_tp_exit(signals: dict) -> None:
         "dealId":        deal_id,
     }
     _live_capture_evidence(pos, "close_intent", order=close_body, expected_exit_reason="partial_take_profit", local_request_time=time.time())
+    _live["open_position"]["partial_exit_pending"] = {
+        "requested_size": half_sz, "original_size": ig_sz,
+        "status": "request_pending", "requested_at": time.time(),
+    }
+    _live_save_state()
     resp = _ig_live_post("/positions/otc", close_body, version="1", close=True)
     _live_capture_evidence(pos, "close_response", response=resp, expected_exit_reason="partial_take_profit")
     if not resp:
-        _live_log(f"partial_tp: POST failed for {sym} — falling back to full close")
-        _live_close_position("take_profit", signals)
+        _live_log(f"partial_tp: response unavailable for {sym}; outcome unknown, state preserved")
         return
 
     deal_ref = resp.get("dealReference", "")
     confirm  = _live_confirm_deal(deal_ref) if deal_ref else None
     _live_capture_evidence(pos, "close_confirmation_observed", response=resp, confirmation=confirm, expected_exit_reason="partial_take_profit")
 
+    _live["open_position"]["partial_exit_pending"].update(
+        deal_reference=deal_ref, confirmation=confirm,
+        status=(confirm or {}).get("dealStatus", "unknown"))
+    _live_save_state()
     if confirm and confirm.get("dealStatus") == "ACCEPTED":
         real_exit    = float(confirm.get("level", exit_px))
         real_pnl_p   = (
@@ -9162,77 +9174,43 @@ def _live_partial_tp_exit(signals: dict) -> None:
         # Mirror of sim: _sim["open_position"]["stop_pct"] = _spread_flr
         _spread_flr = _sim_get_spread_floor(sym)
 
-        # Post-confirm: verify IG shows a remaining position before updating
-        # internal state. Catches broker-stop race on the partial close — same
-        # class as the post-close verification in _live_close_position (ddb7de5).
-        # Without this, a race leaves June managing a ghost half-position.
+        # Acceptance is not proof of a partial fill. Require this deal's residual
+        # quantity; unavailable/malformed/stale evidence cannot erase tracking.
         time.sleep(2)
         _ptp_post = _ig_live_get("/positions", version="2")
-        if _ptp_post is None:
-            _ptp_bd  = _ig_live_get("/accounts", version="1")
-            _ptp_dep = 0.0
-            if _ptp_bd is not None:
-                for _ptp_ac in _ptp_bd.get("accounts", []):
-                    if _ptp_ac.get("preferred"):
-                        _ptp_dep = float(_ptp_ac.get("balance", {}).get("deposit", 0) or 0)
-                        break
-            if _ptp_dep == 0.0:
-                _live_log(
-                    f"⚠️  PARTIAL-TP POST-VERIFY: {sym} — IG flat after partial "
-                    f"close (position fully gone). Clearing state."
-                )
-                _live_capture_active("before_primary_clear")
-                _live["open_position"] = None
-                _live_save_state()
-                return
-            _live_log(
-                f"⚠️  PARTIAL-TP POST-VERIFY: {sym} — /positions/otc unavailable "
-                f"(deposit={_ptp_dep:.2f}>0). Proceeding with state update."
-            )
-        else:
-            _ptp_ig_pos = _ptp_post.get("positions", [])
-            if not _ptp_ig_pos:
-                _live_log(
-                    f"⚠️  PARTIAL-TP POST-VERIFY: {sym} — IG flat after partial "
-                    f"close (position fully gone). Clearing state."
-                )
-                _live_capture_active("before_primary_clear")
-                _live["open_position"] = None
-                _live_save_state()
-                return
-            if len(_ptp_ig_pos) > 1:
-                _live_log(
-                    f"⚠️  PARTIAL-TP POST-VERIFY: {sym} — {len(_ptp_ig_pos)} IG "
-                    f"positions after partial close. Running reconciliation."
-                )
-                _live_reconcile_positions()
-                _live_save_state()
-                return
-            _ptp_ig_deal = _ptp_ig_pos[0].get("position", {}).get("dealId", "")
-            if _ptp_ig_deal and _ptp_ig_deal != deal_id:
-                _live_log(
-                    f"⚠️  PARTIAL-TP POST-VERIFY: {sym} — unexpected dealId "
-                    f"{_ptp_ig_deal} after partial close (expected {deal_id}). "
-                    f"Running reconciliation."
-                )
-                _live_reconcile_positions()
-                # Orphan guard: unexpected dealId means the partial-TP close order
-                # may have opened a new opposite position (original already stopped
-                # by broker before the close fired — same class as SILVER incident).
-                _ptp_orphan_margin = _ls_get_margin()
-                if _ptp_orphan_margin is not None and _ptp_orphan_margin > 0.0:
-                    _live_log(
-                        f"🚨 PARTIAL-TP ORPHAN: LS ACCT MARGIN={_ptp_orphan_margin:.2f} after "
-                        f"{sym} partial close — close order opened a new position "
-                        f"(original already stopped by broker). manual_review_required=True"
-                    )
-                    _live["manual_review_required"] = True
-                _live_save_state()
-                return
-            # Single position with matching dealId confirmed — proceed with update
+        _ptp_rows = _ptp_post.get("positions") if isinstance(_ptp_post, dict) else None
+        _ptp_valid = isinstance(_ptp_rows, list) and all(
+            isinstance(row, dict) and isinstance(row.get("position"), dict)
+            and row["position"].get("dealId") for row in _ptp_rows)
+        _live_capture_evidence(pos, "partial_residual_observed",
+                               broker_positions_response=_ptp_post, confirmation=confirm)
+        if not _ptp_valid:
+            _live_log(f"Partial TP {sym}: broker inventory unavailable; residual tracking preserved")
+            _live_save_state()
+            return
+        _ptp_matches = [row["position"] for row in _ptp_rows
+                        if row["position"]["dealId"] == deal_id]
+        if not _ptp_matches:
+            _live_capture_evidence(pos, "position_absence_observed",
+                                   broker_positions_response=_ptp_post)
+            _live_capture_active("before_primary_clear")
+            _live["open_position"] = None
+            _live_save_state()
+            return
+        _expected_remaining = round(ig_sz - half_sz, 4)
+        try:
+            _observed_remaining = float(_ptp_matches[0]["size"])
+        except (KeyError, TypeError, ValueError):
+            _observed_remaining = None
+        if (len(_ptp_matches) != 1 or _observed_remaining is None
+                or not abs(_observed_remaining - _expected_remaining) <= 0.00001):
+            _live_log(f"Partial TP {sym}: residual quantity unconfirmed; retaining pre-close basis")
+            _live_save_state()
+            return
 
         remaining_sz = round(ig_sz - half_sz, 4)
         _live_capture_active("before_partial_quantity_change")
+        _live["open_position"].pop("partial_exit_pending", None)
         _live["open_position"].setdefault("original_ig_size", ig_sz)
         _live["open_position"].setdefault("original_notional", pos.get("notional", partial_notional * ig_sz / half_sz))
         _live["open_position"]["notional"] = pos.get("notional", partial_notional * ig_sz / half_sz) * remaining_sz / ig_sz
@@ -9288,8 +9266,10 @@ def _live_partial_tp_exit(signals: dict) -> None:
             )
         _live_save_state()
     else:
-        _live_log(f"partial_tp: confirm failed for {sym} — falling back to full close")
-        _live_close_position("take_profit", signals)
+        if confirm and confirm.get("dealStatus") == "REJECTED":
+            _live["open_position"].pop("partial_exit_pending", None)
+        _live_log(f"partial_tp: no accepted partial confirmation for {sym}; state preserved")
+        _live_save_state()
 
 
 # ── Exit checks (Part 5 — mirrors _sim_check_exit) ───────────────────────────

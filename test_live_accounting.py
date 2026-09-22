@@ -7,11 +7,12 @@ from pathlib import Path
 from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock
+from test_broker_identity import TREE
 
 
 def close_harness(direction="long", symbol="GOLD"):
     wanted = {"_live_close_position", "_live_partial_tp_exit"}
-    tree = ast.parse(Path(__file__).with_name("june.py").read_text(encoding="utf-8"))
+    tree = TREE  # reuse parsed source; each test still executes the actual function
     functions = [n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name in wanted]
     assert {n.name for n in functions} == wanted
     pos = dict(instrument=symbol, direction=direction, ig_size=10., fill_price=100.,
@@ -30,7 +31,7 @@ def close_harness(direction="long", symbol="GOLD"):
               _ls_get_margin=Mock(return_value=1.), _ls_connected=False,
               _ig_live_post=Mock(return_value={"dealReference": "fixture-close"}),
               _ig_live_put=Mock(return_value={"dealReference": "fixture-stop"}),
-              _ig_live_get=Mock(return_value={"positions": [{"position": {"dealId": "fixture-deal"}}]}),
+              _ig_live_get=Mock(return_value={"positions": [{"position": {"dealId": "fixture-deal", "size": 5.}}]}),
               _live_confirm_deal=Mock(return_value={"dealStatus": "ACCEPTED", "level": 102.}),
               _sim_get_spread_floor=Mock(return_value=.001),
               _redis=Mock(return_value=redis), _LIVE_TRADE_HIST_KEY="fixture-history",
@@ -98,6 +99,7 @@ class LiveAccountingTests(unittest.TestCase):
     def test_multiple_partials_accumulate_without_losing_original_basis(self):
         ns = close_harness()
         self.partial(ns, 102.)
+        ns["_ig_live_get"].return_value = {"positions": [{"position": {"dealId": "fixture-deal", "size": 2.5}}]}
         self.partial(ns, 104.)
         pos = ns["_live"]["open_position"]
         self.assertEqual((pos["ig_size"], pos["notional"]), (2.5, 250.))
@@ -135,7 +137,7 @@ class LiveAccountingTests(unittest.TestCase):
         ns["_live_confirm_deal"].return_value = {"dealStatus": "REJECTED"}
         ns["_live_partial_tp_exit"]({"GOLD": {"price": 102.}})
         self.assertEqual(ns["_live"], original)
-        ns["_live_close_position"].assert_called_once_with("take_profit", {"GOLD": {"price": 102.}})
+        ns["_live_close_position"].assert_not_called()
 
     def test_minimum_deal_fallback_unchanged(self):
         ns = close_harness()

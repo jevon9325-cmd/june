@@ -117,13 +117,14 @@ raise AssertionError('Crash boundary was not reached')
         self.assertEqual({r['forwarded'] for r in rows}, {-1, 1})
         self.assertTrue(all(r['first_observed_utc'].startswith('2000-') for r in rows))
 
-    def test_extra_failed_partial_verification_preserves_basis_and_receipt_before_clear(self):
+    def test_extra_failed_partial_verification_preserves_live_basis_and_receipt(self):
         ns = self.runtime()
         ns['_ig_live_get'].return_value = None  # both inventory and accounts unavailable
         ns['_live_partial_tp_exit']({'GOLD': {'price': 102.}})
-        self.assertIsNone(ns['_live']['open_position'])  # existing policy deliberately unchanged
+        self.assertEqual(ns['_live']['open_position']['ig_size'], 10.)
+        self.assertTrue(ns['_live']['open_position']['partial_exit_pending'])
         rows = self.rows()
-        basis = next(r for r in rows if r['event'] == 'before_primary_clear')
+        basis = next(r for r in rows if r['event'] == 'partial_residual_observed')
         self.assertEqual((basis['position']['ig_size'], basis['position']['notional']), (10., 1000.))
         receipt = next(r for r in rows if r['event'] == 'close_confirmation_observed')
         self.assertEqual(receipt['details']['confirmation']['dealStatus'], 'ACCEPTED')

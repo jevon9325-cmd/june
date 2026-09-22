@@ -12,6 +12,7 @@ from broker_capture import EvidenceCapture
 from broker_pending import PendingCloseStore
 from test_broker_pending import FaultClient
 from test_live_accounting import close_harness
+from test_broker_identity import TREE
 
 
 class Crash(BaseException):
@@ -27,7 +28,7 @@ def provenance(deal='fixture-deal', role='primary'):
 
 
 def extract(names, ns):
-    tree = ast.parse(Path(__file__).with_name('june.py').read_text(encoding='utf-8'))
+    tree = TREE  # immutable source snapshot for this offline test process
     functions = [n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name in names]
     assert {f.name for f in functions} == set(names)
     exec(compile(ast.Module(body=functions, type_ignores=[]), 'actual_june_lifecycle', 'exec'), ns)
@@ -222,7 +223,10 @@ class RuntimeTests(CaptureTests):
 
     def test_runtime_partial_then_crash_retains_original_basis_and_receipt(self):
         ns = self.runtime()
-        ns['_live_save_state'] = Mock(side_effect=Crash())
+        def crash_after_reduction():
+            if ns['_live']['open_position']['ig_size'] == 5:
+                raise Crash()
+        ns['_live_save_state'] = Mock(side_effect=crash_after_reduction)
         with self.assertRaises(Crash):
             ns['_live_partial_tp_exit']({'GOLD': {'price': 102}})
         self.assertEqual(ns['_live']['open_position']['ig_size'], 5)
@@ -321,9 +325,13 @@ class RuntimeTests(CaptureTests):
                 {'accounts': [{'preferred': True, 'balance': {'deposit': 0}}]}
                 if path == '/accounts' else None if proxy else {'positions': []})
             ns['_live_partial_tp_exit']({'GOLD': {'price': 102}})
-            self.assertIsNone(ns['_live']['open_position'])
-            self.assertTrue(any(r['event'] == 'before_primary_clear' and
-                                r['position']['ig_size'] == 10 for r in self.rows()))
+            if proxy:
+                self.assertEqual(ns['_live']['open_position']['ig_size'], 10)
+                self.assertTrue(ns['_live']['open_position']['partial_exit_pending'])
+            else:
+                self.assertIsNone(ns['_live']['open_position'])
+                self.assertTrue(any(r['event'] == 'before_primary_clear' and
+                                    r['position']['ig_size'] == 10 for r in self.rows()))
 
     def test_runtime_margin_proxy_is_not_fabricated_broker_position_response(self):
         ns = self.runtime()
