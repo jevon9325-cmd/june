@@ -46,6 +46,7 @@ from typing import Optional
 import threading
 import requests
 import redis as redis_lib
+from broker_identity import opening_evidence, response_account_evidence
 
 # ── Environment ─────────────────────────────────────────────────────────────
 IG_BASE    = "https://demo-api.ig.com/gateway/deal"
@@ -427,6 +428,7 @@ _THREE_WAY_GROUPS = [
 # IG session
 _sess: dict      = {"cst": None, "token": None, "born": 0.0}
 _live_sess: dict = {"cst": None, "token": None, "born": 0.0}
+_live_broker_market_evidence: dict = {}  # raw broker units only; never sizing input
 _live_available: bool = False  # True after successful live account auth
 
 # ── Lightstreamer Phase 1 state ───────────────────────────────────────────────
@@ -720,6 +722,8 @@ def authenticate_live() -> bool:
             _live_sess["born"]  = time.time()
             _live_available = True
             acct_id   = data.get("currentAccountId", "?")
+            _live_sess["account_id"] = data.get("currentAccountId")
+            _live_sess["account_currency"] = data.get("currencyIsoCode")
             # Lightstreamer: start ACCOUNT+TRADE subscriptions
             _ls_ep = data.get("lightstreamerEndpoint", "")
             if _ls_ep and acct_id and acct_id != "?":
@@ -788,7 +792,10 @@ def _ig_live_get(path: str, params: Optional[dict] = None, version: str = "1", n
             hdrs["X-SECURITY-TOKEN"] = _live_sess["token"]
             r = requests.get(url, headers=hdrs, params=params, timeout=10)
         if r.status_code == 200:
-            return r.json()
+            result = r.json()
+            if path.startswith("/confirms/") and isinstance(result, dict):
+                result["_june_account_evidence"] = response_account_evidence(_live_sess, hdrs)
+            return result
         if r.status_code == 429:
             _live_api_paused_until = time.time() + 60.0
             print(f"[{_ts()}] ⚠️  LIVE GET 429 rate-limit -- API paused 60s", flush=True)
@@ -6832,7 +6839,10 @@ def _ig_live_post(path: str, body: dict, version: str = "2") -> Optional[dict]:
             hdrs["X-SECURITY-TOKEN"] = _live_sess["token"]
             r = requests.post(url, headers=hdrs, json=body, timeout=15)
         if r.status_code in (200, 201):
-            return r.json()
+            result = r.json()
+            if path == "/positions/otc" and isinstance(result, dict):
+                result["_june_account_evidence"] = response_account_evidence(_live_sess, hdrs)
+            return result
         _live_log(f"POST {path}: HTTP {r.status_code} {r.text[:120]}")
         return None
     except Exception as exc:
@@ -7218,6 +7228,11 @@ def _live_fetch_market_data(sym: str, epic: str) -> bool:
     if not data:
         return False
     inst     = data.get("instrument", {})
+    _live_broker_market_evidence[sym] = {
+        "source": "IG.markets.instrument", "epic": epic,
+        "fields": {key: inst.get(key) for key in ("name", "epic", "type", "lotSize",
+                   "contractSize", "unit", "onePipMeans", "valueOfOnePip", "currencies")},
+    }
     deal     = data.get("dealingRules", {})
     lot_sz   = float(inst.get("lotSize") or 1.0)
     min_obj  = deal.get("minDealSize") or {}
@@ -8010,6 +8025,18 @@ def _live_confirm_deal(deal_ref: str, retries: int = 4) -> Optional[dict]:
 
 # ── Order placement (Part 5) — gated behind _live_trade_guard() ──────────────
 
+def _live_entry_evidence(sym, role, order, response, confirm, local=None):
+    """Retain broker receipt without changing trading on accounting failure."""
+    try:
+        return opening_evidence(sym, role, order, response, confirm,
+                                _live_broker_market_evidence.get(sym), local)
+    except Exception as exc:
+        _live_log(f"ENTRY EVIDENCE PENDING: {sym} {role}: {type(exc).__name__}")
+        return {"identity_status": "capture_error", "role": role,
+                "deal_id": confirm.get("dealId"), "deal_reference": response.get("dealReference"),
+                "accepted_confirmation": dict(confirm), "submitted_order": dict(order)}
+
+
 def _live_open_position(sym: str, direction: str, signals: dict,
                         pos_size: float, leverage: int, conviction: int,
                         stop_mult: float = 1.0, htf_bias: str = "unknown") -> None:
@@ -8260,6 +8287,9 @@ def _live_open_position(sym: str, direction: str, signals: dict,
         "persistence_confirmed": _last_cycle_direction.get(sym) == ("bull" if direction == "long" else "bear"),
         "htf_bias":     htf_bias,  # observation-only; never gates or conviction
     }
+    _live["open_position"]["broker_entry_evidence"] = _live_entry_evidence(
+        sym, "primary", order_body, resp, confirm,
+        {"entry_time": _live["open_position"]["entry_time"], "conviction": conviction})
     _live["total_trades"]    = _live.get("total_trades", 0) + 1
     _live_log(
         f"✅ LIVE POSITION OPENED: {sym} {ig_direction} @ {fill_price:.5f} "
@@ -8821,6 +8851,7 @@ def _live_close_position(exit_reason: str, signals: dict) -> None:
                             "persistence_confirmed": False,
                             "htf_bias":           None,
                             "_pyramid_promoted":  True,
+                            "broker_entry_evidence": _addon_leg.get("broker_entry_evidence"),
                         }
                         _live_log(
                             f"[PYRAMID PROMOTE] {sym}: primary {_pv_deal_id} FULLY_CLOSED "
@@ -9960,6 +9991,9 @@ def _live_add_pyramid_leg(signals: dict) -> None:
         "entry_time": time.time(),
         "leg_index":  leg_index,
     }
+    leg["broker_entry_evidence"] = _live_entry_evidence(
+        sym, "add_on", body, resp, confirm,
+        {"entry_time": leg["entry_time"], "leg_index": leg_index, "parent_deal_id": primary.get("deal_id")})
     _live.setdefault("pyramid_legs", []).append(leg)
     _live["pyramid_agg_stop_level"] = agg_stop_level
 

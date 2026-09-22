@@ -233,6 +233,105 @@ The repair is incomplete. C1 modules have no callers in june.py, and do not
 improve production coverage yet. No existing adaptive consumer is newly trusted.
 No push/deployment/restart/broker action/production Redis write occurred.
 
+## Stage C2a: runtime entry receipts and account provenance
+
+User continuation authority is attachment
+`59c9b11a-0112-4941-8458-cc427685d0d0/pasted-text.txt`. It separates C2 evidence
+generation from Stage E learning integration and requires stopping after C2.
+Reverified repository/origin (credential-free URL), branch, clean C1 HEAD
+`e6bfb9368ab2fa46edf7b4febae564a512937be6`, checkpoint, repair commits and all
+88 baseline tests before edits. No discrepancy. Backup: `.git/june.py.before-c2a`.
+
+New `broker_identity.response_account_evidence` compares request tokens with
+the authenticated session, retaining account ID/currency but never tokens.
+Changed/missing account context stays unverified. `opening_evidence` separates
+submitted orders and local context from broker confirmation size/level/receipt.
+It never substitutes local entry_time, requested size or estimated fill for
+missing broker fields. Raw market unit fields are retained without conversion
+or default values; this stage does not calculate actual notional from them.
+
+Runtime changes (existing signatures unchanged):
+- `authenticate_live`: retain actual currentAccountId/currencyIsoCode, no guessed
+  account or USD currency in the evidence fields.
+- `_ig_live_get`: add `_june_account_evidence` only to successful /confirms replies.
+- `_ig_live_post`: add that field only to successful /positions/otc replies.
+- `_live_fetch_market_data`: retain raw instrument unit fields by symbol/epic in
+  a separate evidence cache, never read by sizing or stop logic.
+- New `_live_entry_evidence`: isolate evidence formatting errors from trading;
+  return explicit capture_error with raw receipt/order instead of raising.
+- `_live_open_position`, `_live_add_pyramid_leg`: attach broker_entry_evidence
+  with role primary/add_on and local identifiers before existing state save.
+- `_live_close_position`: promotion copies the add-on evidence unchanged,
+  preserving add_on origin. No other close behavior changed.
+
+API evidence: https://labs.ig.com/reference/confirms-deal-reference.html calls
+`date` a transaction date; it does not establish exact position opening UTC.
+https://labs.ig.com/reference/positions-deal-id.html v2 exposes createdDateUTC,
+instrumentName, contractSize, currency and size. No new broker read was executed.
+C2a therefore deliberately leaves broker_opened_utc unknown. Even timezone-aware
+confirm dates are confirmation_utc only. Identity remains pending_broker_opening
+or unverified_entry until the next stage obtains exact broker opening identity.
+Market names still need verification against transaction instrument names.
+
+All five POST callers and all five `_live_confirm_deal` callers retain their
+existing keys/behavior; the added response key is not sent back to the broker.
+Other GET responses are unchanged. New position metadata is additive; existing
+history/learning projections do not read it. Cross-sister runtime code was not
+modified. AST scope audit found exactly the seven existing functions above plus
+the new helper; all previous function signatures/module constants/order payload
+construction were unchanged. Existing June CRLF bytes were preserved.
+
+Sixteen new offline tests cover token-free attribution, unknown/changing account,
+401 reauthentication, concurrent session change, no timestamp/size/price guessing,
+receipt mismatch, raw unit/role preservation, formatting failure, actual entry
+annotation statements, existing save/load round-trip and promotion construction.
+Tests execute extracted actual wrappers/helpers/metadata statements, not a live
+bot import. They do not claim full entry-to-close crash recovery coverage.
+Compile checks and all 104 offline tests passed (88 baseline plus 16 identity).
+The final metadata-only test import cleanup was also compiled and retested.
+Diff whitespace/stat/full inspection, caller/reference and AST scope checks passed.
+
+### Scale measurement before pending-store runtime integration
+
+Local fakeredis measurement used generated ~1,367-byte journal records, then one
+PendingCloseStore.capture update. 100 records: 136,700 payload bytes, 7.3 ms;
+1,000: 1,367,000 bytes, 89.6 ms; 5,000: 6,835,000 bytes, 711.9 ms. These are local
+emulator timings, not production latency estimates. The important result is that
+C1 HGETALL/deserialization/deepcopy scales with ALL retained history per update.
+This is an unbounded-cost problem and must be corrected BEFORE wiring that store
+into runtime. Prefer targeted hash-field reads/claims under the existing atomic
+transaction, with incremental pending enumeration. Do not delete unresolved
+evidence or historical ownership/dedup markers to hide the growth. No pruning,
+retention change or Redis redesign was introduced in C2a.
+
+### Exact C2b continuation and unresolved failure windows
+
+The new receipt currently persists only through the EXISTING `_live_save_state`
+Redis blob. Its failures are logged, not durably queued; a subsequent clear can
+still lose evidence. C2a does NOT satisfy the pre-clear durability invariant.
+Do not claim otherwise. PendingCloseStore/history worker remain unwired.
+
+Before adding lifecycle capture, correct the full-hash update cost above. Then
+establish a durable fallback/retry path for Redis outage that does not suppress
+protective exits. Trace every destructive path, including:
+- normal full close final clear and primary/add-on promotion;
+- `_live_partial_tp_exit` both broker-flat early clears and residual mutation;
+- `_live_close_addon_leg` pre-guard removal and confirmed-close removal;
+- `_live_check_pyramid_exits` broker-closed leg removal;
+- `run_live_step` stale pyramid-leg clear;
+- `_live_reconcile_positions` stale clear and orphan/recovered replacements;
+- `_live_save_state`, `_live_load_state`, startup/default initialization.
+Retain original primary evidence before promotion, independently from the add-on.
+Current orphan recovery must not manufacture June ownership for manual positions.
+
+C2c must enrich exact identity and connect account-pinned history/cost handling.
+C2d must test the user's twelve failure cases against actual runtime lifecycle
+functions, plus delayed/out-of-order confirmation metadata for Stage E. Needed
+ordering fields include exact broker final exit UTC, trade identity and separate
+observation/reconciliation times; arrival order must not become trade chronology.
+Chronology integration/test work is NOT completed by C2a. Do not wire adaptive
+consumers or proceed automatically into Stage E after completing C2.
+
 ## Offline checks and continuation
 
 Run in this repository:
@@ -240,8 +339,8 @@ Run in this repository:
 ```
 # PowerShell; local emulator dependency must be readable:
 $env:PYTHONPATH = (Join-Path (Get-Location) '.git/test-deps')
-python -m py_compile broker_ledger.py broker_history.py broker_pending.py test_broker_pending.py test_broker_ledger.py test_live_accounting.py june.py
-python -m unittest -q test_broker_pending test_live_accounting test_broker_ledger test_risk_safety
+python -m py_compile broker_identity.py test_broker_identity.py broker_ledger.py broker_history.py broker_pending.py test_broker_pending.py test_broker_ledger.py test_live_accounting.py june.py
+python -m unittest -q test_broker_identity test_broker_pending test_live_accounting test_broker_ledger test_risk_safety
 git diff --check
 git diff --stat
 git diff
@@ -249,7 +348,7 @@ git status --short
 ```
 
 Inspect `git log` for completed stage commits and current HEAD. Recheck status
-before editing. Resume with C2's integration steps above. Stages A/B/C1 do NOT
+before editing. Resume with C2b's integration steps above. Stages A/B/C1/C2a do NOT
 repair live coverage or make existing learning data broker-truth. Not deployed;
 production remains unchanged. At every stopping point include the user's exact
 CHATGPT HANDOFF structure directly in the response, self-contained and preferably
