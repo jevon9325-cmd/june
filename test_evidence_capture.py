@@ -204,7 +204,7 @@ class RuntimeTests(CaptureTests):
                 if point in ('after_confirmation', 'before_clear', 'after_clear'):
                     expected.add('close_confirmation_observed')
                 if point in ('before_clear', 'after_clear'):
-                    expected.add('before_primary_clear')
+                    expected.update({'before_primary_clear', 'full_close_outcome_observed'})
                 self.assertEqual(events, expected)
                 self.assertEqual(ns['_ig_live_post'].call_count,
                                  0 if point in ('before_capture', 'after_capture') else 1)
@@ -294,7 +294,7 @@ class RuntimeTests(CaptureTests):
         self.assertIsNone(ns['_live']['open_position'])
         self.assertTrue(any(r['event'] == 'before_state_load' for r in self.rows()))
 
-    def test_runtime_ls_addon_removal_and_stale_list_clear(self):
+    def test_runtime_ls_addon_removal_and_unresolved_addon_retention(self):
         ns = self.runtime()
         extract({'_live_check_pyramid_exits', 'run_live_step'}, ns)
         leg = deepcopy(ns['_live']['open_position'])
@@ -310,13 +310,13 @@ class RuntimeTests(CaptureTests):
         ns['_current_cycle_signals_snap'] = {}
         for name in ('_live_poll_balance', '_live_poll_pnl', '_live_check_skim',
                      '_live_publish_eligible_instruments', '_live_check_circuit_breaker',
-                     '_live_update_defensive_mode'):
+                     '_live_update_defensive_mode', '_live_close_all_addon_legs'):
             ns[name] = Mock()
         ns['_redis']().get.return_value = None
         ns['run_live_step']({'GOLD': {'price': 100}})
-        self.assertEqual(ns['_live']['pyramid_legs'], [])
-        self.assertTrue(any(r['deal_id'] == 'addon-deal' and
-                            r['event'] == 'before_addon_tracking_replace' for r in self.rows()))
+        self.assertEqual(ns['_live']['pyramid_legs'], [leg])
+        ns['_live_close_all_addon_legs'].assert_called_once()
+        ns['_live_check_circuit_breaker'].assert_not_called()
 
     def test_runtime_partial_flat_branches_preserve_basis(self):
         for proxy in (False, True):
@@ -333,16 +333,15 @@ class RuntimeTests(CaptureTests):
                 self.assertTrue(any(r['event'] == 'before_primary_clear' and
                                     r['position']['ig_size'] == 10 for r in self.rows()))
 
-    def test_runtime_margin_proxy_is_not_fabricated_broker_position_response(self):
+    def test_runtime_unavailable_inventory_is_not_fabricated_flat_evidence(self):
         ns = self.runtime()
         extract({'_live_reconcile_positions'}, ns)
-        ns['_ig_live_get'] = lambda path, **kw: (
-            {'accounts': [{'preferred': True, 'balance': {'deposit': 0}}]}
-            if path == '/accounts' else None)
+        ns['_ig_live_get'].return_value = None
         ns['_live_reconcile_positions']()
-        observed = next(r for r in self.rows() if r['event'] == 'position_absence_observed')
-        self.assertIsNone(observed['details']['broker_positions_response'])
-        self.assertIsNotNone(observed['details']['margin_proxy_response'])
+        self.assertEqual(ns['_live']['open_position']['ig_size'], 10)
+        self.assertTrue(ns['_live']['orphan_suspected'])
+        self.assertTrue(any(r['event'] == 'inventory_unavailable' for r in self.rows()))
+        self.assertFalse(any(r['event'] == 'position_absence_observed' for r in self.rows()))
 
 
 def load_tests(loader, tests, pattern):

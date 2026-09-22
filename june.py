@@ -8507,100 +8507,31 @@ def _ls_deal_closed(deal_id: str) -> bool:
 
 
 def _ls_position_guard_check(sym: str, deal_id: str) -> tuple:
-    """Pre-send guard: confirm THIS SPECIFIC DEAL still open before sending close.
-
-    Signal hierarchy — LS-PRIMARY, deposit-SECONDARY:
-
-    1. LS CONFIRMS (primary, when _ls_connected):
-       IG pushes a real-time snapshot of recent FULLY_CLOSED events on every new
-       LS session. If we are connected and have NOT received FULLY_CLOSED for this
-       deal, the deal is open. If we HAVE received FULLY_CLOSED, it is gone.
-       /positions (DMA endpoint) is REMOVED — it never lists OTC positions on this
-       account and carries zero discriminating power for OTC deal detection.
-
-    2. Deposit check (secondary, only when LS offline):
-       /accounts -> preferred.balance.deposit.
-       deposit>0 → margin in use → treat as open.
-       deposit=0 → flat account → suppress.
-       /accounts failure → (None, "unavailable") + escalation counter.
-
-    Return codes:
-      (True,  "LS-primary")        LS connected, no FULLY_CLOSED → deal open → proceed
-      (True,  "deposit-secondary") LS offline, deposit>0 → margin in use → proceed
-      (False, "LS-confirmed")      LS received FULLY_CLOSED for this deal → suppress
-      (False, "deposit-zero")      LS offline, deposit=0 → flat → suppress
-      (None,  "unavailable")       /accounts failed while LS offline → skip (with escalation)
-    """
-    global _guard_consecutive_unavail
-
+    """Deal-specific presence/absence. Account margin is not lifecycle evidence."""
     if not deal_id:
+        return (None, "missing-deal-id")
+    if _ls_connected and _ls_deal_closed(deal_id):
+        return (False, "LS-confirmed")
+    data = _ig_live_get("/positions", version="2")
+    rows = data.get("positions") if isinstance(data, dict) else None
+    valid = isinstance(rows, list) and all(
+        isinstance(row, dict) and isinstance(row.get("position"), dict)
+        and isinstance(row["position"].get("dealId"), str)
+        and row["position"]["dealId"] for row in rows)
+    if not valid:
+        _live_log(f"{sym}: deal inventory unavailable; position state UNKNOWN")
         return (None, "unavailable")
-
-    # ─── PRIMARY: LS CONFIRMS ─────────────────────────────────────────────────
-    if _ls_connected:
-        if _ls_deal_closed(deal_id):
-            # LS received explicit FULLY_CLOSED event for this deal → gone.
-            _guard_consecutive_unavail.pop(deal_id, None)
-            return (False, "LS-confirmed")
-        # Cross-check: IG broker-stop events send FULLY_CLOSED with a NEW dealId
-        # (not the original open dealId). _ls_deal_closed() misses these.
-        # On this single-position account, MARGIN=0 means account is flat —
-        # the position was stopped by IG before this close scan fired.
-        _grd_margin = _ls_get_margin()
-        if _grd_margin is not None and _grd_margin == 0.0:
-            _live_log(
-                f"[{sym}] [guard] LS ACCT MARGIN=0 with no FULLY_CLOSED for {deal_id} "
-                f"\u2192 broker-stop detected (IG stop-close uses different dealId). Suppressing."
-            )
-            _guard_consecutive_unavail.pop(deal_id, None)
-            return (False, "LS-margin-zero")
-        # Connected + no FULLY_CLOSED seen + margin>0 → deal open → proceed.
-        _guard_consecutive_unavail.pop(deal_id, None)
-        return (True, "LS-primary")
-
-    # ─── SECONDARY: deposit check (LS offline only) ───────────────────────────
-    _dep_chk = _ig_live_get("/accounts", version="1")
-    if _dep_chk is not None:
-        _dep_val = 0.0
-        for _dep_ac in _dep_chk.get("accounts", []):
-            if _dep_ac.get("preferred"):
-                _dep_val = float(_dep_ac.get("balance", {}).get("deposit", 0) or 0)
-                break
-        _guard_consecutive_unavail.pop(deal_id, None)
-        if _dep_val > 0:
-            _live_log(
-                f"[{sym}] [guard] LS offline, deposit={_dep_val:.2f}>0 "
-                f"→ margin in use → treat as open (deposit-secondary)"
-            )
-            return (True, "deposit-secondary")
-        _live_log(
-            f"[{sym}] [guard] LS offline, deposit=0 → flat → suppress close"
-        )
-        return (False, "deposit-zero")
-
-    # /accounts failed while LS also offline → genuinely unavailable.
-    _guard_consecutive_unavail[deal_id] = _guard_consecutive_unavail.get(deal_id, 0) + 1
-    _streak = _guard_consecutive_unavail[deal_id]
-    _live_log(
-        f"[{sym}] [guard] LS offline + /accounts failed — skipping close "
-        f"(unavail_streak={_streak}/{_GUARD_UNAVAIL_ESCALATION_THRESHOLD})"
-    )
-    if _streak >= _GUARD_UNAVAIL_ESCALATION_THRESHOLD:
-        _live_log("=" * 62)
-        _live_log(f"!!! GUARD ESCALATION: {sym} / {deal_id} !!!")
-        _live_log(f"    LS offline + /accounts failed for {_streak} consecutive guard checks.")
-        _live_log(f"    Cannot confirm whether this position is open or closed.")
-        _live_log(f"    ACTION: CHECK IG APP NOW — manual close may be required.")
-        _live_log("=" * 62)
-    return (None, "unavailable")
+    return (any(row["position"]["dealId"] == deal_id for row in rows), "REST-deal")
 
 
 def _live_close_position(exit_reason: str, signals: dict) -> None:
-    """Close the current live position via an opposing IG market order.
+    """Close the current live position with a deal-specific IG DELETE.
 
-    STRUCTURALLY GATED: _live_trade_guard() is the first call. With switch OFF,
+    STRUCTURALLY GATED: _live_trade_guard() gates every order. With switch OFF,
     logs WOULD-SELL and returns without placing any order.
     """
+    if (_live.get("open_position") or {}).get("partial_exit_pending"):
+        _live_reconcile_positions()  # refresh residual size before a protective full close
     pos = (_live.get("open_position") or {}).copy()
     if not pos:
         return
@@ -8634,28 +8565,14 @@ def _live_close_position(exit_reason: str, signals: dict) -> None:
     if not _live_trade_guard():  # ← structural gate
         return
 
-    # Pre-send guard: deposit via /accounts is the sole reliable signal on this
-    # IG live account. GET /positions/otc and GET /positions/otc/{dealId} return 404
-    # regardless of position state — confirmed by live diagnostic 2026-08-27.
-    # manual_review_required blocks subsequent close attempts when post-close
-    # verification detected an anomaly (cascade protection — see race-condition trace).
+    # Suppress only on deal-specific closure evidence; DELETE cannot open a new deal.
     if deal_id:
-        if _live.get("manual_review_required"):
-            _live_log(
-                f"⚠️  {sym}: manual_review_required flag set — close blocked pending "
-                f"reconciliation (cascade protection). No orders until IG flat confirmed."
-            )
-            return
         _guard_open, _guard_src = _ls_position_guard_check(sym, deal_id)
         if _guard_src == "DISAGREEMENT":
             return  # manual_review_required already set inside _ls_position_guard_check
         if _guard_open is None:
-            _live_log(
-                f"⚠️  {sym}: both LS and /accounts unavailable before close — "
-                f"preserving state (cautious)."
-            )
-            return
-        if not _guard_open:
+            _live_log(f"{sym}: inventory unavailable; attempting protective deal-specific DELETE")
+        if _guard_open is False:
             _live_capture_evidence(pos, "position_absence_observed", observation_source=_guard_src, expected_exit_reason=exit_reason)
             _live_log(
                 f"⚠️  {sym}: position already gone [{_guard_src}] — "
@@ -8724,6 +8641,23 @@ def _live_close_position(exit_reason: str, signals: dict) -> None:
     _live_capture_evidence(pos, "close_confirmation_observed", response=resp, confirmation=confirm, expected_exit_reason=exit_reason)
 
     if confirm and confirm.get("dealStatus") == "ACCEPTED":
+        _close_inventory = _ig_live_get("/positions", version="2")
+        _close_rows = _close_inventory.get("positions") if isinstance(_close_inventory, dict) else None
+        _close_valid = isinstance(_close_rows, list) and all(
+            isinstance(row, dict) and isinstance(row.get("position"), dict)
+            and row["position"].get("dealId") for row in _close_rows)
+        _close_confirmed = any(isinstance(item, dict) and item.get("dealId") == deal_id
+                               and item.get("status") == "FULLY_CLOSED"
+                               for item in confirm.get("affectedDeals") or [])
+        _close_stream = _ls_connected and _ls_deal_closed(deal_id)
+        _close_absent = _close_valid and not any(row["position"]["dealId"] == deal_id for row in _close_rows)
+        _live_capture_evidence(pos, "full_close_outcome_observed",
+                               broker_positions_response=_close_inventory, confirmation=confirm)
+        if not (_close_confirmed or _close_stream or _close_absent):
+            _live["manual_review_required"] = True
+            _live_log(f"{sym}: close accepted but disappearance unconfirmed; tracking preserved")
+            _live_save_state()
+            return
         real_exit  = float(confirm.get("level", exit_px))
         real_pnl_p = (real_exit - fill_px) / fill_px if dirn == "long" else \
                      (fill_px - real_exit) / fill_px
@@ -8854,9 +8788,6 @@ def _live_close_position(exit_reason: str, signals: dict) -> None:
         return  # open_position set by reconciliation; entry guard blocks new trades if still open
 
     # Post-close verification: confirm IG is actually flat before clearing state.
-    # /positions/otc returns 404 for BOTH "genuinely flat" AND "transitional state
-    # with orphan position" — indistinguishable on 404 alone. Use account balance
-    # as discriminator: deposit=0 means no margin in use → genuinely flat.
     time.sleep(2)  # initial wait for IG to settle
     _VERIFY_MAX    = 3
     _post_resolved = False  # True only when flat is confirmed
@@ -8875,13 +8806,16 @@ def _live_close_position(exit_reason: str, signals: dict) -> None:
         Returns True=flat confirmed, False=blocked (promotion or unresolvable), None=retry.
         """
         _ls_cl   = _ls_deal_closed(_pv_deal_id) if (_pv_deal_id and _ls_connected) else False
-        _ls_ok   = _ls_connected  # LS is reliable only when actively connected
-        _ls_flat = _ls_ok and _ls_cl  # LS confirms THIS deal specifically closed
+        _ls_ok   = _ls_connected or _close_confirmed
+        _ls_flat = _close_confirmed or (_ls_ok and _ls_cl)  # LS confirms THIS deal specifically closed
 
         # REST: per-deal check via /positions (not /positions/otc which 404s on this account)
-        _rs_data    = _ig_live_get("/positions", version="2")
-        _rs_ok      = _rs_data is not None
-        _rs_all_pos = _rs_data.get("positions", []) if _rs_ok else []
+        _rs_data    = _close_inventory if _vi_n == 1 else _ig_live_get("/positions", version="2")
+        _rs_rows = _rs_data.get("positions") if isinstance(_rs_data, dict) else None
+        _rs_ok = isinstance(_rs_rows, list) and all(
+            isinstance(row, dict) and isinstance(row.get("position"), dict)
+            and row["position"].get("dealId") for row in _rs_rows)
+        _rs_all_pos = _rs_rows if _rs_ok else []
         _rs_deals   = {p.get("position", {}).get("dealId", "") for p in _rs_all_pos}
         _rs_flat    = (_pv_deal_id not in _rs_deals) if (_rs_ok and _pv_deal_id) else (not _rs_ok)
 
@@ -8954,7 +8888,7 @@ def _live_close_position(exit_reason: str, signals: dict) -> None:
             if _ls_flat and not _rs_flat:
                 # LS received explicit FULLY_CLOSED for this deal.
                 # REST still shows the deal -- OTC cache lag is expected on this account type
-                # (/positions/otc always returns 404; /positions DMA is secondary).
+                # A matching FULLY_CLOSED event is specific to the original deal.
                 # LS-primary: consistent with guard rebuild. Treat LS as authoritative.
                 _live_log(
                     f"✅ POST-CLOSE VERIFY {_vi_n}/{_VERIFY_MAX}: "
@@ -8968,18 +8902,6 @@ def _live_close_position(exit_reason: str, signals: dict) -> None:
                 f"✅ POST-CLOSE VERIFY {_vi_n}/{_VERIFY_MAX}: "
                 f"REST-only: deal {_pv_deal_id} absent from /positions for {sym}"
             )
-            # Orphan guard: if close order landed on an already-stopped position,
-            # IG opens a new opposite position instead. Catch it via LS ACCT MARGIN.
-            _pv_margin_chk = _ls_get_margin()
-            if _pv_margin_chk is not None and _pv_margin_chk > 0.0:
-                _live_log(
-                    f"🚨 POST-CLOSE ORPHAN: LS ACCT MARGIN={_pv_margin_chk:.2f} after "
-                    f"{sym} close — close order opened a new position "
-                    f"(original already stopped by broker). manual_review_required=True"
-                )
-                _live["manual_review_required"] = True
-                _live_save_state()
-                return False
             return True
         if _ls_ok:
             # REST unavailable -- LS only
@@ -9020,22 +8942,21 @@ def _live_close_position(exit_reason: str, signals: dict) -> None:
             return  # promotion or unresolved state handled by verifier
 
     if not _post_resolved:
-        # All retries exhausted AND balance showed deposit>0 on each attempt.
-        # Fail safe: preserve open_position and block new entries.
-        # manual_review_required prevents subsequent exit checks from sending new
-        # close orders with a stale dealId (which would extend a cascade).
-        # Flag is cleared by _live_reconcile_positions() when deposit=0 confirms flat.
+        # Preserve tracking and entry caution; protective deal DELETE remains available.
         _live["manual_review_required"] = True
         _live_log(
             f"\U0001f6a8 POST-CLOSE VERIFICATION FAILED: could not confirm IG flat after "
             f"{_VERIFY_MAX} attempts for {sym} \u2014 open_position PRESERVED. "
-            f"manual_review_required=True — all closes blocked until reconcile confirms flat."
+            f"manual_review_required=True — entry caution retained; protective closes remain available."
         )
         _live_save_state()
         return  # intentionally NOT clearing open_position
 
     _live_capture_active("before_primary_clear")
     _live["open_position"] = None
+    if _close_valid and not _close_rows:
+        _live.pop("manual_review_required", None)
+        _live.pop("orphan_suspected", None)
     _live_save_state()
 
 
@@ -9105,8 +9026,8 @@ def _live_partial_tp_exit(signals: dict) -> None:
     if not _live_trade_guard():
         return
 
-    # Pre-send guard: deposit-only (mirrors _live_close_position).
-    # GET /positions/otc / per-deal GET always 404 on this account — confirmed 2026-08-27.
+    # Partial TP requires deal-specific presence before submission.
+    # Account margin is not evidence of individual position state — confirmed 2026-08-27.
     if deal_id:
         if _live.get("manual_review_required"):
             _live_log(
@@ -9300,21 +9221,6 @@ def _live_check_exit(signals: dict, regime: str) -> None:
         _live_reconcile_positions()
         _live_save_state()
         return
-
-    # Margin-based broker-stop detection: IG stop-close events use a NEW dealId
-    # so _ls_deal_closed() above misses them. If LS ACCT MARGIN=0 but a
-    # position is still tracked, the broker stop fired and must be reconciled.
-    if _ls_connected:
-        _bsd_margin = _ls_get_margin()
-        if _bsd_margin is not None and _bsd_margin == 0.0:
-            _live_log(
-                f"[LS MARGIN=0] {sym}: broker stop detected via LS ACCT "
-                f"(no FULLY_CLOSED for deal {_ls_chk_id} — IG stop-close uses different dealId). "
-                f"Reconciling."
-            )
-            _live_reconcile_positions()
-            _live_save_state()
-            return
 
     # Max hold — always fires regardless of price availability
     if hold_sec >= _SIM_MAX_HOLD_SECS:
@@ -9634,16 +9540,12 @@ def _live_close_addon_leg(leg: dict, exit_reason: str, signals: dict) -> None:
     if not _live_trade_guard():
         return
     if deal_id:
-        if _live.get("manual_review_required"):
-            _live_log(f"[PYRAMID] {sym}: manual_review_required -- addon close blocked")
-            return
         _g_open, _g_src = _ls_position_guard_check(sym, deal_id)
         if _g_src == "DISAGREEMENT":
             return
         if _g_open is None:
-            _live_log(f"[PYRAMID] {sym}: both LS and /accounts unavailable -- preserving addon")
-            return
-        if not _g_open:
+            _live_log(f"{sym}: inventory unavailable; attempting protective deal-specific DELETE")
+        if _g_open is False:
             _live_capture_evidence(leg, "position_absence_observed", observation_source=_g_src, expected_exit_reason=exit_reason)
             _live_log(f"[PYRAMID] {sym}: addon already gone [{_g_src}] -- clearing tracking")
             _live_capture_active("before_addon_tracking_replace")
@@ -9660,7 +9562,6 @@ def _live_close_addon_leg(leg: dict, exit_reason: str, signals: dict) -> None:
         "timeInForce":    "FILL_OR_KILL",
         "dealId":         deal_id,
     }
-    _addon_margin_pre = _ls_get_margin()  # orphan guard: capture before sending close
     _live_capture_evidence(leg, "close_intent", order=close_body, expected_exit_reason=exit_reason, local_request_time=time.time())
     resp = _ig_live_post("/positions/otc", close_body, version="1", close=True)
     _live_capture_evidence(leg, "close_response", response=resp, expected_exit_reason=exit_reason)
@@ -9671,6 +9572,23 @@ def _live_close_addon_leg(leg: dict, exit_reason: str, signals: dict) -> None:
     confirm  = _live_confirm_deal(deal_ref) if deal_ref else None
     _live_capture_evidence(leg, "close_confirmation_observed", response=resp, confirmation=confirm, expected_exit_reason=exit_reason)
     if confirm and confirm.get("dealStatus") == "ACCEPTED":
+        _close_inventory = _ig_live_get("/positions", version="2")
+        _close_rows = _close_inventory.get("positions") if isinstance(_close_inventory, dict) else None
+        _close_valid = isinstance(_close_rows, list) and all(
+            isinstance(row, dict) and isinstance(row.get("position"), dict)
+            and row["position"].get("dealId") for row in _close_rows)
+        _close_confirmed = any(isinstance(item, dict) and item.get("dealId") == deal_id
+                               and item.get("status") == "FULLY_CLOSED"
+                               for item in confirm.get("affectedDeals") or [])
+        _close_stream = _ls_connected and _ls_deal_closed(deal_id)
+        _close_absent = _close_valid and not any(row["position"]["dealId"] == deal_id for row in _close_rows)
+        _live_capture_evidence(leg, "addon_close_outcome_observed",
+                               broker_positions_response=_close_inventory, confirmation=confirm)
+        if not (_close_confirmed or _close_stream or _close_absent):
+            _live["manual_review_required"] = True
+            _live_log(f"{sym}: close accepted but disappearance unconfirmed; tracking preserved")
+            _live_save_state()
+            return
         real_exit  = float(confirm.get("level", mid))
         real_pnl_p = (real_exit - fill_px) / fill_px if dirn == "long" else (fill_px - real_exit) / fill_px
         _live_log(
@@ -9687,18 +9605,6 @@ def _live_close_addon_leg(leg: dict, exit_reason: str, signals: dict) -> None:
             except Exception:
                 pass
             _live["pyramid_agg_stop_level"] = None
-        # Orphan guard: if close order landed on an already-stopped addon leg,
-        # IG opens a new opposite position — LS ACCT MARGIN increases instead of
-        # decreasing. Use 0.10 threshold to clear rounding noise.
-        _addon_margin_post = _ls_get_margin()
-        if (_addon_margin_pre is not None and _addon_margin_post is not None
-                and _addon_margin_post > _addon_margin_pre + 0.10):
-            _live_log(
-                f"🚨 PYRAMID ORPHAN: LS ACCT MARGIN {_addon_margin_pre:.2f}→{_addon_margin_post:.2f} "
-                f"INCREASED after {sym} addon close — close order opened a new position "
-                f"(original already stopped by broker). manual_review_required=True"
-            )
-            _live["manual_review_required"] = True
         _live_save_state()
     else:
         status = confirm.get("dealStatus", "?") if confirm else "no-confirm"
@@ -9807,6 +9713,9 @@ def _pyramid_active_max_legs() -> int:
 
 
 def _live_check_pyramid_entry(signals: dict, regime: str) -> None:
+    if (_live.get("orphan_suspected") or _live.get("manual_review_required")
+            or (_live.get("open_position") or {}).get("partial_exit_pending")):
+        return
     # Evaluate whether to add a pyramid leg to the existing primary position.
     # All defensive gates explicitly checked -- mirrors _live_try_entry exactly.
     # Profit gate: primary must show >= _PYRAMID_PROFIT_GATE_PCT spread-adjusted P&L.
@@ -10157,10 +10066,9 @@ def _live_try_entry(signals: dict, regime: str, _notional_skip: set = None) -> N
     if _live.get("open_position"):
         return     # one position at a time
 
-    if _live.get("orphan_suspected"):
-        _live_log(f"⚠️ Entry BLOCKED: orphan_suspected -- /positions/otc 404 + deposit>0 "
-                  f"persisted >={_RECON_ORPHAN_ESCALATION_THRESHOLD} cycles. "
-                  f"Check IG app for unmanaged open positions.")
+    if (_live.get("orphan_suspected") or _live.get("manual_review_required")
+            or _live.get("pyramid_legs")):
+        _live_log("Entry blocked: unresolved position evidence requires reconciliation")
         return
 
     total   = _live.get("balance_total", 0.0)
@@ -10678,11 +10586,6 @@ def run_live_step(signals: dict) -> None:
         if not _sim.get("open_position"):   # sim path handles it via _sim_check_exit when sim is also open
             _sim_apply_pos_adjust()
         _live_check_exit(signals, regime)
-        # Pyramid orphan protection: if primary just closed but addon legs remain,
-        # close them immediately. Any primary exit (SL/TP/rotation) terminates addons.
-        if not _live.get("open_position") and _live.get("pyramid_legs"):
-            _live_log("⚠️ PYRAMID ORPHAN: primary leg closed -- immediately closing all addon legs")
-            _live_close_all_addon_legs("orphan_primary_closed", signals)
         if _live.get("open_position"):
             # Primary still open -- pyramid exit checks then try to add leg 2
             _live_check_pyramid_exits(signals)
@@ -10690,13 +10593,13 @@ def run_live_step(signals: dict) -> None:
                 _live_check_pyramid_entry(signals, regime)
             return    # still holding — skip entry logic
 
-    # Belt-and-suspenders: stale addon legs without a primary position
+    # A failed addon close is unresolved exposure, never disposable stale state.
     if _live.get("pyramid_legs"):
-        _live_log("⚠️ STALE PYRAMID LEGS: no primary position -- clearing")
-        _live_capture_active("before_addon_tracking_replace")
-        _live["pyramid_legs"] = []
-        _live["pyramid_agg_stop_level"] = None
+        _live_close_all_addon_legs("orphan_primary_closed", signals)
         _live_save_state()
+        if _live.get("pyramid_legs"):
+            _live_log("Unresolved addon exposure retained; new entries blocked")
+            return
 
     # Daily drawdown circuit breaker — gates new-trade authority only.
     # Runs after exit management so a position that just closed still triggers
@@ -10732,52 +10635,39 @@ def _live_reconcile_positions() -> None:
     #           or manual entry). Reconstructs minimal state so exit management
     #           is immediately active from the next cycle.
     #   Stale:  June state says open but IG shows nothing. Clears it.
-    data = _ig_live_get("/positions", version="2")  # 404 → None → skip, not clear
-    _evidence_positions_response = data  # retain raw response before a local margin-proxy inference
-    if data is None:
-        # /positions/otc returned 404 or failed. Use account balance to disambiguate:
-        # deposit=0 means no margin in use -> genuinely flat (treat as empty list).
-        # deposit>0 means margin in use -> position visible soon (transitional), skip.
-        _recon_bal = _ig_live_get("/accounts", version="1")
-        if _recon_bal is not None:
-            _recon_dep = 0.0
-            for _recon_ac in _recon_bal.get("accounts", []):
-                if _recon_ac.get("preferred"):
-                    _recon_dep = float(_recon_ac.get("balance", {}).get("deposit", 0) or 0)
-                    break
-            if _recon_dep == 0.0:
-                _recon_consecutive_404_with_deposit = 0  # reset — no margin in use
-                _live.pop("orphan_suspected", None)       # unblock entry if previously set
-                _live_log("Reconciliation: /positions/otc 404 but balance deposit=0 "
-                          "-- treating as flat (no margin in use)")
-                data = {"positions": []}
-            else:
-                _recon_consecutive_404_with_deposit += 1
-                _streak = _recon_consecutive_404_with_deposit
-                _live_log(f"Reconciliation: /positions/otc 404 but deposit={_recon_dep:.2f}>0 "
-                          f"-- skipping [404_streak={_streak}/{_RECON_ORPHAN_ESCALATION_THRESHOLD}]")
-                if _streak >= _RECON_ORPHAN_ESCALATION_THRESHOLD:
-                    _live["orphan_suspected"] = True
-                    _live_log("=" * 62)
-                    _live_log("!!! ORPHAN POSITION ALERT -- ESCALATION THRESHOLD REACHED !!!")
-                    _live_log(f"    /positions/otc returned 404 for {_streak} consecutive cycles")
-                    _live_log(f"    while deposit=${_recon_dep:.2f} (real margin in use).")
-                    _live_log(f"    At least one REAL OPEN POSITION exists that June")
-                    _live_log(f"    cannot locate, track, or manage. ACTIVE BLIND SPOT.")
-                    _live_log(f"    /positions (DMA) does not list OTC on this account.")
-                    _live_log(f"    ACTION: CHECK IG APP NOW -- open position(s) unmanaged.")
-                    _live_log(f"    ACTION: Close any unmanaged position manually if needed.")
-                    _live_log(f"    New entry: BLOCKED until /positions/otc returns 200.")
-                    _live_log("=" * 62)
-                return
-        else:
-            _live_log("Reconciliation: /positions/otc AND /accounts both failed -- skipping")
-            return
-
-    # /positions/otc returned 200 — clear streak and unblock entry if previously escalated
+    data = _ig_live_get("/positions", version="2")
+    _evidence_positions_response = data
+    ig_positions = data.get("positions") if isinstance(data, dict) else None
+    valid = isinstance(ig_positions, list) and all(
+        isinstance(row, dict) and isinstance(row.get("position"), dict)
+        and row["position"].get("dealId") for row in ig_positions)
+    if not valid:
+        _live_capture_active("inventory_unavailable")
+        _live["orphan_suspected"] = True
+        _live_log("Reconciliation: inventory unavailable; retain tracking and block new entries")
+        return
     _recon_consecutive_404_with_deposit = 0
     _live.pop("orphan_suspected", None)
-    ig_positions = data.get("positions", [])
+    # Pending partial outcome: restore broker quantity without inventing missing P&L.
+    tracked = _live.get("open_position")
+    if tracked and tracked.get("partial_exit_pending"):
+        import math
+        matches = [row["position"] for row in ig_positions
+                   if row["position"]["dealId"] == tracked.get("deal_id")]
+        if len(matches) == 1:
+            try:
+                size = float(matches[0]["size"])
+            except (KeyError, TypeError, ValueError):
+                size = 0.0
+            old_size = tracked.get("ig_size", 0.0)
+            if math.isfinite(size) and 0 < size <= old_size:
+                _live_capture_active("before_partial_quantity_change")
+                tracked.setdefault("original_ig_size", old_size)
+                tracked.setdefault("original_notional", tracked.get("notional", 0.0))
+                tracked["notional"] = tracked.get("notional", 0.0) * size / old_size
+                tracked["ig_size"] = size
+                tracked["partial_exit_pending"]["observed_residual_size"] = size
+                _live_save_state()
     june_pos     = _live.get("open_position")
 
     # Clean -- neither side has a position
@@ -10980,7 +10870,7 @@ def _live_reconcile_positions() -> None:
 
     # Stale: June state has position but IG shows nothing
     if not ig_positions and june_pos:
-        _live_capture_evidence(june_pos, "position_absence_observed", observation_source="reconciliation.flat_check", broker_positions_response=_evidence_positions_response, margin_proxy_response=locals().get("_recon_bal"))
+        _live_capture_evidence(june_pos, "position_absence_observed", observation_source="reconciliation.flat_check", broker_positions_response=_evidence_positions_response)
         sym     = june_pos.get("instrument", "?")
         deal_id = june_pos.get("deal_id", "?")
         _live_log("=" * 58)

@@ -171,3 +171,56 @@ the agreed calculation without silently changing its fixed risk budget.
 ### C verification
 
 Six targeted residual tests passed; crash-boundary rerun plus those tests: seven passed. Full 146-test suite passed in 11.355s. The uncommitted PS1-D red tests were explicitly excluded from this C-only run. The earlier full run exposed an outdated crash injection at the first save; it now injects at the intended post-reduction save. Test harnesses reuse the same parsed, immutable source AST per process instead of reparsing for every fixture; production code is still executed, never imported. py_compile, diff --check and complete source/test diff review passed. Changed production scope: only `_live_partial_tp_exit`; its sole caller remains `_live_check_exit`. Payload contract, min-deal full-close fallback before submission, and successful verified partial economics remain unchanged.
+
+Commit: `4688569`.
+
+## PS1-D: position evidence and margin inference
+
+| Baseline use | Baseline classification | Finding / repair |
+|---|---|---|
+| Guard: connected stream, margin=0 | PRIMARY inference | Stale zero suppressed live deals; removed |
+| Guard: offline stream, accounts deposit zero/positive | SECONDARY-labelled but decisive | Account-wide value neither proves this deal absent nor present; replaced by inventory |
+| `_live_check_exit`: cached zero margin | PRIMARY inference | Returned before max-hold/protective checks; removed |
+| Partial verifier: missing account evidence defaults to zero | PRIMARY inference | Tracking loss; repaired in C |
+| Full verifier: positive margin after this deal disappears | HEURISTIC treated as decisive orphan proof | Other concurrent exposure falsely blocked management; removed |
+| Addon close: margin increase >0.10 | HEURISTIC treated as decisive orphan proof | Lag misses orphan; other exposure causes false alert; replaced with specific outcome evidence |
+| Recovery: unavailable inventory plus deposit=0 | PRIMARY inference | Fabricated empty inventory; removed |
+| Eligibility, sizing, margin gate, day-start seed | Account capacity/accounting, not individual lifecycle proof | Reviewed; no sizing/leverage constants changed |
+
+`_ls_get_margin` has no observation timestamp. Connection state does not establish
+freshness; reconnect retains account cache, and stream snapshot/lost-update hooks
+do not establish a complete position inventory. Absence of a close event is not
+proof that a deal is open. REST accounts are account-wide and can include multiple
+positions, add-ons, delayed updates and stale local/Redis snapshots. Margin is
+therefore **HEURISTIC ONLY for individual position state**, even when useful as
+an account capacity measure. No margin read remains in the repaired lifecycle
+decisions. A matched `affectedDeals` FULLY_CLOSED or stream closure is specific
+proof; valid account inventory distinguishes presence, absence and unavailable.
+
+Initial eight regressions produced six failures. The final matrix adds malformed
+inventory, accepted-but-still-present full close, residual resynchronization and
+protective sizing. Full and addon closes retain tracking unless matched closure
+or valid inventory absence is observed. Full-close estimated history/learning is
+no longer applied merely because an order was ACCEPTED while outcome is unknown.
+New C2b outcome observations precede mutation. Unavailable or malformed recovery
+inventory retains state and blocks entry immediately; it is never converted into
+an empty broker response. No missing account field is interpreted as zero proof.
+
+Protective full/addon exits may attempt a deal-specific DELETE when inventory is
+unavailable or manual-review caution is set. This depends on A's restricted close
+contract: it cannot become an opening/netting order. Positive deal-closure evidence
+still suppresses an unnecessary request. Entry and addon expansion remain blocked
+under unresolved inventory/manual-review/pending-partial conditions. Existing
+kill-switch authorization is unchanged. Unresolved addon legs survive failed
+close attempts and are retried by the existing orphan-exit path in later cycles.
+
+A pending partial triggers quantity reconciliation before protective full close.
+The actual positive finite broker residual updates tracked size and proportional
+notional, retaining original basis and pending economic evidence. Missing partial
+P&L is not invented. Missing quantity can still cause an oversized DELETE to be
+rejected; it cannot create exposure. Delayed economics and restart idempotence
+remain limitations for later ledger work. All new state fields are additive JSON.
+
+### D verification
+
+Targeted position-evidence plus C2b capture tests: 31 passed. Full suite: 157 passed in 10.596s. An initial full run correctly detected the added outcome event in two exact-event crash expectations; those now require it. py_compile, whitespace/stat/status checks and complete source/test diff review passed. AST scope: guard, primary close, partial comment, exit check, addon close, entry caution, pyramid-entry caution, main-loop orphan handling and recovery. All module-level assignments/constants are unchanged. No broker payload contract beyond A changed; a pending partial now supplies the verified residual size to an existing protective close.
