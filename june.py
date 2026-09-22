@@ -3039,6 +3039,15 @@ _LIVE_SPROUT_MINDEAL_MULTS: dict = {
 _LIVE_MARGIN_FALLBACKS: dict = {
     "GOLD": 0.012,  # IG API returns 0% marginFactor (known anomaly); real ~1.2% from deposit observations
 }
+_LIVE_LOT_NOTIONAL_OVERRIDES: dict = {
+    # SOYBEANS: IG API returns lotSize=1 under the "$1/point" convention
+    # (onePipMeans "1 cents per bushel" = $1 per lot per cent).
+    # CC.D.* price_unit=0.01 (cents->dollars) then understates notional 100x:
+    #   0.04 lots x 1.0 x 1335 cts x 0.01 = $0.53 (trips fx_lot_formula_suspect gate).
+    # Override 100x compensates in eligibility and reconciliation formulas only;
+    # _live_lot_sizes stays 1.0 so ig_size and native-price P&L are unaffected.
+    "SOYBEANS": 100.0,
+}
 
 # ── Sprout sizing rotation ─────────────────────────────────────────────────────
 _SIM_SIZING_ORDER        = ["fixed_5", "fixed_10", "pct_5", "pct_10"]
@@ -7298,7 +7307,7 @@ def _live_fetch_market_data(sym: str, epic: str) -> bool:
         if epic.upper().endswith(".CASH.IP"):
             _recon_min_n = round(min_val * _recon_mid * price_unit, 4)
         else:
-            _recon_min_n = round(min_val * lot_sz * _recon_mid * price_unit, 4)
+            _recon_min_n = round(min_val * _LIVE_LOT_NOTIONAL_OVERRIDES.get(sym, lot_sz) * _recon_mid * price_unit, 4)
         _cached_n = _sim_min_notional.get(sym)
         if _cached_n and _cached_n > 1.0 and _recon_min_n > 0.001:
             _ratio = _cached_n / _recon_min_n
@@ -7394,7 +7403,8 @@ def _live_publish_eligible_instruments(signals: dict) -> None:
             continue
 
         price_usd    = price * price_unit
-        min_notional = (min_deal * price_usd) if is_equity else (min_deal * lot_sz * price_usd)
+        _elig_lot_sz = _LIVE_LOT_NOTIONAL_OVERRIDES.get(sym, lot_sz)
+        min_notional = (min_deal * price_usd) if is_equity else (min_deal * _elig_lot_sz * price_usd)
         margin_rate  = max(0.0, min(1.0, margin_raw))
         min_margin   = min_notional * _real_margin_fraction(sym, margin_raw)
 
