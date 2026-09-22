@@ -6863,11 +6863,24 @@ def _live_update_defensive_mode() -> None:
 
 # ── IG live POST / DELETE wrappers ────────────────────────────────────────────
 
-def _ig_live_post(path: str, body: dict, version: str = "2") -> Optional[dict]:
+def _ig_live_post(path: str, body: dict, version: str = "2", *, close: bool = False) -> Optional[dict]:
     """POST to live IG account. Returns parsed response dict or None on failure.
     Handles 401 re-auth and logs errors. Does NOT call _live_trade_guard() —
     callers must gate before reaching here.
     """
+    # IG's documented DELETE-with-body alternative. Opening callers remain POST.
+    if close:
+        import math
+        if (path != "/positions/otc" or version != "1"
+                or set(body) != {"dealId", "direction", "size", "orderType", "timeInForce"}
+                or not isinstance(body.get("dealId"), str) or not body["dealId"].strip()
+                or body.get("direction") not in ("BUY", "SELL")
+                or not isinstance(body.get("size"), (int, float))
+                or not math.isfinite(body["size"]) or body["size"] <= 0
+                or body.get("orderType") != "MARKET"
+                or body.get("timeInForce") != "FILL_OR_KILL"):
+            _live_log("Invalid deal-specific close request; request not sent")
+            return None
     global _live_api_paused_until
     if time.time() < _live_api_paused_until:
         _live_log(f"POST {path} skipped -- 429 rate-limit pause active")
@@ -6883,6 +6896,8 @@ def _ig_live_post(path: str, body: dict, version: str = "2") -> Optional[dict]:
         "Accept":           "application/json; charset=UTF-8",
         "Version":          version,
     }
+    if close:
+        hdrs["_method"] = "DELETE"
     try:
         r = requests.post(url, headers=hdrs, json=body, timeout=15)
         if r.status_code == 401:
@@ -8691,19 +8706,14 @@ def _live_close_position(exit_reason: str, signals: dict) -> None:
 
     # ── Real close order ──────────────────────────────────────────────────────
     close_body = {
-        "epic":        epic,
-        "expiry":      "-",
         "direction":   close_dir,
         "size":        ig_size,
         "orderType":   "MARKET",
         "timeInForce": "FILL_OR_KILL",
-        "forceOpen":     False,         # required by IG v1 API — absent field treated as null → HTTP 400
-        "guaranteedStop": False,         # required by IG v1 API — absent field treated as null → HTTP 400
-        "currencyCode":   "USD",         # required by IG v1 API — absent field treated as null → HTTP 400
         "dealId":         deal_id,
     }
     _live_capture_evidence(pos, "close_intent", order=close_body, expected_exit_reason=exit_reason, local_request_time=time.time())
-    resp = _ig_live_post("/positions/otc", close_body, version="1")
+    resp = _ig_live_post("/positions/otc", close_body, version="1", close=True)
     _live_capture_evidence(pos, "close_response", response=resp, expected_exit_reason=exit_reason)
     if not resp:
         _live_log(f"close_position: POST failed for {sym} — position may still be open")
@@ -8869,7 +8879,7 @@ def _live_close_position(exit_reason: str, signals: dict) -> None:
         _ls_flat = _ls_ok and _ls_cl  # LS confirms THIS deal specifically closed
 
         # REST: per-deal check via /positions (not /positions/otc which 404s on this account)
-        _rs_data    = _ig_live_get("/positions", version="1")
+        _rs_data    = _ig_live_get("/positions", version="2")
         _rs_ok      = _rs_data is not None
         _rs_all_pos = _rs_data.get("positions", []) if _rs_ok else []
         _rs_deals   = {p.get("position", {}).get("dealId", "") for p in _rs_all_pos}
@@ -9001,30 +9011,13 @@ def _live_close_position(exit_reason: str, signals: dict) -> None:
     for _vi in range(_VERIFY_MAX):
         if _vi > 0:
             time.sleep(3)  # 3s between retries; worst-case extra: 6s
-        _post_data = _ig_live_get("/positions/otc", version="1")
-        if _post_data is None:
-            # 404 / network error: dual-system disambiguation (LS primary + REST fallback)
-            _pv_r = _post_dual_verify(_vi + 1)
-            if _pv_r is True:
-                _post_resolved = True
-                break
-            if _pv_r is False:
-                return  # promotion or manual_review_required handled in _post_dual_verify
-            continue
-        _post_pos = _post_data.get("positions", [])
-        if _post_pos:
-            # 200 with open positions: possible orphan from broker-stop race
-            _live_log(
-                f"\u26a0\ufe0f  POST-CLOSE VERIFICATION: IG still shows {len(_post_pos)} open "
-                f"position(s) after {sym} close confirm \u2014 possible broker-stop race. "
-                f"Running reconciliation."
-            )
-            _live_reconcile_positions()
-            _live_save_state()
-            return  # open_position set by reconciliation; entry guard blocks new trades
-        # 200 + empty list: IG confirmed flat
-        _post_resolved = True
-        break
+        # Verify the requested deal, not whether the entire account is flat.
+        _pv_r = _post_dual_verify(_vi + 1)
+        if _pv_r is True:
+            _post_resolved = True
+            break
+        if _pv_r is False:
+            return  # promotion or unresolved state handled by verifier
 
     if not _post_resolved:
         # All retries exhausted AND balance showed deposit>0 on each attempt.
@@ -9139,19 +9132,14 @@ def _live_partial_tp_exit(signals: dict) -> None:
         # Position confirmed open. Proceed with partial close.
 
     close_body = {
-        "epic":          epic,
-        "expiry":        "-",
         "direction":     close_dir,
         "size":          half_sz,
         "orderType":     "MARKET",
         "timeInForce":   "FILL_OR_KILL",
-        "forceOpen":     False,
-        "guaranteedStop": False,
-        "currencyCode":  "USD",
         "dealId":        deal_id,
     }
     _live_capture_evidence(pos, "close_intent", order=close_body, expected_exit_reason="partial_take_profit", local_request_time=time.time())
-    resp = _ig_live_post("/positions/otc", close_body, version="1")
+    resp = _ig_live_post("/positions/otc", close_body, version="1", close=True)
     _live_capture_evidence(pos, "close_response", response=resp, expected_exit_reason="partial_take_profit")
     if not resp:
         _live_log(f"partial_tp: POST failed for {sym} — falling back to full close")
@@ -9179,7 +9167,7 @@ def _live_partial_tp_exit(signals: dict) -> None:
         # class as the post-close verification in _live_close_position (ddb7de5).
         # Without this, a race leaves June managing a ghost half-position.
         time.sleep(2)
-        _ptp_post = _ig_live_get("/positions/otc", version="1")
+        _ptp_post = _ig_live_get("/positions", version="2")
         if _ptp_post is None:
             _ptp_bd  = _ig_live_get("/accounts", version="1")
             _ptp_dep = 0.0
@@ -9686,20 +9674,15 @@ def _live_close_addon_leg(leg: dict, exit_reason: str, signals: dict) -> None:
             _live_save_state()
             return
     close_body = {
-        "epic":           epic,
-        "expiry":         "-",
         "direction":      close_dir,
         "size":           ig_size,
         "orderType":      "MARKET",
         "timeInForce":    "FILL_OR_KILL",
-        "forceOpen":      False,
-        "guaranteedStop": False,
-        "currencyCode":   "USD",
         "dealId":         deal_id,
     }
     _addon_margin_pre = _ls_get_margin()  # orphan guard: capture before sending close
     _live_capture_evidence(leg, "close_intent", order=close_body, expected_exit_reason=exit_reason, local_request_time=time.time())
-    resp = _ig_live_post("/positions/otc", close_body, version="1")
+    resp = _ig_live_post("/positions/otc", close_body, version="1", close=True)
     _live_capture_evidence(leg, "close_response", response=resp, expected_exit_reason=exit_reason)
     if not resp:
         _live_log(f"[PYRAMID] {sym}: addon close POST failed -- state preserved")
@@ -10769,7 +10752,7 @@ def _live_reconcile_positions() -> None:
     #           or manual entry). Reconstructs minimal state so exit management
     #           is immediately active from the next cycle.
     #   Stale:  June state says open but IG shows nothing. Clears it.
-    data = _ig_live_get("/positions/otc", version="1")  # 404 → None → skip, not clear
+    data = _ig_live_get("/positions", version="2")  # 404 → None → skip, not clear
     _evidence_positions_response = data  # retain raw response before a local margin-proxy inference
     if data is None:
         # /positions/otc returned 404 or failed. Use account balance to disambiguate:
