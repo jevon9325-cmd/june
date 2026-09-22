@@ -8630,7 +8630,10 @@ def _live_close_position(exit_reason: str, signals: dict) -> None:
         commission  = _IG_EQUITY_COMMISSION_USD * 2 if sym in _live_equity_cfd else 0.0
         net_dollar  = real_dollar - commission
         _partial_pnl_c = pos.get("partial_dollar_pnl", 0.0)
-        won         = (net_dollar + _partial_pnl_c) > 0
+        complete_dollar = net_dollar + _partial_pnl_c
+        original_notional = pos.get("original_notional", notional)
+        complete_pnl_p = (real_dollar + _partial_pnl_c) / original_notional if original_notional > 0 else real_pnl_p
+        won         = complete_dollar > 0
         _live_log(
             f"✅ LIVE POSITION CLOSED: {sym} @ {real_exit:.5f} | "
             f"gross {real_pnl_p*100:+.2f}% (${real_dollar:+.2f})"
@@ -8644,10 +8647,13 @@ def _live_close_position(exit_reason: str, signals: dict) -> None:
             "direction":    dirn,
             "entry_price":  fill_px,
             "exit_price":   real_exit,
-            "ig_size":      ig_size,
-            "notional":     round(notional, 2),
-            "pnl_pct":      round(real_pnl_p, 6),
-            "dollar_pnl":   round(net_dollar, 4),
+            "ig_size":      pos.get("original_ig_size", ig_size),
+            "notional":     round(original_notional, 2),
+            "pnl_pct":      round(complete_pnl_p, 6),
+            "dollar_pnl":   round(complete_dollar, 4),
+            "residual_dollar_pnl": round(net_dollar, 4),
+            "partial_dollar_pnl": round(_partial_pnl_c, 4),
+            "pnl_source":   "confirmed_fill_estimate",
             "commission":   round(commission, 2),
             "hold_min":     round(hold_min, 1),
             "exit_epoch":   int(time.time()),
@@ -8671,11 +8677,11 @@ def _live_close_position(exit_reason: str, signals: dict) -> None:
         _live["total_wins"]   = _live.get("total_wins", 0)   + int(won)
         _live["total_losses"] = _live.get("total_losses", 0) + int(not won)
         if dirn == "long":
-            _live["long_pnl"]    = round(_live.get("long_pnl", 0.0)  + net_dollar, 4)
+            _live["long_pnl"]    = round(_live.get("long_pnl", 0.0)  + complete_dollar, 4)
             _live["long_trades"] = _live.get("long_trades", 0) + 1
             if won: _live["long_wins"] = _live.get("long_wins", 0) + 1
         else:
-            _live["short_pnl"]    = round(_live.get("short_pnl", 0.0) + net_dollar, 4)
+            _live["short_pnl"]    = round(_live.get("short_pnl", 0.0) + complete_dollar, 4)
             _live["short_trades"] = _live.get("short_trades", 0) + 1
             if won: _live["short_wins"] = _live.get("short_wins", 0) + 1
 
@@ -8683,7 +8689,7 @@ def _live_close_position(exit_reason: str, signals: dict) -> None:
         _htf_b_c = pos.get("htf_bias", "unknown")
         if _htf_b_c not in ("unknown", None):
             _live_write_htf_event(sym, dirn, _htf_b_c, 0.0, fill_px)
-        _live_perf_record(sym, won, sig.get("spread_atr_ratio"), pnl_dollar=net_dollar,
+        _live_perf_record(sym, won, sig.get("spread_atr_ratio"), pnl_dollar=complete_dollar,
                           entry_sar=pos.get("entry_sar"), persistence_confirmed=pos.get("persistence_confirmed"))
         _sim_15m_record(sym, dirn, pos.get("entry_change_15m") or 0.0, won)
         # Live phase stat update — only counted when above balance gate
@@ -8991,9 +8997,9 @@ def _live_partial_tp_exit(signals: dict) -> None:
     lot_sz     = _live_lot_sizes.get(sym, _LIVE_LOT_SIZE_FX)
     price_unit = _live_price_unit.get(sym, 1.0)
     if sym in _live_equity_cfd:
-        partial_notional = half_sz * mid * price_unit
+        partial_notional = half_sz * fill_px * price_unit
     else:
-        partial_notional = half_sz * lot_sz * mid  # native-price notional; pnl_pct uses same native prices, price_unit cancels
+        partial_notional = half_sz * lot_sz * fill_px  # entry basis; native-price P&L units
 
     close_dir = "SELL" if dirn == "long" else "BUY"
     epic      = INSTRUMENTS.get(sym, "")
@@ -9137,11 +9143,14 @@ def _live_partial_tp_exit(signals: dict) -> None:
             # Single position with matching dealId confirmed — proceed with update
 
         remaining_sz = round(ig_sz - half_sz, 4)
+        _live["open_position"].setdefault("original_ig_size", ig_sz)
+        _live["open_position"].setdefault("original_notional", pos.get("notional", partial_notional * ig_sz / half_sz))
+        _live["open_position"]["notional"] = pos.get("notional", partial_notional * ig_sz / half_sz) * remaining_sz / ig_sz
         _live["open_position"]["ig_size"]            = remaining_sz
         _live["open_position"]["stop_pct"]           = _spread_flr
         _live["open_position"]["initial_sl_pct"]     = _spread_flr
         _live["open_position"]["partial_exit_done"]  = True
-        _live["open_position"]["partial_dollar_pnl"] = partial_dollar_pnl
+        _live["open_position"]["partial_dollar_pnl"] = pos.get("partial_dollar_pnl", 0.0) + partial_dollar_pnl
         _live["open_position"]["breakeven_locked"]   = True
         _live["open_position"]["dple_effective_sl"]  = -_spread_flr
 

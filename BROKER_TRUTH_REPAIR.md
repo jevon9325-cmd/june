@@ -101,13 +101,63 @@ Historical production records remain unchanged. Scope limitations still pending:
 HTF one-to-many matching, SIM/live mixing, severity semantics, and account-level
 earned P&L/skimming require explicit classification rather than a broad rewrite.
 
+## Stage B: partial-close accounting
+
+Stage A commit: `67d5676c9c702909f7065e2828e70e20b3bd478e`.
+Only `_live_partial_tp_exit` and `_live_close_position` changed in June.
+Accepted, verified partial closes now preserve original quantity/notional, reduce
+remaining notional proportionally, calculate partial dollars on entry basis and
+accumulate partial realizations. Final close history, directional totals and
+performance dollars use partial plus residual results, consistent with win/loss.
+History retains the residual and partial components and explicitly labels
+`pnl_source=confirmed_fill_estimate`. It is NOT broker-history reconciliation.
+Original `pos_size` and leverage remain unchanged because pyramiding uses them
+as policy inputs. No order payload, exit trigger, stop, target or gate changed.
+
+Eight new tests execute the actual two functions via AST extraction with mocked
+broker/Redis/time dependencies. They cover partial quantity/notional, all three
+requested partial/residual sign combinations and consumer agreement, repeated
+partials, short positions, ordinary full close, disabled guard, rejected partial
+and minimum-deal fallback. Compile checks passed; the combined suite passed
+66 tests (8 live accounting, 19 reconciliation, 39 existing risk tests).
+AST comparison confirmed all other functions, imports and module constants
+unchanged. Caller signatures are unchanged. Full diff and field references were
+reviewed; existing CRLF line endings in June were retained.
+
+Limitations: old already-partially-closed positions lack the new original basis
+and are not migrated. Existing fill/notional approximations, flat equity fee
+estimate and unknown financing remain; final `exit_price` is the residual fill,
+while `pnl_pct` represents combined gross return. These provisional consumers
+remain contaminated until canonical delivery is implemented and verified.
+
+Read-only production source search identified Claudia `_build_june_performance_str`
+and its Barbie-review calibration using numeric `dollar_pnl`; the field type is
+unchanged and whole-position totals repair this particular inconsistency.
+Both consumers attempt GET/JSON-object access to June's persistent history key,
+where June writes a Redis list with LPUSH. This pre-existing compatibility issue
+was observed in source, not tested against production Redis, and is NOT repaired
+here. The former catches the outer error and may return Unavailable without its
+intended state fallback. The calibration reader catches the persistent-key error
+and retains the rolling state sample. Do not silently broaden this June patch
+to sister repositories. No matching direct field references were found in the
+other top-level Python files under /opt/bots (not an exhaustive dynamic audit).
+
+Learning status at this checkpoint: performance/WR blocks, observer severity and
+recovery, streaks and leverage phases receive more consistent ordinary-close
+estimates but still lack broker-managed/add-on coverage and actual costs. HTF
+matching and shared 15-minute reliability still require separate assessment.
+Combo/adaptive target SIM inputs remain intentionally SIM-based. Barbie/Claudia
+live summaries retain incomplete history and the compatibility limitation above.
+Earned-P&L/skimming remain account-level DEAL estimates, not canonical June net.
+No consumer is newly certified trustworthy by these two stages alone.
+
 ## Offline checks and continuation
 
 Run in this repository:
 
 ```
-python -m py_compile broker_ledger.py test_broker_ledger.py june.py
-python -m unittest -q test_broker_ledger test_risk_safety
+python -m py_compile broker_ledger.py test_broker_ledger.py test_live_accounting.py june.py
+python -m unittest -q test_live_accounting test_broker_ledger test_risk_safety
 git diff --check
 git diff --stat
 git diff
@@ -115,5 +165,7 @@ git status --short
 ```
 
 Inspect `git log` for completed stage commits and current HEAD. Recheck status
-before editing. Stage A alone does NOT repair live coverage or make any existing
-learning consumer trustworthy. Not deployed; production remains unchanged.
+before editing. Resume with stage 3's durable evidence/retry design above, before
+wiring the pure ledger into ordinary or broker-managed exits. Then finish add-on
+exposure and consumer integration. Stages A/B do NOT repair live coverage or make
+existing learning data broker-truth. Not deployed; production remains unchanged.
