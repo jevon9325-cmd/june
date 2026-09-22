@@ -19,6 +19,46 @@ def _json(value):
     return json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False)
 
 
+class _TargetedFields:
+    """Lazy reads inside WATCH; only touched fields participate in serialization."""
+    def __init__(self, client, key):
+        self.client, self.key = client, key
+        self.before, self.values = {}, {}
+
+    def __contains__(self, field):
+        if field not in self.before:
+            raw = self.client.hget(self.key, field)
+            self.before[field] = raw.decode() if isinstance(raw, bytes) else raw
+            if raw is not None:
+                self.values[field] = json.loads(raw)
+        return field in self.values
+
+    def __getitem__(self, field):
+        if field not in self:
+            raise KeyError(field)
+        return self.values[field]
+
+    def get(self, field, default=None):
+        return self[field] if field in self else default
+
+    def __setitem__(self, field, value):
+        field in self  # retain the original value before mutation
+        self.values[field] = value
+
+    def setdefault(self, field, default):
+        if field not in self:
+            self.values[field] = default
+        return self.values[field]
+
+    def updates(self):
+        changed = {}
+        for field, value in self.values.items():
+            encoded = _json(value)
+            if self.before[field] != encoded:
+                changed[field] = encoded
+        return changed
+
+
 class PendingCloseStore:
     def __init__(self, client, account_id):
         if not isinstance(account_id, str) or not account_id.strip():
@@ -31,20 +71,15 @@ class PendingCloseStore:
             raise EvidenceError("Broker deal identity required")
         return "trade:" + _key([self.account_id, deal_id])
 
-    def _read(self, client):
-        return {(k.decode() if isinstance(k, bytes) else k): json.loads(v)
-                for k, v in client.hgetall(self.key).items()}
-
     def _update(self, change):
         # No callback may perform external side effects: WATCH can retry it.
         for _ in range(8):
             with self.client.pipeline() as pipe:
                 try:
                     pipe.watch(self.key)
-                    before = self._read(pipe)
-                    after = deepcopy(before)
-                    result = change(after)
-                    updates = {k: _json(v) for k, v in after.items() if k not in before or before[k] != v}
+                    data = _TargetedFields(pipe, self.key)
+                    result = change(data)
+                    updates = data.updates()
                     if updates:
                         pipe.multi()
                         pipe.hset(self.key, mapping=updates)
@@ -189,5 +224,21 @@ class PendingCloseStore:
         return self._update(change)
 
     def entries(self):
-        """Recover captured/pending/completed work after an application restart."""
-        return [v for k, v in self._read(self.client).items() if k.startswith("trade:")]
+        """Compatibility snapshot; use iter_entries for incremental recovery."""
+        return list(self.iter_entries())
+
+    def get_entry(self, deal_id):
+        """Read one position without enumerating account history."""
+        raw = self.client.hget(self.key, self._field(deal_id))
+        return json.loads(raw) if raw is not None else None
+
+    def iter_entries(self, count=100):
+        """Incremental HSCAN, not a consistent snapshot; retry/dedup by deal ID.
+
+        Redis may repeat fields during a scan. Recovery consumers must therefore
+        be idempotent. No unresolved or completed evidence expires here.
+        """
+        if type(count) is not int or count <= 0:
+            raise ValueError("Positive scan count required")
+        for _, raw in self.client.hscan_iter(self.key, match="trade:*", count=count):
+            yield json.loads(raw)

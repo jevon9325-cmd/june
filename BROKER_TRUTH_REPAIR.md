@@ -1,5 +1,76 @@
 # Broker-truth repair checkpoint and continuation
 
+## C2b work: verified start and pre-change lifecycle trace (2026-09-22)
+
+Authority: attachment `b6d073b9-0da9-445e-9126-13afc9ecff2f/pasted-text.txt`.
+Verified clean `repair/broker-truth-ledger`, origin
+`https://github.com/jevon9325-cmd/june.git`, HEAD
+`920acdedcadfa6bd716100ef3c6eb365878e9af9`, checkpoint at `23170d9`,
+and A/B/C1/C2a ancestry. All 104 baseline offline tests passed with access to
+existing `.git/test-deps`. The sandbox-only attempt could not load fakeredis
+properly (17 import-related setup errors); this was not a code/test regression.
+No production access is needed for this implementation.
+
+### Trace BEFORE lifecycle edits (C2a line numbers)
+
+Each row identifies evidence lost by a crash just after the destructive line.
+All position snapshots must retain their original metadata as observations;
+local fill/notional/P&L/reasons are not promoted to broker-history facts.
+
+| Runtime path | Destructive transition and lost evidence |
+| --- | --- |
+| `_live_close_position` 8640 onward | Close POST/confirmation can be followed by crash before state save: lose request/reference/receipt; pre-request position must already survive. Guard-already-absent delegates to reconciliation. Final clear 8981 loses primary opening, size, partials, notional and reason. |
+| Nested `_post_dual_verify` 8862 | Promotion replaces primary and clears add-on list: lose old primary outcome inputs and original add-on snapshot/relationship. Preserve BOTH before replacement; promoted evidence must retain add_on role. |
+| `_live_partial_tp_exit` 9088 onward | Same request/receipt crash gap. Flat branches 9128/9142 lose entire primary; reconciliation branches can also clear. Lines 9177-9186 overwrite quantity/notional/partial totals: preserve pre-change basis and confirmed receipt, separately from residual estimate. |
+| `_live_close_addon_leg` 9609/9641 | Guard absence or accepted confirmation removes leg; lose opening identity, intended vs confirmed exposure, request/receipt and local reason. Primary must not be substituted for add-on. |
+| `_live_check_pyramid_exits` 9723 | LS FULLY_CLOSED removes add-on without normal close path; disappearance is only an observation, not price/cost/reason proof. |
+| `run_live_step` 10653 | Stale add-on list cleared, including after a failed orphan close attempt. Preserve every leg; do not change this existing exit policy in C2b. |
+| `_live_reconcile_positions` 10943 | Broker-flat clears primary; lose opening/partials and provenance even without a June close request. Orphan reconstruction 10853 and recovered add-on append retain broker response separately and must not invent June ownership. |
+| `_live_open_position` 8265 | New primary assignment can overwrite stale state; accepted opening metadata 8290 must survive a later save failure. |
+| `_live_add_pyramid_leg` | Append accepted leg, then save: Redis failure can lose accepted receipt across restart. Capture newly available provenance independently. |
+| `_live_save_state` 6728 | Redis SET overwrites the only persisted active blob (with TTL); failure is logged then ignored. Independent evidence cannot depend on successful active-state SET. |
+| `_live_load_state` 6736 / startup | `_live.update` replaces active state; retain existing in-memory positions before replacement and loaded positions before reconciliation. Defaults use missing-key initialization; they must not erase retained evidence. |
+
+### C2b-1 targeted access
+
+Replaced whole-hash HGETALL/deepcopy with lazy HGET of touched fields inside
+the existing WATCH transaction, then one atomic HSET of changed fields. Capture
+reads one trade field; opening registration reads trade + opening owners;
+reconciliation reads trade + opening owners + each matched realization claim;
+projection reads trade + owners + consumer state + delivery marker. Existing
+ownership and delivery indexes/schema are retained, with no migration.
+Account-wide WATCH still means unrelated concurrent writers can cause retries;
+payload access no longer scales with unrelated retained trades. A single trade's
+own event history and a consumer's own projection can still grow.
+`get_entry` provides direct lookup; `iter_entries` uses incremental HSCAN for
+recovery (not a consistent snapshot, may repeat; consumers must be idempotent).
+`entries` remains a compatibility materialization, not used by update paths.
+
+No automatic pruning/TTL. Unresolved records (A) and reconciled-but-undelivered
+records (B) must survive. Terminal status (C) cannot yet be established because
+Stage E has not defined the required consumer set. Any later compaction must
+retain account/deal and opening ownership identities, realization claims,
+immutable economic-result identity/version and per-consumer committed delivery
+markers; otherwise an old transaction could be attributed/delivered again.
+Retention is deferred to Stage E, not introduced here.
+
+Offline fixture repeat (1,341-byte retained trade payloads, median of 11 captures):
+
+| Retained trades | Retained payload bytes | Fields read/update | Median ms |
+| --- | ---: | ---: | ---: |
+| 100 | 134,100 | 1 | 1.752 |
+| 1,000 | 1,341,000 | 1 | 1.291 |
+| 5,000 | 6,705,000 | 1 | 1.819 |
+
+These fakeredis fixture times are not production latency guarantees. Storage
+figures exclude Redis/key overhead. Reproduce with
+`python -B test_pending_access.py --benchmark`. Four new regression tests check
+bounded capture/registration/reconciliation/projection reads, no-op writes,
+direct lookup and incremental enumeration. All 26 targeted tests passed.
+Full relevant offline suite passed 108 tests; all Python sources compiled.
+Full diff, caller/key searches and whitespace/stat/status review passed. C2b-1
+does not change june.py, strategy constants, sizing, exit policy or order bodies.
+
 ## Authority and restrictions
 
 Repository: `C:\Users\jevon\trading_alerts\june-broker-truth-repair`.
