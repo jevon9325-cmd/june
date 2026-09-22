@@ -151,13 +151,97 @@ live summaries retain incomplete history and the compatibility limitation above.
 Earned-P&L/skimming remain account-level DEAL estimates, not canonical June net.
 No consumer is newly certified trustworthy by these two stages alone.
 
+## Stage C1: durable evidence and paginated history components (not runtime wired)
+
+Resumption verified branch `repair/broker-truth-ledger`, clean HEAD
+`c080e6981cf88b95630ddabec49e8e06c7b6fac2`, checkpoint and both prior commits.
+The original 66 tests passed again before editing. No production/GitHub refresh
+was performed in this substage; their equality is the original pre-edit check.
+
+New `broker_history.fetch_transaction_history` reads fixed UTC windows using
+IG GET /history/transactions v2, ALL types, all pages. Parameters and response
+fields were checked against https://labs.ig.com/reference/history-transactions.html.
+Missing/unstable/truncated/repeated pages fail rather than returning incomplete
+success. Pagination does not establish final cost completeness. The injected
+GET callback must stay bound to the verified account; the reader cannot enforce
+account identity from transaction rows that do not expose an account ID.
+
+New `broker_pending.PendingCloseStore` uses the existing redis dependency:
+
+- `capture`: immutable, deduplicated raw snapshots, without TTL.
+- `register_opening`: exact opening identity plus explicit June accepted-entry
+  receipt; recovered/manual positions do not automatically become June trades.
+- `reconcile`: calls the pure ledger; pending history/costs remain pending;
+  conflicting or disappearing evidence cannot erase previous observations.
+  Opening-tuple collisions block attribution and delivery for both positions.
+- `project_once`: atomic journal-owned consumer state plus delivery marker in
+  one HSET inside WATCH/MULTI/EXEC. Pure reducers only; never wrap existing
+  side-effecting June learning calls in this function.
+- `entries`: restores captured/pending/completed work after application restart.
+
+One account-scoped `june_broker_ledger_v1:<account hash>` Redis hash contains the
+journal. No deletion/expiry, historical migration, or production access occurs.
+Transport errors propagate; an ambiguous acknowledgement is safe to retry.
+The journal currently reads the complete hash per update, so growing-history
+performance needs assessment before integration. Redis data durability remains
+an operational prerequisite; tests simulate application/client restart, not
+Redis disk failure. All known opening identities must be registered before
+delivery; a newly discovered collision blocks subsequent delivery but cannot
+undo effects already delivered before that evidence was known.
+
+New `test_broker_pending.py`: 22 tests using fakeredis, including delayed partial
+and cost evidence, restart recovery, broker-only close, duplicate delivery,
+pre/post-EXEC disconnect, lost capture/reconciliation acknowledgement, concurrent
+WATCH conflict, separate consumers, malformed pages, unknown ownership, wrong
+account/window, insufficient cost coverage, changed completed P&L and reducer
+failure. The broker-close test delivers to a fixture projection, NOT actual
+`_live_perf_record`. No June runtime function changed in C1.
+Compile checks passed and the combined suite passed all 88 tests (22 new plus
+66 baseline tests). Full diff, whitespace, file scope and reference checks passed.
+
+Test-only dependencies installed inside this checkout's `.git/test-deps`:
+fakeredis 2.38.0, redis 8.1.0, sortedcontainers 2.4.0. Production requirements are
+unchanged. The initial sandbox run could not read those installed files; rerun
+with local dependency access passed. This was a test-environment permission
+failure, not a production operation. For a fresh checkout, install fakeredis
+in an isolated test environment before running these tests.
+
+### Next exact integration work (C2, then D/E)
+
+1. Reverify branch/HEAD/status. Inspect all clear/remove/promotion paths before
+   inserting capture, including `_live_close_position`, `_live_partial_tp_exit`,
+   `_live_close_addon_leg`, `_live_check_pyramid_exits`, `_live_reconcile_positions`
+   and `_live_save_state`. Preserve evidence across Redis failures without
+   silently suppressing protective exits or clearing the last recoverable copy.
+2. Retain actual accepted entry receipts, exact broker opening UTC/name/quantity
+   and verified session account for primary/add-on positions. Current entry_time
+   is local time; `_live_sess` does not retain currentAccountId. Do not guess
+   either identity. Unknown legacy/recovered ownership remains unattributed.
+3. Bind a retry worker to the account-pinned history reader and establish explicit
+   cost attribution/completeness evidence. Absence of fees is not proof of zero
+   costs. Cost evidence in tests is a fixture, not an implemented IG cost adapter.
+4. Integrate existing learning updates atomically with delivery or an equivalent
+   proven recovery design. Existing consumers update multiple Redis keys and
+   in-memory state; C1 projections do not make those writes exactly-once. Test
+   actual close/reconciliation functions and crash boundaries before switching
+   away from Stage B estimates. Preserve chronological streak/phase semantics
+   when broker history arrives late; do not silently redesign them.
+5. Complete add-on native-unit exposure accounting while preserving promoted
+   `pos_size`/pyramid sizing policy, then consumer compatibility and final audit.
+
+The repair is incomplete. C1 modules have no callers in june.py, and do not
+improve production coverage yet. No existing adaptive consumer is newly trusted.
+No push/deployment/restart/broker action/production Redis write occurred.
+
 ## Offline checks and continuation
 
 Run in this repository:
 
 ```
-python -m py_compile broker_ledger.py test_broker_ledger.py test_live_accounting.py june.py
-python -m unittest -q test_live_accounting test_broker_ledger test_risk_safety
+# PowerShell; local emulator dependency must be readable:
+$env:PYTHONPATH = (Join-Path (Get-Location) '.git/test-deps')
+python -m py_compile broker_ledger.py broker_history.py broker_pending.py test_broker_pending.py test_broker_ledger.py test_live_accounting.py june.py
+python -m unittest -q test_broker_pending test_live_accounting test_broker_ledger test_risk_safety
 git diff --check
 git diff --stat
 git diff
@@ -165,7 +249,8 @@ git status --short
 ```
 
 Inspect `git log` for completed stage commits and current HEAD. Recheck status
-before editing. Resume with stage 3's durable evidence/retry design above, before
-wiring the pure ledger into ordinary or broker-managed exits. Then finish add-on
-exposure and consumer integration. Stages A/B do NOT repair live coverage or make
-existing learning data broker-truth. Not deployed; production remains unchanged.
+before editing. Resume with C2's integration steps above. Stages A/B/C1 do NOT
+repair live coverage or make existing learning data broker-truth. Not deployed;
+production remains unchanged. At every stopping point include the user's exact
+CHATGPT HANDOFF structure directly in the response, self-contained and preferably
+under 1,500 words; do not require a reader to open this document.
