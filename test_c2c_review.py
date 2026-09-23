@@ -270,6 +270,7 @@ class ReviewCostFinalityTests(unittest.TestCase):
     def test_reference_less_commission_and_unknown_account_costs_block_finality(self):
         for kind in ('COMM', 'SWAP', 'INTEREST', 'MYSTERY'):
             with self.subTest(kind=kind):
+                self.setUp()
                 self.assert_pending(self.reconcile([realization(),
                     {'transactionType': kind, 'currency': '$', 'profitAndLoss': '-$9'}],
                     self.evidence))
@@ -312,6 +313,18 @@ class ReviewCostFinalityTests(unittest.TestCase):
         self.client.hset(self.store.key, self.store._field(self.pos['deal_id']), json.dumps(entry))
         with self.assertRaisesRegex(EvidenceError, 'Legacy economic completion'):
             self.store.project_once(self.pos['deal_id'], 'fixture', lambda *_: {})
+
+    def test_unresolved_cost_cannot_disappear_after_restart(self):
+        for kind in ('COMM', 'SWAP', 'MYSTERY'):
+            with self.subTest(kind=kind):
+                self.setUp()
+                row = {'transactionType': kind, 'profitAndLoss': '-$9', 'currency': '$'}
+                self.assert_pending(self.reconcile([realization(), row], self.evidence))
+                self.store = PendingCloseStore(self.client, 'fixture-account')
+                before = self.client.hgetall(self.store.key)
+                with self.assertRaisesRegex(EvidenceError, 'Previously observed cost rows'):
+                    self.reconcile(evidence=self.evidence)
+                self.assertEqual(before, self.client.hgetall(self.store.key))
 
 
 class ReviewRealizationIdentityTests(unittest.TestCase):

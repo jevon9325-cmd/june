@@ -187,3 +187,14 @@ instrument and a versioned namespace, still excluding the June claimant ID.
 A third test verifies saved pre-versioned realization records are quarantined
 without rekeying or projection. Existing claims/history are preserved for review.
 Full suite 307 PASS; compile and diff checks PASS; complete diff reviewed.
+
+## Correction 7: retain unresolved costs across restart
+
+Final review reproduced another premature completion path: after observing an
+unresolved COMM/SWAP/unknown row, a later batch omitting that row could certify
+zero costs because only attributed costs survived in the journal. One adversarial
+test with three subcases reproduced this before repair. The journal now retains
+all observed non-capital cost rows atomically and refuses subsequent cumulative
+history that omits any of them. No silent window merging or evidence deletion.
+The prior independent-cost tests now use independent stores per scenario.
+Full suite 308 PASS; compile/diff checks PASS; full correction reviewed.

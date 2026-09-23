@@ -186,6 +186,14 @@ class PendingCloseStore:
             pos = entry["opening"]
             if _utc(batch["from"]) > _utc(pos["opened_utc"]) or _utc(batch["to"]) <= _utc(pos["opened_utc"]):
                 raise EvidenceError("History window does not cover opening")
+            # Retain unresolved economics too. Like realizations, cost history
+            # must be cumulative; a retry cannot silently forget a prior SWAP
+            # or reference-less fee merely because it could not be attributed.
+            observed_cost_rows = {_key(row): deepcopy(row) for row in batch['transactions']
+                                  if row.get('transactionType') not in ('DEAL', 'DEPO', 'WITH')}
+            if any(key not in observed_cost_rows for key in entry.get('observed_cost_rows', {})):
+                raise EvidenceError('Previously observed cost rows missing; retain pending record')
+            entry['observed_cost_rows'] = observed_cost_rows
             record = reconcile_completed_trade(pos, batch["transactions"], costs,
                                                history_complete=True, costs_complete=False)
             economics_complete = economic_evidence_complete(pos, record, batch, cost_evidence)
