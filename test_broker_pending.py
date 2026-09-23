@@ -17,7 +17,13 @@ from test_broker_ledger import position, realization
 
 START, END = "2026-09-21T00:00:00", "2026-09-22T00:00:00"
 COST_EVIDENCE = {"source": "fixture.broker.cost_statement", "reference": "statement-1",
-                 "covered_through": END}
+                 "covered_through": END, 'covered_from': START, 'schema_version': 2,
+                 'account_id': 'fixture-account', 'deal_id': 'opening-1',
+                 'posting_finality': {'source': 'fixture.broker.statement',
+                     'reference': 'posting-final-1', 'final': True, 'posted_through': END},
+                 'components': {kind: {'source': 'fixture.broker.statement',
+                     'reference': 'final-' + kind, 'final': True, 'total': '0'}
+                     for kind in ('commission', 'financing', 'other')}}
 
 
 def page(rows, number=1, count=None, size=500):

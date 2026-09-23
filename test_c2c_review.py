@@ -198,3 +198,117 @@ class ReviewCostAttributionTests(unittest.TestCase):
                 reconcile_position(store, pos['deal_id'], history([row, comm_row('entry-reference')]),
                                    pos, entry_reference='entry-reference')
             self.assertIsNone(store.get_entry(pos['deal_id'])['record'])
+
+
+class ReviewCostFinalityTests(unittest.TestCase):
+    def setUp(self):
+        from test_broker_pending import COST_EVIDENCE
+        self.client = fakeredis.FakeRedis()
+        self.store = PendingCloseStore(self.client, 'fixture-account')
+        self.pos = register(self.store)
+        self.evidence = deepcopy(COST_EVIDENCE)
+
+    def reconcile(self, rows=None, evidence=None, batch=None):
+        return reconcile_position(self.store, self.pos['deal_id'],
+            batch or history([realization()] if rows is None else rows), self.pos,
+            entry_reference='entry-reference', cost_evidence=evidence)[0]
+
+    def assert_pending(self, record):
+        self.assertEqual(record['status'], 'pending_costs')
+        self.assertIsNone(record['net_realized_pnl'])
+        self.assertTrue(record['provenance']['history_fetch_complete'])
+        self.assertFalse(record['provenance']['economic_evidence_complete'])
+
+    def test_legacy_coverage_through_close_is_not_finality(self):
+        old = {k: self.evidence[k] for k in ('source', 'reference', 'covered_through')}
+        self.assert_pending(self.reconcile(evidence=old))
+
+    def test_no_commission_visible_with_positive_expected_cost_stays_pending(self):
+        self.evidence['components']['commission']['total'] = '-9'
+        self.assert_pending(self.reconcile(evidence=self.evidence))
+
+    def test_each_cost_component_and_posting_horizon_must_be_final(self):
+        for component in ('commission', 'financing', 'other'):
+            evidence = deepcopy(self.evidence)
+            evidence['components'][component]['final'] = False
+            self.assert_pending(self.reconcile(evidence=evidence))
+        evidence = deepcopy(self.evidence)
+        evidence['posting_finality']['final'] = False
+        self.assert_pending(self.reconcile(evidence=evidence))
+
+    def test_immature_history_window_cannot_cover_later_posting_horizon(self):
+        self.evidence['posting_finality']['posted_through'] = '2026-09-23T00:00:00'
+        self.assert_pending(self.reconcile(evidence=self.evidence))
+
+    def test_zero_cost_requires_explicit_final_zero_components(self):
+        self.assert_pending(self.reconcile())
+        record = self.reconcile(evidence=self.evidence)
+        self.assertEqual(record['status'], 'complete')
+        self.assertEqual(record['net_realized_pnl'], '-0.16')
+
+    def test_delayed_commission_after_restart_completes_only_at_final_total(self):
+        self.evidence['components']['commission']['total'] = '-18'
+        self.assert_pending(self.reconcile(evidence=self.evidence))
+        self.store = PendingCloseStore(self.client, 'fixture-account')
+        rows = [realization(), comm_row('entry-reference')]
+        self.assert_pending(self.reconcile(rows, self.evidence))
+        rows.append(comm_row('close-1'))
+        record = self.reconcile(rows, self.evidence)
+        self.assertEqual(record['status'], 'complete')
+        self.assertEqual(record['net_realized_pnl'], '-18.16')
+
+    def test_delayed_descriptive_financing_remains_unresolved_after_restart(self):
+        self.evidence['components']['financing']['final'] = False
+        self.assert_pending(self.reconcile(evidence=self.evidence))
+        self.store = PendingCloseStore(self.client, 'fixture-account')
+        self.evidence['components']['financing'].update(final=True, total='-0.50')
+        rows = [realization(), {'transactionType': 'SWAP', 'currency': '$',
+            'profitAndLoss': '-$0.50', 'instrumentName':
+            'Daily Financing Adjustment - FX Interest for 1 day Spot Gold ($1)'}]
+        self.assert_pending(self.reconcile(rows, self.evidence))
+
+    def test_reference_less_commission_and_unknown_account_costs_block_finality(self):
+        for kind in ('COMM', 'SWAP', 'INTEREST', 'MYSTERY'):
+            with self.subTest(kind=kind):
+                self.assert_pending(self.reconcile([realization(),
+                    {'transactionType': kind, 'currency': '$', 'profitAndLoss': '-$9'}],
+                    self.evidence))
+
+    def test_direct_store_cannot_bypass_unresolved_raw_cost(self):
+        record = self.store.reconcile(self.pos['deal_id'], history([realization(),
+            {'transactionType': 'SWAP', 'currency': '$', 'profitAndLoss': '-$9'}]),
+            cost_evidence=self.evidence)
+        self.assert_pending(record)
+
+    def test_cost_statement_must_cover_correct_position_and_entire_lifecycle(self):
+        for change in ({'deal_id': 'another'}, {'account_id': 'another'},
+                       {'covered_from': '2026-09-21T06:00:00'},
+                       {'covered_through': '2026-09-21T00:00:00'}):
+            with self.subTest(change=change), self.assertRaises(EvidenceError):
+                self.reconcile(evidence={**self.evidence, **change})
+
+    def test_capital_flows_do_not_block_positive_zero_cost_evidence(self):
+        rows = [realization(), {'transactionType': 'DEPO', 'profitAndLoss': '$150'},
+                {'transactionType': 'WITH', 'profitAndLoss': '-$20'}]
+        record = self.reconcile(rows, self.evidence)
+        self.assertEqual(record['net_realized_pnl'], '-0.16')
+
+    def test_financing_cannot_cancel_other_credit_to_invent_zero_cost(self):
+        self.evidence['components']['financing']['total'] = '-1'
+        self.evidence['components']['other']['total'] = '1'
+        self.assert_pending(self.reconcile(evidence=self.evidence))
+
+    def test_cost_posting_outside_history_is_refused(self):
+        self.evidence['components']['commission']['total'] = '-9'
+        row = {**comm_row(), 'dateUtc': '2026-09-23T00:00:00'}
+        with self.assertRaisesRegex(EvidenceError, 'Cost posting outside'):
+            self.reconcile([realization(), row], self.evidence)
+
+    def test_legacy_completed_record_cannot_be_projected(self):
+        import json
+        self.reconcile(evidence=self.evidence)
+        entry = self.store.get_entry(self.pos['deal_id'])
+        entry['record']['provenance'].pop('economic_evidence_complete')
+        self.client.hset(self.store.key, self.store._field(self.pos['deal_id']), json.dumps(entry))
+        with self.assertRaisesRegex(EvidenceError, 'Legacy economic completion'):
+            self.store.project_once(self.pos['deal_id'], 'fixture', lambda *_: {})

@@ -14,6 +14,7 @@ import json
 from redis.exceptions import WatchError
 
 from broker_ledger import EvidenceError, _key, _number, _text, _utc, reconcile_completed_trade
+from broker_finality import economic_evidence_complete
 
 
 def _json(value):
@@ -160,12 +161,13 @@ class PendingCloseStore:
     def reconcile(self, deal_id, batch, costs=(), *, cost_evidence=None):
         """Persist pending or completed result; completion never guesses zero costs.
 
-        `cost_evidence` must explicitly attest attributable costs through the
-        closing date, with source/reference/covered_through. Merely observing no
-        fee rows is insufficient. Delayed/corrected evidence cannot silently
-        overwrite a previously completed outcome.
+        `cost_evidence` must satisfy broker_finality's version-2 contract:
+        position-scoped final component totals and broker posting finality over
+        the full lifecycle. Legacy coverage alone leaves costs pending.
+        Delayed/corrected evidence cannot overwrite a completed outcome.
         """
         field = self._field(deal_id)
+        costs = tuple(costs)
         if batch.get("account_id") != self.account_id or batch.get("history_complete") is not True:
             raise EvidenceError("Complete account-pinned history required")
 
@@ -181,11 +183,32 @@ class PendingCloseStore:
             pos = entry["opening"]
             if _utc(batch["from"]) > _utc(pos["opened_utc"]) or _utc(batch["to"]) <= _utc(pos["opened_utc"]):
                 raise EvidenceError("History window does not cover opening")
-            if cost_evidence is not None:
-                if any(not cost_evidence.get(k) for k in ("source", "reference", "covered_through")):
-                    raise EvidenceError("Explicit cost coverage evidence required")
             record = reconcile_completed_trade(pos, batch["transactions"], costs,
-                                               history_complete=True, costs_complete=cost_evidence is not None)
+                                               history_complete=True, costs_complete=False)
+            economics_complete = economic_evidence_complete(pos, record, batch, cost_evidence)
+            if economics_complete:
+                # Direct store callers must not bypass unresolved raw costs.
+                from broker_cost import build_cost_record
+                from broker_transaction import normalize_batch
+                identified = {cost['cost_id'] for cost in record['costs']}
+                for tx in normalize_batch(batch):
+                    if tx['transaction_type'] in ('deal', 'deposit', 'withdrawal'):
+                        continue
+                    if tx['transaction_type'] != 'commission':
+                        economics_complete = False
+                        break
+                    if tx['close_utc'] != 'UNKNOWN' and not (
+                            _utc(batch['from']) <= _utc(tx['close_utc']) <= _utc(batch['to'])):
+                        raise EvidenceError('Cost posting outside fetched history window')
+                    candidate = build_cost_record(tx, self.account_id, deal_id)
+                    if candidate is None or candidate['cost_id'] not in identified:
+                        economics_complete = False
+                        break
+            if economics_complete:
+                record = reconcile_completed_trade(pos, batch['transactions'], costs,
+                                                   history_complete=True, costs_complete=True)
+            record['provenance']['history_fetch_complete'] = True
+            record['provenance']['economic_evidence_complete'] = economics_complete
             for part in record["realizations"]:
                 if _utc(part["exit_utc"]) > _utc(batch["to"]):
                     raise EvidenceError("Realization outside fetched history window")
@@ -235,6 +258,8 @@ class PendingCloseStore:
             record = entry.get("record") if entry else None
             if not record or record["status"] != "complete":
                 raise EvidenceError("Pending outcome cannot be delivered")
+            if record.get('provenance', {}).get('economic_evidence_complete') is not True:
+                raise EvidenceError('Legacy economic completion requires evidence review')
             if record.get('costs') and entry.get('cost_claim_version') != 2:
                 raise EvidenceError('Legacy cost records cannot be delivered')
             if data[entry["opening_key"]] != [field]:

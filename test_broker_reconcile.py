@@ -19,6 +19,7 @@ C2c-9 — restart / idempotency
 """
 
 import unittest
+from copy import deepcopy
 from unittest.mock import Mock
 
 import fakeredis
@@ -30,6 +31,9 @@ from broker_pending import PendingCloseStore
 from broker_reconcile import reconcile_position
 from test_broker_ledger import position, realization
 from test_broker_pending import FaultClient, page, register, COST_EVIDENCE, START, END
+
+COST_EVIDENCE = deepcopy(COST_EVIDENCE)
+COST_EVIDENCE['components']['commission']['total'] = '-18'
 
 
 ACCOUNT_ID = "fixture-account"

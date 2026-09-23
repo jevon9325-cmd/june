@@ -42,12 +42,13 @@ the position's instrument.  Callers must NOT silently treat this as zero cost.
 
 cost_complete semantics
 -----------------------
-cost_complete=True means all trading costs for this position have been identified
-and attributed.  This requires:
+cost_complete=True means only that the supplied batch has no unresolved cost
+rows. It is NOT economic finality and says nothing about delayed postings.
+broker_finality separately validates positive finality evidence. This requires:
   1. deal_references supplied (closing-leg commissions confirmed)
   2. entry_reference supplied (opening-leg commission confirmed)
   3. No unresolved COMM rows (all referenced COMM rows in known deal refs)
-  4. No SWAP rows for this instrument (financing attribution impossible)
+  4. No unresolved financing or account-level costs (no guessed exclusion)
 cost_complete=False: pass costs_complete=False to reconcile_completed_trade and
 leave net_realized_pnl as None.  Do not treat missing costs as zero.
 """
@@ -195,7 +196,9 @@ def attribute_costs(position_evidence, normalized_transactions,
       - deal_references or entry_reference is not supplied
       - any SWAP rows are present for this instrument (financing not resolvable)
       - any unattributed COMM rows remain
-    Only when all of the above are resolved is cost_complete True.
+      - any unresolved account-level costs (including descriptive financing)
+    Only when all of the above are resolved is cost_complete True. This is a
+    batch-local attribution result, never proof that no costs will arrive later.
 
     Returns:
     {
@@ -288,6 +291,9 @@ def attribute_costs(position_evidence, normalized_transactions,
             "instrument-level financing present for this position's instrument; "
             "SWAP attribution at position level requires deal ID in SWAP rows "
             "(inherent IG history API limitation) — cost_complete cannot be asserted")
+    elif account_costs:
+        complete = False
+        reason = 'unresolved account costs or financing; absence of an exact instrument match is not exclusion proof'
     elif unattributed:
         complete = False
         reason = (f"{len(unattributed)} commission row(s) with reference not in "

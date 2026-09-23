@@ -15,10 +15,9 @@ as more evidence arrives; the store advances automatically.
   T1  DEAL row present, COMM absent    → pending_costs
   T2  DEAL + COMM + cost_evidence      → complete
 
-cost_evidence is an explicit external attestation ({source, reference,
-covered_through}) that the caller supplies when they can confirm all costs
-have been accounted for.  Finding no cost rows in the batch is NOT
-sufficient — the store requires the attestation to finalize.
+cost_evidence follows broker_finality's version-2 position-scoped statement
+contract: final component totals plus positive broker posting-finality evidence.
+History coverage or an empty cost list never establishes economic completion.
 
 Idempotency
 -----------
@@ -54,7 +53,7 @@ def reconcile_position(store, deal_id, raw_batch, position_evidence,
                         the registered broker opening.
     entry_reference   : str or None — opening COMM reference from the entry
                         confirmation.  Needed to attribute the opening-leg commission.
-    cost_evidence     : dict or None — {source, reference, covered_through}.
+    cost_evidence     : dict or None — broker_finality version-2 statement.
                         Only passed to the store when attribution.cost_complete is
                         True — unattributed costs must not be silently ignored.
                         When None, the record stays pending_costs even if all costs

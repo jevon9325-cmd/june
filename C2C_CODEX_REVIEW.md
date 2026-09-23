@@ -150,3 +150,30 @@ This detects known ambiguity; it does not establish completeness of the opening
 registry, resolve absent history rows, or undo already delivered historical data.
 Existing pre-index registrations need evidence review/re-registration before use.
 The first-claim rule alone remains insufficient as economic ownership proof.
+
+## Correction 5: positive economic finality contract
+
+Legacy source/reference/covered_through attestation no longer finalizes a trade.
+broker_finality.py defines version-2 input evidence: exact account/position scope,
+full accrual coverage, separately referenced broker posting finality, fetched
+coverage through that posting horizon, and explicitly final commission/financing/
+other signed totals. Totals must reconcile to identified costs. No hard-coded
+posting delay or wall-clock maturity is invented. Nonzero financing remains
+pending because no verified position attribution exists; offsetting other credits
+cannot hide it. Explicit final zero components can establish zero costs only
+conditional on authentic, externally verified broker statement evidence.
+
+Both pipeline and direct store calls block visible unresolved account costs,
+reference-less commissions and descriptive/unknown financing. Capital flows stay
+excluded. Provenance now separates history_fetch_complete from
+economic_evidence_complete. Legacy completed records lacking that evidence cannot
+be projected. This is a contract validator, NOT a broker statement authenticator;
+there is no production adapter supplying such finality evidence. Synthetic fixture
+attestations demonstrate validation, not that an IG posting-finality source exists.
+
+Fourteen additional tests cover legacy coverage, absent expected commissions,
+individual component finality, immature posting horizons, positive zero costs,
+delayed entry/exit commissions and financing after restart, unknown account costs,
+direct-store bypass, position/window mismatch, non-trading flows, offsetting costs,
+out-of-window postings, and legacy projection quarantine. Full offline suite:
+304 PASS. Compile and diff checks PASS; complete change reviewed.
