@@ -40,7 +40,7 @@ def pos(**changes):
         "direction": "short",
         "entry_price": "4352.53",
         "original_quantity": "0.16",
-        "opened_utc": None,
+        "opened_utc": "2026-09-21T05:45:56",
     }
     base.update(changes)
     return base
@@ -236,11 +236,11 @@ class MatchingTests(unittest.TestCase):
         self.assertIn("direction", m["basis"])
         self.assertIn("close_quantity", m["basis"])
 
-    def test_high_confidence_when_position_quantity_unknown(self):
-        """No position quantity → cannot confirm size → HIGH_CONFIDENCE not EXACT."""
+    def test_exact_identity_when_position_quantity_unknown(self):
+        """Exact opening identity does not require full-close quantity."""
         txs = _batch()
         result = match_realizations(pos(original_quantity=None), txs)
-        self.assertEqual(result["confidence"], HIGH_CONFIDENCE)
+        self.assertEqual(result["confidence"], EXACT)
         self.assertNotIn("close_quantity", result["matches"][0]["basis"])
 
     def test_no_match_empty_transaction_list(self):
@@ -296,7 +296,7 @@ class MatchingTests(unittest.TestCase):
         """Two partial closes at the same open_price/direction: cannot pick one → AMBIGUOUS."""
         partial_a = realization("partial-a", "-0.08", "0.09")
         partial_b = realization("partial-b", "-0.08", "0.05")
-        # pos has original_quantity=None so quantity check skipped; both are HIGH_CONFIDENCE
+        # pos has original_quantity=None so quantity check skipped; both have exact opening identity
         txs = _batch([partial_a, partial_b])
         result = match_realizations(pos(original_quantity=None), txs)
         self.assertEqual(result["confidence"], AMBIGUOUS)
@@ -315,7 +315,8 @@ class MatchingTests(unittest.TestCase):
                                 openDateUtc="2026-09-21T05:46:56")
 
         primary_pos = pos(entry_price="4352.53", original_quantity="0.16")
-        addon_pos   = pos(entry_price="4341.05", original_quantity="0.04")
+        addon_pos   = pos(entry_price="4341.05", original_quantity="0.04",
+                          opened_utc="2026-09-21T05:46:56")
 
         txs = _batch([first_tx, second_tx])
 
@@ -334,9 +335,9 @@ class MatchingTests(unittest.TestCase):
     def test_exact_match_promoted_by_open_utc_when_quantity_absent(self):
         """open_utc is a confirming field: HIGH_CONFIDENCE + matching UTC → EXACT."""
         txs = _batch()  # openDateUtc="2026-09-21T05:45:56" → normalized "+00:00"
-        # Without quantity AND without opened_utc: HIGH_CONFIDENCE
+        # Without opening UTC the identity is ambiguous
         result_hc = match_realizations(pos(original_quantity=None, opened_utc=None), txs)
-        self.assertEqual(result_hc["confidence"], HIGH_CONFIDENCE)
+        self.assertEqual(result_hc["confidence"], AMBIGUOUS)
         # With matching opened_utc: EXACT
         result_ex = match_realizations(
             pos(original_quantity=None, opened_utc="2026-09-21T05:45:56+00:00"), txs)
@@ -351,12 +352,12 @@ class MatchingTests(unittest.TestCase):
         self.assertEqual(result["confidence"], EXACT)
         self.assertIn("open_utc", result["matches"][0]["basis"])
 
-    def test_partial_close_quantity_mismatch_gives_high_confidence(self):
-        """Partial close (0.08) doesn't match position quantity (0.16) → HIGH_CONFIDENCE."""
+    def test_partial_close_quantity_does_not_change_identity(self):
+        """Exact opening identity does not require full-close quantity."""
         partial_tx = realization("partial", "-0.08", "0.09")
         txs = _batch([partial_tx])
         result = match_realizations(pos(), txs)  # pos quantity=0.16; tx quantity=0.08
-        self.assertEqual(result["confidence"], HIGH_CONFIDENCE)
+        self.assertEqual(result["confidence"], EXACT)
         self.assertNotIn("close_quantity", result["matches"][0]["basis"])
 
     def test_long_position_exact_match(self):

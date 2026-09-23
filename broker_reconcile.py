@@ -32,7 +32,7 @@ excess_close is never resolved by guessing — it raises immediately.  The
 caller must supply opened_utc in position_evidence to disambiguate.
 """
 
-from broker_ledger import EvidenceError
+from broker_ledger import EvidenceError, _number, _utc
 from broker_transaction import normalize_batch
 from broker_match import collect_lifecycle_realizations
 from broker_cost import attribute_costs
@@ -50,7 +50,8 @@ def reconcile_position(store, deal_id, raw_batch, position_evidence,
                         account_id, history_complete=True, from, to, transactions.
     position_evidence : dict — position identity: account_id, deal_id,
                         broker_instrument, direction, entry_price,
-                        original_quantity.  opened_utc sharpens same-price matching.
+                        original_quantity, currency and exact opened_utc. Must match
+                        the registered broker opening.
     entry_reference   : str or None — opening COMM reference from the entry
                         confirmation.  Needed to attribute the opening-leg commission.
     cost_evidence     : dict or None — {source, reference, covered_through}.
@@ -77,12 +78,31 @@ def reconcile_position(store, deal_id, raw_batch, position_evidence,
     if not isinstance(position_evidence, dict):
         raise EvidenceError("Position evidence dict required")
 
+    entry = store.get_entry(deal_id)
+    if not entry or not entry.get("opening"):
+        raise EvidenceError("Registered broker opening required")
+    opening = entry["opening"]
+    for field in ("account_id", "deal_id", "broker_instrument", "direction", "currency"):
+        if position_evidence.get(field) != opening.get(field):
+            raise EvidenceError(f"Caller identity differs from registered opening: {field}")
+    for field in ("entry_price", "original_quantity"):
+        if _number(position_evidence.get(field)) != _number(opening[field]):
+            raise EvidenceError(f"Caller identity differs from registered opening: {field}")
+    if _utc(position_evidence.get("opened_utc")) != _utc(opening["opened_utc"]):
+        raise EvidenceError("Caller opening UTC differs from registered opening")
+    registered_ref = entry["ownership_evidence"]["dealReference"]
+    if entry_reference is not None and entry_reference != registered_ref:
+        raise EvidenceError("Entry reference differs from accepted opening receipt")
+    position_evidence = opening
+
     # C2c-A: normalize all rows in the batch (DEAL, COMM, DEPO, SWAP, …)
     normalized = normalize_batch(raw_batch)
 
     # C2c-B: lifecycle — accumulate all matching DEAL rows
     lc = collect_lifecycle_realizations(position_evidence, normalized)
 
+    if lc["lifecycle_state"] == "ambiguous":
+        raise EvidenceError("Exact realization opening identity required")
     if lc["lifecycle_state"] == "conflict":
         raise EvidenceError(f"Realization conflict for deal {deal_id}: {lc['notes']}")
     if lc["lifecycle_state"] == "excess_close":

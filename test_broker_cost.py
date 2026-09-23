@@ -329,7 +329,7 @@ class CostReconcileIntegrationTests(unittest.TestCase):
              "broker_instrument": "Micron Technology",
              "direction": "long",
              "entry_price": "955.25",
-             "original_quantity": "1"},
+             "original_quantity": "1", "opened_utc": pos["opened_utc"]},
             txs)
         self.assertEqual(lc["lifecycle_state"], "full_close")
         costs = attribute_costs(
@@ -365,7 +365,7 @@ class CostReconcileIntegrationTests(unittest.TestCase):
              "broker_instrument": pos["broker_instrument"],
              "direction": pos["direction"],
              "entry_price": pos["entry_price"],
-             "original_quantity": pos["original_quantity"]},
+             "original_quantity": pos["original_quantity"], "opened_utc": pos["opened_utc"]},
             txs)
         self.assertEqual(lc["lifecycle_state"], "partial_close")
         costs = attribute_costs(
@@ -434,9 +434,9 @@ class AddOnPrimaryIdentityTests(unittest.TestCase):
         })
 
         primary_pos = {"account_id": ACCOUNT_ID, "broker_instrument": "Spot Gold ($1)",
-                       "direction": "short", "entry_price": "4352.53", "original_quantity": "0.16"}
+                       "direction": "short", "entry_price": "4352.53", "original_quantity": "0.16", "opened_utc": "2026-09-21T05:45:56"}
         addon_pos   = {"account_id": ACCOUNT_ID, "broker_instrument": "Spot Gold ($1)",
-                       "direction": "short", "entry_price": "4341.05", "original_quantity": "0.04"}
+                       "direction": "short", "entry_price": "4341.05", "original_quantity": "0.04", "opened_utc": "2026-09-21T05:46:56"}
 
         primary_lc = collect_lifecycle_realizations(primary_pos, txs)
         addon_lc   = collect_lifecycle_realizations(addon_pos, txs)
@@ -467,7 +467,7 @@ class AddOnPrimaryIdentityTests(unittest.TestCase):
             "transactions": [full_primary, full_addon],
         })
         pos = {"account_id": ACCOUNT_ID, "broker_instrument": "Spot Gold ($1)",
-               "direction": "short", "entry_price": "4352.53", "original_quantity": "0.16"}
+               "direction": "short", "entry_price": "4352.53", "original_quantity": "0.16", "opened_utc": "2026-09-21T05:45:56"}
         result = collect_lifecycle_realizations(pos, txs)
         # 0.16 + 0.16 = 0.32 > 0.16 → excess_close; we can't know which belongs to primary
         self.assertEqual(result["lifecycle_state"], "excess_close")

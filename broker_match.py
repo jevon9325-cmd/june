@@ -1,40 +1,15 @@
-"""Open/close matching between pending June positions and normalized transactions.
+"""Match broker history by the complete opening tuple, never by reference.
 
-No bot import, network, Redis, or orders.  Pure functions only.
-
-Match confidence states
------------------------
-EXACT           All key identity fields present and matching; single candidate.
-HIGH_CONFIDENCE Core fields match (account + instrument + open_price + direction);
-                at least one confirming field (quantity or open_utc) absent.
-AMBIGUOUS       Multiple transactions reach HIGH_CONFIDENCE or above for one position.
-NO_MATCH        No transaction reaches the minimum identity threshold.
-CONFLICT        A transaction matches account + instrument + open_price but
-                contradicts direction — evidence is internally inconsistent.
-
-Reference alone is explicitly forbidden as a matching key.  Real IG history
-contains cases where two distinct realizations share the same closing reference
-but have different opening tuples (instrument + openDateUtc + openLevel) that
-identify different positions.  The matcher never uses reference for identity.
-
-Identity hierarchy (strongest first)
--------------------------------------
-1. account_id              [required — 1 pt]
-2. instrument_name         [1 pt; required for >= HIGH_CONFIDENCE]
-3. open_price              [1 pt; strong discriminator]
-4. direction               [1 pt; required for >= HIGH_CONFIDENCE;
-                            CONFLICT if present and contradicts when score >= 3]
-5. close_quantity          [1 pt; confirming]
-6. open_utc                [1 pt bonus; confirming; promotes to EXACT without quantity]
-
-EXACT  requires: account + instrument + open_price + direction
-              + at least one confirming field (close_quantity or open_utc).
-HIGH_CONFIDENCE: account + instrument + open_price + direction only.
+EXACT requires account, instrument, price, direction and opening UTC.
+Quantity describes a realization, not opening identity. Missing UTC is
+AMBIGUOUS; a different known UTC is NO_MATCH. HIGH_CONFIDENCE is retained
+as a compatibility constant but is never emitted for incomplete identity.
+Pure offline functions; no runtime or broker side effects.
 """
 
 from decimal import Decimal, InvalidOperation
 
-from broker_ledger import EvidenceError
+from broker_ledger import EvidenceError, _key
 from broker_transaction import UNKNOWN, parse_utc
 
 EXACT           = "EXACT"
@@ -44,7 +19,6 @@ NO_MATCH        = "NO_MATCH"
 CONFLICT        = "CONFLICT"
 
 _REQUIRED_FOR_HIGH = frozenset({"account_id", "instrument_name", "open_price", "direction"})
-_CONFIRMING       = frozenset({"close_quantity", "open_utc"})
 
 
 def _decimal_eq(a, b):
@@ -91,6 +65,11 @@ def _score_transaction(norm_tx, position):
     if score < 2:
         return score, basis, False
 
+    tx_utc = norm_tx.get("open_utc")
+    pos_utc = parse_utc(position.get("opened_utc"))
+    if tx_utc not in (None, UNKNOWN) and pos_utc != UNKNOWN and tx_utc != pos_utc:
+        return 0, [], False
+
     # Open price — strong discriminator
     op = norm_tx.get("open_price")
     ep = position.get("entry_price")
@@ -130,7 +109,7 @@ def _score_transaction(norm_tx, position):
 
 
 def _is_exact(basis):
-    return _REQUIRED_FOR_HIGH.issubset(basis) and bool(_CONFIRMING & set(basis))
+    return _REQUIRED_FOR_HIGH.issubset(basis) and "open_utc" in basis
 
 
 def _is_high_confidence(basis):
@@ -138,42 +117,13 @@ def _is_high_confidence(basis):
 
 
 def collect_lifecycle_realizations(position, normalized_transactions):
-    """Collect ALL DEAL transactions attributable to this position's full lifecycle.
+    """Collect deduplicated realizations with a complete matching opening tuple.
 
-    Unlike match_realizations() which signals AMBIGUOUS when multiple transactions
-    reach HIGH_CONFIDENCE, this function ACCUMULATES all matching DEAL rows as the
-    position's complete realization set.  Correctly handles partial + residual
-    close sequences without requiring the caller to resolve AMBIGUOUS manually.
-
-    Matching criterion: all four core fields must match — account, instrument,
-    open_price, direction.  Quantity is NOT required for collection; individual
-    partial closes may be smaller than original_quantity.  When opened_utc is
-    known on the position it acts as an additional filter via _score_transaction,
-    preventing same-price positions from mixing.
-
-    Lifecycle states:
-      full_close:    sum(close_quantity) == original_quantity  [Stage 1 AMBIGUOUS resolved]
-      partial_close: sum < original_quantity (residual close still pending)
-      excess_close:  sum > original_quantity — AMBIGUOUS; two or more positions
-                     likely share this opening identity.  Supply opened_utc to resolve.
-                     Do NOT pick one transaction arbitrarily from an excess_close result.
-      no_match:      no DEAL row matches the minimum four identity fields
-      conflict:      a matched row contradicts direction
-
-    Limitation: without opened_utc, same-price same-direction positions cannot be
-    distinguished.  excess_close is the signal; the Stage 1 AMBIGUOUS limitation is
-    not fully resolved in this case — see broker_match module docstring.
-
-    Returns:
-    {
-      "lifecycle_state":       str,
-      "realizations":          list of matched norm_tx dicts (ALL partials + residual)
-      "total_closed_quantity": Decimal string or UNKNOWN
-      "quantity_accounted":    bool — True only when sum == original_quantity
-      "deal_references":       set[str] — references from all matched DEAL rows
-      "raw_rows":              list[dict] — norm_tx["raw"] for reconcile_completed_trade
-      "notes":                 str
-    }
+    Missing opening UTC returns ambiguous with no attributable references.
+    Known different opening UTC excludes the row. Quantity determines partial,
+    full or excess close only after identity is established. Exact duplicate
+    normalized rows count once; the ledger still validates economic conflicts.
+    This does not prove uniqueness among unregistered broker openings.
     """
     if not isinstance(position, dict):
         raise EvidenceError("Position evidence dict required")
@@ -182,14 +132,28 @@ def collect_lifecycle_realizations(position, normalized_transactions):
 
     realizations = []
     conflicts = []
+    uncertain = []
+    seen = set()
 
     for norm_tx in normalized_transactions:
         score, basis, is_conflict = _score_transaction(norm_tx, position)
         if is_conflict:
             conflicts.append(norm_tx)
-        elif _REQUIRED_FOR_HIGH.issubset(set(basis)):
-            # All 4 core identity fields confirmed — include regardless of quantity match
-            realizations.append(norm_tx)
+        elif _is_exact(basis):
+            fingerprint = _key(norm_tx)
+            if fingerprint not in seen:
+                seen.add(fingerprint)
+                realizations.append(norm_tx)
+        elif _is_high_confidence(basis):
+            uncertain.append(norm_tx)
+
+    if uncertain:
+        return {
+            "lifecycle_state": "ambiguous", "realizations": [],
+            "total_closed_quantity": UNKNOWN, "quantity_accounted": False,
+            "deal_references": set(), "raw_rows": [],
+            "notes": "Exact opening UTC is required; quantity cannot establish identity",
+        }
 
     if conflicts and not realizations:
         return {
@@ -328,7 +292,7 @@ def match_realizations(position, normalized_transactions):
         }
 
     match = candidates[0]
-    confidence = EXACT if _is_exact(match["basis"]) else HIGH_CONFIDENCE
+    confidence = EXACT if _is_exact(match["basis"]) else AMBIGUOUS
     return {
         "confidence": confidence,
         "matches": [match],

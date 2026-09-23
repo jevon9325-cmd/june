@@ -33,7 +33,7 @@ from test_broker_pending import FaultClient, page, register, COST_EVIDENCE, STAR
 
 
 ACCOUNT_ID = "fixture-account"
-ENTRY_REF  = "open-ref-1"
+ENTRY_REF  = "entry-reference"
 POS        = position()  # default fixture: short Gold, opened_utc 2026-09-21T05:45:56
 
 
