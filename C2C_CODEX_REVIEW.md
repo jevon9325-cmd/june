@@ -70,3 +70,44 @@ cases. Targeted 77 tests PASS. Full suite: 280 tests PASS.
 Cash helpers are offline only; _utc callers reviewed in history/pending and
 normalization. June does not call these helpers. june.py remains byte-unchanged
 from the pre-C2c baseline. py_compile and diff checks PASS; full diff reviewed.
+
+## Durable continuation checkpoint
+
+Correction commits: eb2635f (opening identity), 1e48c7d (parsing).
+Current complete offline suite: 280 PASS, versus Claude baseline 271.
+No failed or expected-failure tests retained. Working tree cleaned by commits.
+
+Offline diagnostic probes after both corrections (fake Redis, no network):
+
+| Probe | Observed result |
+|---|---|
+| Identical normalized COMM, claimant a vs b | Different cost IDs |
+| Same reference/amount, posting 07:00 vs 08:00 | Same cost ID |
+| Same COMM shared reference, two candidate positions | Assigned once to each |
+| DEAL only plus current three-field cost attestation | complete, net -0.16 |
+| DEAL plus reference-less -9 COMM and attestation | complete, net -0.16 |
+| DEAL plus descriptive -0.50 SWAP and attestation | complete, net -0.16 |
+
+The SWAP description was exactly: Daily Financing Adjustment - FX Interest for
+1 day Spot Gold ($1). None of these results establishes legitimate zero costs.
+The last two omit visible unresolved economic rows. The first three expose
+identity/attribution defects. These are blockers, not approved behavior.
+
+Cost correction has NOT been started. Next independent change must add regression
+tests first, establish claimant-independent source cost identity plus atomic
+claims, reject reference-only ambiguous allocation, and strengthen the finality
+contract beyond covered_through. Do not invent source IDs or a posting-delay
+threshold where broker evidence cannot distinguish rows. Preserve unresolved
+rows rather than finalize. Inspect schema compatibility with saved pending and
+completed records before changing IDs. Keep this separate from the two commits.
+
+Continue remaining review of realization source identity (instrument omission),
+late opening collisions, overlapping windows, economic finality, claim concurrency,
+and five-equity-trade pipeline fixture. Broker capture source was inspected:
+local SQLite immutable evidence and replay are not proof of broker economics;
+unknown account/opening provenance remains quarantined. Full suite includes its
+failure-injection tests. No Stage D/E or runtime adapters were connected.
+
+Checkpoint verdict: REVIEW INCOMPLETE / NOT APPROVED. Do not interpret 280 passing
+tests as certification of cost attribution or broker-net completed outcomes.
+Stopped at independent verified commits per the requested token-discipline rule.
