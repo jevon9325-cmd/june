@@ -224,3 +224,100 @@ remain limitations for later ledger work. All new state fields are additive JSON
 ### D verification
 
 Targeted position-evidence plus C2b capture tests: 31 passed. Full suite: 157 passed in 10.596s. An initial full run correctly detected the added outcome event in two exact-event crash expectations; those now require it. py_compile, whitespace/stat/status checks and complete source/test diff review passed. AST scope: guard, primary close, partial comment, exit check, addon close, entry caution, pyramid-entry caution, main-loop orphan handling and recovery. All module-level assignments/constants are unchanged. No broker payload contract beyond A changed; a pending partial now supplies the verified residual size to an existing protective close.
+
+Commit: `bbc8779`.
+
+## PS1-F: recovery provenance
+
+Baseline recovery treated inventory order as primary/addon assignment, defaulted
+missing direction to BUY and missing/invalid creation time to now, and logged
+Redis loss as if known. It could also attach an opposite-direction position to a
+pyramid whose aggregate exit logic uses the primary's instrument/direction.
+
+Recovered positions now explicitly distinguish `management_role` and its local
+assignment basis from `historical_origin=unknown`. A missing or invalid broker
+timestamp remains `broker_opened_utc=null`; the operational entry clock is
+labelled `recovery_observation`. Valid full UTC timestamps retain fractions and
+timezone semantics. Date-only evidence does not become an invented midnight
+opening. Inventory ordering can still assign temporary management roles; it does
+not establish original strategy ownership or opening intent.
+
+Direction is no longer guessed. Newly discovered rows need known instrument,
+BUY/SELL, and finite positive size/level. Missing fields or an incompatible
+instrument/direction group are retained as raw `recovery_unresolved_positions`,
+captured through C2b, logged and flagged for review. Valid compatible positions
+still enter risk management even alongside an unresolved row. Existing tracked
+positions remain manageable; these flags block expansion, not protective DELETE.
+This deliberately does not invent a new cross-instrument/opposite-direction
+pyramid strategy. Such incompatible positions require separate manual management.
+
+Surviving opening evidence is retained when a known addon becomes primary, and
+the addon list is rebuilt without duplicating that deal. Existing primary
+promotion also carries provenance fields forward. No recovered position gains a
+fabricated verified opening account or economically reconciled status.
+
+## PS1-G: SOYBEANS units
+
+Evidence source: the preceding integration investigation's read-only IG v3
+`/markets/CC.D.S.BMU.IP` response, recorded in
+`../integration-audit-20260922-110855/INTEGRATION_REPORT.md`, section 4E.
+Its inspection was at 2026-09-22 16:16 UTC; this is retained metadata evidence,
+not a new current-price assertion. Fields: Soybeans ($1), lotSize=1,
+contractSize="1", unit=CONTRACTS, onePipMeans="1 cents per bushel",
+valueOfOnePip="1.00", USD/baseExchangeRate=1, minDeal=.04, marginFactor=2
+PERCENTAGE, bid1340.5/offer1341.7, midpoint1341.1.
+
+Native minimum exposure is `.04 * 1 * 1341.1 = $53.644`; margin is $1.07288.
+Eligibility's `.01` conversion therefore needs the existing `100.0` multiplier.
+**The override remains 100.0. Actual IG sizing and native-price P&L formulas are
+unchanged.** A desired $134.11 produces .10 contracts; changing the eligibility
+override does not change that sizing function. A one-native-point move on .04
+contracts yields $.04 in the actual close-accounting fixture.
+
+Two concrete surrounding defects were repaired:
+
+1. Cached native-price inversion divided by minDeal*lotSize*.01, returning134110
+   from the corrected $53.644 cache instead of1341.1. Both cached inversions now
+   use the same effective notional multiplier as the cache producer. Explicit
+   positive-mid callers retain their stop calculation; cached fallback now agrees.
+2. Market-data reconciliation skipped caches <=$1, so a former cent-error value
+   .53644 survived valid metadata. Override instruments now refresh from the
+   broker snapshot even for absent/sub-dollar seeds, retaining four decimals.
+   Non-override cache thresholds remain unchanged. This can change SOYBEANS
+   eligibility and its shared SIM/live cache, by correcting units; it does not
+   change its strategy, allocation, leverage, target, order sizing or P&L formula.
+
+The override is instrument-specific, not a universal IG contract rule. Without
+valid market metadata/snapshot, no fresh unit verification can be claimed; the
+existing failed-fetch guards remain relevant. Legacy unversioned caches and
+future broker specification changes still require operational attention.
+
+## Remaining limits and deployment boundary
+
+- Capital-flow policy is resolved but not implemented: dated/account-specific
+  flows and a defensible opening equity baseline are prerequisites. No arbitrary
+  $150 reset and no C2c history adapter were introduced.
+- This is offline evidence-based verification, not a broker execution trial.
+  No live test order was placed. Production still runs its previous revision.
+- Incompatible/malformed recovered positions remain explicit unresolved exposure
+  requiring review; PS1 does not redesign June into a general multi-position book.
+- Unknown close outcomes can still suffer broker latency, outages, stale sizes
+  and rejected protective requests. Deal-specific DELETE prevents those requests
+  from becoming fresh opposite orders; it cannot guarantee execution availability.
+- Pending partial economics are not reconstructed from size alone. Existing
+  estimated P&L/learning, lost confirmation attribution and crash/restart
+  idempotence still require later ledger/consumer work. C2b capture is preserved,
+  not promoted into proof of economic completion.
+- Existing account-selection/freshness concerns, zero-equity circuit-breaker
+  guard, kill-switch coupling to protective orders, and known addon exposure
+  accounting remain separate risks. No policy/strategy redesign was attempted.
+- SQLite/Redis capture retains its existing synchronous-I/O and both-sinks-down
+  durability limits. Existing storage-failure/replay tests remain in the suite.
+
+No production source edit, production Redis write, restart, push, deployment,
+broker action, account switch or kill-switch modification occurred in PS1.
+The only production inspection was read-only historical journal inspection.
+
+### F/G verification
+
+F/G targeted: 15 passed. Final full offline suite: 172 passed in 8.712s (135 baseline + 37 PS1 tests). Initial red cases covered unknown-role fields, invented BUY, opposite-direction grouping, 100x fallback, skipped sub-dollar cache; later edge regressions covered valid-row management, known-addon identity preservation and date-only timestamp inference. py_compile and git diff --check/stat/status passed. Full source/test diff reviewed. AST scope is market-data cache reconciliation, cached price inversion, provenance carryover in primary promotion, new recovery metadata helper and recovery. All module-level assignments/constants match the previous commit. Actual order-sizing, entry helpers and circuit-breaker formula are unchanged. Existing JSON schemas accept additive provenance/pending fields; C2b identity, immutable capture, storage-failure, replay and economic-completion separation tests pass.

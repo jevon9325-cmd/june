@@ -7351,7 +7351,7 @@ def _live_fetch_market_data(sym: str, epic: str) -> bool:
             _ref_p = (_s_bid + _s_off) / 2.0
         else:
             _mn = _sim_min_notional.get(sym, 0.0)
-            _denom = min_val * lot_sz * price_unit
+            _denom = min_val * _LIVE_LOT_NOTIONAL_OVERRIDES.get(sym, lot_sz) * price_unit
             _ref_p = _mn / _denom if (_mn > 0 and _denom > 0) else 0.0
         if _ref_p > 0:
             _ms_val = _ref_p * _pct_frac
@@ -7373,7 +7373,7 @@ def _live_fetch_market_data(sym: str, epic: str) -> bool:
     # Compares live API snapshot data against _sim_min_notional[sym]; corrects if
     # ratio is >3x or <0.33x — thresholds that catch real spec changes (17-50x seen)
     # without reacting to normal 7-day price drift (~5-15%).
-    # FX pairs skipped (lot_formula_suspect). Seeds ($0.04/$0.05) skipped via >$1 guard.
+    # FX pairs skipped. Unit overrides must also repair sub-dollar legacy seeds.
     _snap_d = data.get("snapshot", {})
     _s_bid  = float(_snap_d.get("bid")   or 0)
     _s_off  = float(_snap_d.get("offer") or 0)
@@ -7384,10 +7384,11 @@ def _live_fetch_market_data(sym: str, epic: str) -> bool:
         else:
             _recon_min_n = round(min_val * _LIVE_LOT_NOTIONAL_OVERRIDES.get(sym, lot_sz) * _recon_mid * price_unit, 4)
         _cached_n = _sim_min_notional.get(sym)
-        if _cached_n and _cached_n > 1.0 and _recon_min_n > 0.001:
-            _ratio = _cached_n / _recon_min_n
-            if _ratio > 3.0 or _ratio < 0.33:
-                _sim_min_notional[sym] = round(_recon_min_n, 2)
+        _override_units = sym in _LIVE_LOT_NOTIONAL_OVERRIDES
+        if (_override_units or (_cached_n and _cached_n > 1.0)) and _recon_min_n > 0.001:
+            _ratio = (_cached_n or 0.0) / _recon_min_n
+            if _override_units or _ratio > 3.0 or _ratio < 0.33:
+                _sim_min_notional[sym] = round(_recon_min_n, 4 if _override_units else 2)
                 _sim_eligible.add(sym)
                 try:
                     _redis().set(_NOTIONAL_REDIS_KEY, json.dumps(_sim_min_notional),
@@ -7395,7 +7396,7 @@ def _live_fetch_market_data(sym: str, epic: str) -> bool:
                 except Exception:
                     pass
                 _live_log(
-                    f"⚠️  min_notional reconciled: {sym} ${_cached_n:.2f} → "
+                    f"⚠️  min_notional reconciled: {sym} ${(_cached_n or 0.0):.2f} → "
                     f"${_recon_min_n:.2f} (ratio {_ratio:.1f}x — stale cache corrected)"
                 )
     _live_log(f"LIVE mkt: {sym} lot={lot_sz} minDeal={min_val} pip={pip_sz} unit={price_unit} margin={margin_rate:.0%} min_stop={_live_min_stop_pts[sym]}pts")
@@ -8003,7 +8004,7 @@ def _live_entry_price_ref(sym: str) -> float:
     """Approximate current mid price for sym for stop-point calculation (best-effort).
 
     Uses live lot size and min_deal fetched from LIVE IG API:
-      native_mid ~= min_notional / (min_deal x lot_sz x price_unit)
+      native_mid ~= min_notional / (min_deal x effective_notional_lot x price_unit)
     price_unit=0.01 for cent-denominated instruments (Silver BMU), 1.0 for others.
     This is exact when min_notional was set at current price; acceptable approximation
     otherwise -- stop distance uses actual fill price inside IG platform.
@@ -8012,9 +8013,9 @@ def _live_entry_price_ref(sym: str) -> float:
     lot_sz     = _live_lot_sizes.get(sym, _LIVE_LOT_SIZE_FX)
     min_deal   = _live_min_deal.get(sym, 1.0)
     price_unit = _live_price_unit.get(sym, 1.0)
-    denom      = min_deal * lot_sz * price_unit
+    denom      = min_deal * _LIVE_LOT_NOTIONAL_OVERRIDES.get(sym, lot_sz) * price_unit
     if mn > 0 and denom > 0:
-        return mn / denom    # native_mid ~= min_n / (minDeal x lotSz x price_unit)
+        return mn / denom    # inverse of eligibility/cache notional units
     return 1.0   # safe fallback
 
 
@@ -8858,6 +8859,12 @@ def _live_close_position(exit_reason: str, signals: dict) -> None:
                             "_pyramid_promoted":  True,
                             "broker_entry_evidence": _addon_leg.get("broker_entry_evidence"),
                         }
+                        for _key in ("historical_origin", "entry_time_source", "broker_opened_utc",
+                                     "recovery_observed_at", "broker_created_date_raw"):
+                            if _key in _addon_leg:
+                                _promoted[_key] = _addon_leg[_key]
+                        _promoted["management_role"] = "primary"
+                        _promoted["management_role_basis"] = "surviving_addon_promotion"
                         _live_log(
                             f"[PYRAMID PROMOTE] {sym}: primary {_pv_deal_id} FULLY_CLOSED "
                             f"| addon {_addon_deal} confirmed open (REST + LS no CONFIRMS) "
@@ -10626,6 +10633,32 @@ def run_live_step(signals: dict) -> None:
 # ── Startup ───────────────────────────────────────────────────────────────────
 
 
+def _live_recovery_metadata(position: dict, management_role: str) -> dict:
+    """A management assignment is not evidence of historical opening intent."""
+    from datetime import datetime, timezone
+    observed = time.time()
+    opened = None
+    raw = position.get("createdDateUTC")
+    if isinstance(raw, str) and len(raw) >= 19 and raw[10] in ("T", " "):
+        try:
+            parsed = datetime.fromisoformat(raw.replace("/", "-"))
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)  # field is explicitly UTC
+            opened = parsed.astimezone(timezone.utc)
+        except ValueError:
+            pass
+    return {
+        "historical_origin": "unknown",
+        "management_role": management_role,
+        "management_role_basis": "inventory_recovery_assignment",
+        "broker_opened_utc": opened.isoformat().replace("+00:00", "Z") if opened else None,
+        "entry_time": opened.timestamp() if opened else observed,
+        "entry_time_source": "broker_createdDateUTC" if opened else "recovery_observation",
+        "recovery_observed_at": observed,
+        "broker_created_date_raw": raw,
+    }
+
+
 def _live_reconcile_positions() -> None:
     global _recon_consecutive_404_with_deposit
     # Reconcile _live["open_position"] against IG real open positions.
@@ -10648,6 +10681,45 @@ def _live_reconcile_positions() -> None:
         return
     _recon_consecutive_404_with_deposit = 0
     _live.pop("orphan_suspected", None)
+    # Validate fields needed to manage newly discovered deals. Unknown historical
+    # origin is fine; inventing direction, quantity or an incompatible pyramid is not.
+    import math
+    known = [item for item in [_live.get("open_position"), *_live.get("pyramid_legs", [])] if item]
+    known_ids = {item.get("deal_id") for item in known}
+    primary = _live.get("open_position")
+    group = ((INSTRUMENTS.get(primary.get("instrument")),
+              "BUY" if primary.get("direction") == "long" else "SELL") if primary else None)
+    unresolved = []
+    for row in ig_positions:
+        item = row["position"]
+        if primary and item["dealId"] in known_ids:
+            continue
+        market = row.get("market") or {}
+        epic = market.get("epic") if isinstance(market, dict) else None
+        try:
+            size, level = float(item["size"]), float(item["level"])
+            usable = (math.isfinite(size) and size > 0 and math.isfinite(level) and level > 0
+                      and item.get("direction") in ("BUY", "SELL") and epic in INSTRUMENTS.values())
+        except (KeyError, TypeError, ValueError):
+            usable = False
+        candidate_group = (epic, item.get("direction"))
+        if usable and group is None:
+            group = candidate_group
+        if not usable or candidate_group != group:
+            unresolved.append(row)
+            _live_capture_evidence({"deal_id": item["dealId"], "historical_origin": "unknown"},
+                                   "recovery_unresolved", broker_position=row)
+    if unresolved:
+        _live["recovery_unresolved_positions"] = unresolved
+        _live["orphan_suspected"] = True
+        _live["manual_review_required"] = True
+        _live_log("Recovery requires manual review: missing broker fields or incompatible position group")
+        _live_save_state()
+        ig_positions = [row for row in ig_positions if row not in unresolved]
+        if not ig_positions:
+            return  # unknown rows are not evidence that tracked positions disappeared
+    else:
+        _live.pop("recovery_unresolved_positions", None)
     # Pending partial outcome: restore broker quantity without inventing missing P&L.
     tracked = _live.get("open_position")
     if tracked and tracked.get("partial_exit_pending"):
@@ -10709,22 +10781,18 @@ def _live_reconcile_positions() -> None:
                     _mkt_info = _ig_p.get("market", {})
                     _epic2    = _mkt_info.get("epic", "")
                     _sym2     = {v: k for k, v in INSTRUMENTS.items()}.get(_epic2, _epic2)
-                    _ig_dir2  = _pos_info.get("direction", "BUY")
+                    _ig_dir2  = _pos_info["direction"]
                     _dirn2    = "long" if _ig_dir2 == "BUY" else "short"
                     _ig_sz2   = float(_pos_info.get("size", 0))
                     _fp2      = float(_pos_info.get("level", 0.0))
                     _did2     = _pos_info.get("dealId", "")
                     _dref2    = _pos_info.get("dealReference", "")
-                    _entry2   = time.time()
-                    try:
-                        _cr2 = _pos_info.get("createdDateUTC", "")
-                        if _cr2:
-                            _entry2 = datetime.fromisoformat(_cr2.split(".")[0]).replace(tzinfo=timezone.utc).timestamp()
-                    except Exception:
-                        pass
+                    _recovery2 = _live_recovery_metadata(_pos_info, "addon")
+                    _entry2 = _recovery2["entry_time"]
                     _lot_sz2   = _live_lot_sizes.get(_sym2, _LIVE_LOT_SIZE_FX)
                     _notional2 = _ig_sz2 * _lot_sz2 * _fp2 if _fp2 > 0 else 0.0
                     _leg2 = {
+                        **_recovery2,
                         "instrument": _sym2,
                         "direction":  _dirn2,
                         "deal_id":    _did2,
@@ -10745,7 +10813,7 @@ def _live_reconcile_positions() -> None:
                     _live_log("*** PYRAMID LEG RECOVERED -- STATE RECONSTRUCTED ***")
                     _live_log(f"   Instrument : {_sym2} {_ig_dir2}  size={_ig_sz2}  fill={_fp2}")
                     _live_log(f"   Deal ID    : {_did2}")
-                    _live_log(f"   Root cause : pyramid leg lost across restart (Redis state loss)")
+                    _live_log(f"   Historical origin : UNKNOWN; addon is a management assignment")
                     _live_log(f"   Action     : leg appended to pyramid_legs -- exit management ACTIVE")
                     _live_log(f"   stop/tp    : 0.0 (unknown) -- agg stop will recalculate next cycle")
                     _live_log("=" * 58)
@@ -10768,26 +10836,21 @@ def _live_reconcile_positions() -> None:
         mkt_info   = ig_p.get("market", {})
         epic       = mkt_info.get("epic", "")
         sym        = {v: k for k, v in INSTRUMENTS.items()}.get(epic, epic)
-        ig_dir     = pos_info.get("direction", "BUY")
+        ig_dir     = pos_info["direction"]
         direction  = "long" if ig_dir == "BUY" else "short"
         ig_size    = float(pos_info.get("size", 0))
         fill_price = float(pos_info.get("level", 0.0))
         deal_id    = pos_info.get("dealId", "")
         deal_ref   = pos_info.get("dealReference", "")
-        entry_time = time.time()
-        try:
-            _created = pos_info.get("createdDateUTC", "")
-            if _created:
-                _clean = _created.split(".")[0]
-                entry_time = datetime.fromisoformat(_clean).replace(tzinfo=timezone.utc).timestamp()
-        except Exception:
-            pass
+        _recovery_primary = _live_recovery_metadata(pos_info, "primary")
+        entry_time = _recovery_primary["entry_time"]
         lot_sz   = _live_lot_sizes.get(sym, _LIVE_LOT_SIZE_FX)
         notional = ig_size * lot_sz * fill_price if fill_price > 0 else 0.0
         hold_min = (time.time() - entry_time) / 60.0
 
         _live_capture_active("before_primary_replace")
         _live["open_position"] = {
+            **_recovery_primary,
             "instrument":       sym,
             "direction":        direction,
             "deal_id":          deal_id,
@@ -10805,13 +10868,21 @@ def _live_reconcile_positions() -> None:
             "reversal_count":   0,
             "reconciled":       True,
         }
+        # Reassignment must retain any surviving opening evidence for this deal.
+        for previous in known:
+            if previous.get("deal_id") == deal_id:
+                for key in ("broker_entry_evidence", "historical_origin"):
+                    if key in previous:
+                        _live["open_position"][key] = previous[key]
+        _live_capture_active("before_addon_tracking_replace")
+        _live["pyramid_legs"] = []  # rebuild from inventory; do not duplicate old addons
         _live_log("=" * 58)
         _live_capture_evidence(_live.get("open_position"), "broker_recovered_primary", broker_position=ig_p)
         _live_log("*** ORPHAN POSITION DETECTED -- STATE RECONSTRUCTED ***")
         _live_log(f"   Instrument : {sym} {ig_dir}  size={ig_size}  fill={fill_price}")
         _live_log(f"   Deal ID    : {deal_id}")
-        _live_log(f"   Hold time  : ~{hold_min:.0f} min (from IG creation timestamp)")
-        _live_log(f"   Root cause : Redis state loss or manually-opened position")
+        _live_log(f"   Hold time  : ~{hold_min:.0f} min (management clock; source recorded in state)")
+        _live_log(f"   Historical origin : UNKNOWN; primary is a management assignment")
         _live_log(f"   Action     : open_position populated -- exit management ACTIVE")
         _live_log(f"   stop/tp    : using sim calibration (conservative defaults)")
         _live_log(f"   *** VERIFY : Check IG app -- confirm position is intentional ***")
@@ -10824,22 +10895,18 @@ def _live_reconcile_positions() -> None:
                 _mkt_info2 = _ig_p2.get("market", {})
                 _epic3     = _mkt_info2.get("epic", "")
                 _sym3      = {v: k for k, v in INSTRUMENTS.items()}.get(_epic3, _epic3)
-                _ig_dir3   = _pos_info2.get("direction", "BUY")
+                _ig_dir3   = _pos_info2["direction"]
                 _dirn3     = "long" if _ig_dir3 == "BUY" else "short"
                 _ig_sz3    = float(_pos_info2.get("size", 0))
                 _fp3       = float(_pos_info2.get("level", 0.0))
                 _did3      = _pos_info2.get("dealId", "")
                 _dref3     = _pos_info2.get("dealReference", "")
-                _entry3    = time.time()
-                try:
-                    _cr3 = _pos_info2.get("createdDateUTC", "")
-                    if _cr3:
-                        _entry3 = datetime.fromisoformat(_cr3.split(".")[0]).replace(tzinfo=timezone.utc).timestamp()
-                except Exception:
-                    pass
+                _recovery3 = _live_recovery_metadata(_pos_info2, "addon")
+                _entry3 = _recovery3["entry_time"]
                 _lot_sz3   = _live_lot_sizes.get(_sym3, _LIVE_LOT_SIZE_FX)
                 _notional3 = _ig_sz3 * _lot_sz3 * _fp3 if _fp3 > 0 else 0.0
                 _leg3 = {
+                    **_recovery3,
                     "instrument": _sym3,
                     "direction":  _dirn3,
                     "deal_id":    _did3,
@@ -10853,6 +10920,11 @@ def _live_reconcile_positions() -> None:
                     "leg_index":  len(_extra_ids) + 1,
                     "reconciled": True,
                 }
+                for previous in known:
+                    if previous.get("deal_id") == _did3:
+                        for key in ("broker_entry_evidence", "historical_origin"):
+                            if key in previous:
+                                _leg3[key] = previous[key]
                 _live_capture_evidence(_leg3, "broker_recovered_addon", broker_position=_ig_p2)
                 _live.setdefault("pyramid_legs", []).append(_leg3)
                 _extra_ids.append(_did3)
