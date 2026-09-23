@@ -198,3 +198,92 @@ all observed non-capital cost rows atomically and refuses subsequent cumulative
 history that omits any of them. No silent window merging or evidence deletion.
 The prior independent-cost tests now use independent stores per scenario.
 Full suite 308 PASS; compile/diff checks PASS; full correction reviewed.
+
+## Correction 8: statement currency
+
+Finality evidence must also explicitly match the position currency. Missing or
+foreign currency cannot be silently treated as USD. Added both adversarial
+subcases to the scope test. Full suite remains 308 PASS; compile/diff checks PASS.
+
+## Review verdict at this continuation checkpoint: NOT APPROVED
+
+Start: clean 8ff64e53b3aa97506039ff70606b626a95f7e82a, 280 tests PASS.
+Branch remains integration/broker-truth-main-20260922. Previous Claude and Codex
+commits preserved. This session added 28 test methods plus adversarial subcases.
+
+Verified correction commits:
+- 9afb8c3: source cost fingerprints and atomic cost claims (288 tests).
+- 033ee97: known shared-reference ambiguity (290 tests).
+- 11df42b: positive cost finality contract (304 tests).
+- 05e34e4: realization instrument discriminator/legacy quarantine (307 tests).
+- 3256c2a: unresolved-cost persistence across restart (308 tests).
+- Statement currency guard is included with this final review update.
+
+### Remaining blockers and evidence needed
+
+1. Economic source identity is still not established for indistinguishable rows
+   or revised representations of the same broker event. A normalized content
+   fingerprint is not a broker-issued event identity. Known cross-position
+   duplication and different-posting collisions are repaired, but that does not
+   prove the absolute acceptance invariants for all distinct events/corrections.
+   Need source evidence establishing event uniqueness and correction lineage;
+   do not add hypothetical broker ID fields or row-index identities.
+2. Opening registry completeness is still a prerequisite, not a proven fact.
+   A fake-Redis diagnostic after all repairs completed/projected opening-1, then
+   registered an identical opening under late-collision. The old record still
+   reported complete and the journal projection still held count=1/net=-0.16.
+   Subsequent projection calls are guarded, but existing delivered state is not
+   invalidated. Need a defensible registry-completeness/finality boundary before
+   certification; do not connect adaptive consumers to bypass this blocker.
+3. Version-2 finality validation is conditional on externally verified broker
+   statement evidence. No authenticated posting-finality document/source/adapter
+   is established by this repository or this review. Synthetic finality fixtures
+   must not be represented as real broker guarantees, a known latency bound, or
+   proof of genuinely zero-cost historical trades. Financing remains unresolved.
+4. Legacy saved records need explicit evidence review and migration design before
+   activation. This change intentionally quarantines them; no production records
+   were read, modified, rekeyed or redelivered. Pre-index opening registrations
+   also need review. No automatic migration has been authorized or implemented.
+5. The real five-equity-trade +3.68/-90/-86.32 full-pipeline evidence proof remains
+   unestablished. The existing Micron fixture is not that proof. Do not manufacture
+   broker statement rows or totals to turn a synthetic test into historical proof.
+
+### Acceptance audit (FAIL includes not established, not just a failing test)
+
+| # | Result | Reason |
+|---|---|---|
+| 1 | FAIL | Exact tuple checks work, but incomplete registry/late collisions remain unproven. |
+| 2 | FAIL | Identical realization delivery is idempotent; broker correction lineage is not established. |
+| 3 | FAIL | Instrument collision fixed; indistinguishable separate source events remain unproven. |
+| 4 | FAIL | Atomic identical-cost claims work; content fingerprints cannot prove event identity across revisions. |
+| 5 | FAIL | Distinct times/instruments preserved; economic multiplicity of indistinguishable rows is unknown. |
+| 6 | PASS | Existing duplicate partial and residual fixtures reconcile once with exact Decimal quantities. |
+| 7 | PASS | DEPO/WITH excluded; unknown account flows block net completion. |
+| 8 | PASS | Unattributable financing remains pending and its observed source rows survive restart. |
+| 9 | FAIL | Stronger gate tested, but authentic broker posting-finality evidence remains unestablished. |
+| 10 | PASS | Identical cumulative evidence retries/overlaps, WATCH races and lost acknowledgements are idempotent; regressions refused. |
+| 11 | FAIL | Missing fields/cost finality stay pending; economic multiplicity and registry completeness remain assumptions. |
+| 12 | PASS | No runtime calls to reconcile_position/project_once; adaptive consumers remain disconnected. |
+
+### Final verification and deployment assessment
+
+- Full offline suite: 308 PASS (the live_save_state disconnect warning is the
+  existing injected failure test, not a production connection).
+- Compile: all 26 broker modules and test files PASS; final touched modules also
+  compiled after the statement-currency guard.
+- git diff --check against starting HEAD: PASS; independent correction diffs
+  reviewed in full. Only offline broker evidence modules, tests and this report
+  changed. No unrelated files changed.
+- june.py byte-unchanged against pre-C2c 9e7a2ab. Live order payloads, strategy,
+  sizing, tiers and leverage unchanged. No Stage D/E work.
+- Callers/references reviewed: finality is called by the offline store; cost
+  attribution by the offline pipeline. No adaptive consumer wiring introduced.
+- Runtime/trading behavior changed: NO. Production modified/restarted: NO.
+  Live Redis modified: NO (fake Redis only). Broker actions/deploy/push: NO.
+- The complete C2b + PS1 + C2c candidate is NOT certified ready for controlled
+  production deployment. C2c remains NOT APPROVED; no deployment is authorized.
+
+Continuation should start from this committed clean checkpoint and the blockers
+above. Do not reconstruct old history or interpret 308 passing tests as C2c
+certification. Resolve the source-evidence and registry-finality contracts before
+claiming all twelve acceptance invariants. Stop at C2c.

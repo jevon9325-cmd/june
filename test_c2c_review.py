@@ -283,6 +283,7 @@ class ReviewCostFinalityTests(unittest.TestCase):
 
     def test_cost_statement_must_cover_correct_position_and_entire_lifecycle(self):
         for change in ({'deal_id': 'another'}, {'account_id': 'another'},
+                       {'currency': 'EUR'}, {'currency': None},
                        {'covered_from': '2026-09-21T06:00:00'},
                        {'covered_through': '2026-09-21T00:00:00'}):
             with self.subTest(change=change), self.assertRaises(EvidenceError):

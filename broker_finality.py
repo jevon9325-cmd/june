@@ -23,7 +23,7 @@ def economic_evidence_complete(position, record, batch, evidence):
     # Legacy three-field coverage is fetch coverage, not economic finality.
     if evidence.get('schema_version') != 2:
         return False
-    if any(evidence.get(k) != position[k] for k in ('account_id', 'deal_id')):
+    if any(evidence.get(k) != position[k] for k in ('account_id', 'deal_id', 'currency')):
         raise EvidenceError('Cost statement belongs to another position')
     if not record['realizations'] or _number(record['remaining_quantity']) != 0:
         return False
