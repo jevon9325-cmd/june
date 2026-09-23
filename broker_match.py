@@ -137,6 +137,133 @@ def _is_high_confidence(basis):
     return _REQUIRED_FOR_HIGH.issubset(basis)
 
 
+def collect_lifecycle_realizations(position, normalized_transactions):
+    """Collect ALL DEAL transactions attributable to this position's full lifecycle.
+
+    Unlike match_realizations() which signals AMBIGUOUS when multiple transactions
+    reach HIGH_CONFIDENCE, this function ACCUMULATES all matching DEAL rows as the
+    position's complete realization set.  Correctly handles partial + residual
+    close sequences without requiring the caller to resolve AMBIGUOUS manually.
+
+    Matching criterion: all four core fields must match — account, instrument,
+    open_price, direction.  Quantity is NOT required for collection; individual
+    partial closes may be smaller than original_quantity.  When opened_utc is
+    known on the position it acts as an additional filter via _score_transaction,
+    preventing same-price positions from mixing.
+
+    Lifecycle states:
+      full_close:    sum(close_quantity) == original_quantity  [Stage 1 AMBIGUOUS resolved]
+      partial_close: sum < original_quantity (residual close still pending)
+      excess_close:  sum > original_quantity — AMBIGUOUS; two or more positions
+                     likely share this opening identity.  Supply opened_utc to resolve.
+                     Do NOT pick one transaction arbitrarily from an excess_close result.
+      no_match:      no DEAL row matches the minimum four identity fields
+      conflict:      a matched row contradicts direction
+
+    Limitation: without opened_utc, same-price same-direction positions cannot be
+    distinguished.  excess_close is the signal; the Stage 1 AMBIGUOUS limitation is
+    not fully resolved in this case — see broker_match module docstring.
+
+    Returns:
+    {
+      "lifecycle_state":       str,
+      "realizations":          list of matched norm_tx dicts (ALL partials + residual)
+      "total_closed_quantity": Decimal string or UNKNOWN
+      "quantity_accounted":    bool — True only when sum == original_quantity
+      "deal_references":       set[str] — references from all matched DEAL rows
+      "raw_rows":              list[dict] — norm_tx["raw"] for reconcile_completed_trade
+      "notes":                 str
+    }
+    """
+    if not isinstance(position, dict):
+        raise EvidenceError("Position evidence dict required")
+    if not isinstance(normalized_transactions, list):
+        raise EvidenceError("Normalized transaction list required")
+
+    realizations = []
+    conflicts = []
+
+    for norm_tx in normalized_transactions:
+        score, basis, is_conflict = _score_transaction(norm_tx, position)
+        if is_conflict:
+            conflicts.append(norm_tx)
+        elif _REQUIRED_FOR_HIGH.issubset(set(basis)):
+            # All 4 core identity fields confirmed — include regardless of quantity match
+            realizations.append(norm_tx)
+
+    if conflicts and not realizations:
+        return {
+            "lifecycle_state": "conflict",
+            "realizations": [],
+            "total_closed_quantity": UNKNOWN,
+            "quantity_accounted": False,
+            "deal_references": set(),
+            "raw_rows": [],
+            "notes": f"{len(conflicts)} direction conflict(s); no valid realizations",
+        }
+
+    if not realizations:
+        return {
+            "lifecycle_state": "no_match",
+            "realizations": [],
+            "total_closed_quantity": UNKNOWN,
+            "quantity_accounted": False,
+            "deal_references": set(),
+            "raw_rows": [],
+            "notes": "No DEAL transactions match the 4 core identity fields",
+        }
+
+    total = Decimal("0")
+    total_known = True
+    for r in realizations:
+        cq = r.get("close_quantity")
+        if cq == UNKNOWN:
+            total_known = False
+        else:
+            try:
+                total += Decimal(str(cq))
+            except (InvalidOperation, ValueError):
+                total_known = False
+
+    oq = position.get("original_quantity")
+    if total_known and oq is not None:
+        try:
+            original = Decimal(str(oq))
+            if total == original:
+                state, accounted = "full_close", True
+            elif total < original:
+                state, accounted = "partial_close", False
+            else:
+                state, accounted = "excess_close", False
+        except (InvalidOperation, ValueError):
+            state, accounted = "partial_close", False
+    else:
+        state, accounted = "partial_close", False
+
+    deal_refs = {r.get("reference") for r in realizations
+                 if r.get("reference") not in (UNKNOWN, None)}
+
+    notes_parts = [f"{len(realizations)} realization(s)"]
+    if total_known:
+        notes_parts.append(f"total closed {total}")
+    if state == "excess_close":
+        notes_parts.append(
+            "excess quantity — multiple positions likely share this opening identity; "
+            "provide opened_utc to resolve")
+    if conflicts:
+        notes_parts.append(f"{len(conflicts)} direction conflict(s) present")
+
+    return {
+        "lifecycle_state": state,
+        "realizations": realizations,
+        "total_closed_quantity": str(total) if total_known else UNKNOWN,
+        "quantity_accounted": accounted,
+        "deal_references": deal_refs,
+        "raw_rows": [r.get("raw", {}) for r in realizations],
+        "notes": "; ".join(notes_parts),
+    }
+
+
 def match_realizations(position, normalized_transactions):
     """Match a pending position to normalized DEAL transactions.
 

@@ -1,4 +1,5 @@
-"""Tests for transaction normalization (broker_transaction) and open/close matching (broker_match).
+"""Tests for transaction normalization (broker_transaction), open/close matching (broker_match),
+and lifecycle collection (broker_match.collect_lifecycle_realizations).
 
 No bot import, live Redis, or broker access.
 Reuses the realization() and position() fixtures from test_broker_ledger.
@@ -10,7 +11,7 @@ from copy import deepcopy
 from broker_ledger import EvidenceError
 from broker_transaction import UNKNOWN, normalize_transaction, normalize_batch, parse_utc
 from broker_match import (EXACT, HIGH_CONFIDENCE, AMBIGUOUS, NO_MATCH, CONFLICT,
-                          match_realizations)
+                          match_realizations, collect_lifecycle_realizations)
 from test_broker_ledger import realization, position
 
 
@@ -395,6 +396,127 @@ class MatchingTests(unittest.TestCase):
                 result = match_realizations(p, txs)
                 self.assertIn("notes", result)
                 self.assertIsInstance(result["notes"], str)
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Lifecycle collection tests (C2c-3 partial + residual resolution)
+# ════════════════════════════════════════════════════════════════════════════
+
+class LifecycleTests(unittest.TestCase):
+    """Tests for collect_lifecycle_realizations() — C2c-3 partial/residual reconciliation.
+
+    This resolves the Stage 1 AMBIGUOUS limitation for the partial + residual case:
+    match_realizations() returns AMBIGUOUS for two partial closes of the same position
+    because it can't pick one.  collect_lifecycle_realizations() ACCUMULATES both
+    and returns full_close when their quantities sum to original_quantity.
+    """
+
+    def test_single_full_close_is_full_close(self):
+        result = collect_lifecycle_realizations(pos(), _batch())
+        self.assertEqual(result["lifecycle_state"], "full_close")
+        self.assertTrue(result["quantity_accounted"])
+        self.assertEqual(result["total_closed_quantity"], "0.16")
+        self.assertEqual(len(result["realizations"]), 1)
+
+    def test_partial_plus_residual_resolves_to_full_close(self):
+        """Stage 1 AMBIGUOUS case resolved: two partials sum to original_quantity."""
+        partial_a = realization("partial-a", "-0.08", "0.09")
+        partial_b = realization("partial-b", "-0.08", "-0.04")
+        txs = _batch([partial_a, partial_b])
+        result = collect_lifecycle_realizations(pos(), txs)
+        # Both partials are collected; sum(0.08 + 0.08) == original_quantity(0.16)
+        self.assertEqual(result["lifecycle_state"], "full_close")
+        self.assertEqual(len(result["realizations"]), 2)
+        self.assertTrue(result["quantity_accounted"])
+        self.assertEqual(result["total_closed_quantity"], "0.16")
+
+    def test_partial_only_is_partial_close(self):
+        """Single partial close (0.08 of 0.16 original) → partial_close, residual pending."""
+        partial = realization("partial-a", "-0.08", "0.09")
+        txs = _batch([partial])
+        result = collect_lifecycle_realizations(pos(), txs)
+        self.assertEqual(result["lifecycle_state"], "partial_close")
+        self.assertFalse(result["quantity_accounted"])
+        self.assertEqual(result["total_closed_quantity"], "0.08")
+
+    def test_three_partial_closes_accumulate(self):
+        """Multiple partials: three sub-quantities that sum to original_quantity."""
+        t1 = realization("r1", "-0.06", "0.05")
+        t2 = realization("r2", "-0.06", "0.05")
+        t3 = realization("r3", "-0.04", "-0.03")
+        txs = _batch([t1, t2, t3])
+        result = collect_lifecycle_realizations(pos(), txs)
+        self.assertEqual(result["lifecycle_state"], "full_close")
+        self.assertEqual(len(result["realizations"]), 3)
+        self.assertEqual(result["total_closed_quantity"], "0.16")
+
+    def test_excess_close_signals_shared_opening_identity(self):
+        """Two full-close transactions for same price/direction signal position mixing.
+
+        This is the residual Stage 1 AMBIGUOUS limitation: without opened_utc we
+        cannot separate Position A's close from Position B's close when both were
+        opened at the same price.  excess_close is the correct signal.
+        """
+        full_a = realization("full-a", "-0.16", "0.17")   # Position A's close
+        full_b = realization("full-b", "-0.16", "-0.14")  # Position B's close
+        txs = _batch([full_a, full_b])
+        result = collect_lifecycle_realizations(pos(), txs)
+        self.assertEqual(result["lifecycle_state"], "excess_close")
+        self.assertFalse(result["quantity_accounted"])
+        self.assertIn("excess", result["notes"])
+        self.assertIn("opened_utc", result["notes"])
+        # Both transactions collected — caller must NOT pick arbitrarily
+        self.assertEqual(len(result["realizations"]), 2)
+
+    def test_no_match_empty_transactions(self):
+        result = collect_lifecycle_realizations(pos(), [])
+        self.assertEqual(result["lifecycle_state"], "no_match")
+        self.assertFalse(result["quantity_accounted"])
+        self.assertEqual(result["deal_references"], set())
+
+    def test_no_match_commission_row_not_a_realization(self):
+        comm = {"transactionType": "COMM", "reference": "fee", "profitAndLoss": "-$9"}
+        txs = _batch([comm])
+        result = collect_lifecycle_realizations(pos(), txs)
+        self.assertEqual(result["lifecycle_state"], "no_match")
+
+    def test_conflict_lifecycle(self):
+        """Direction-contradicting transaction → conflict state."""
+        long_tx = realization(quantity="0.16")  # positive = long; position is short
+        txs = _batch([long_tx])
+        result = collect_lifecycle_realizations(pos(direction="short"), txs)
+        self.assertEqual(result["lifecycle_state"], "conflict")
+        self.assertEqual(result["realizations"], [])
+
+    def test_deal_references_collected_from_all_realizations(self):
+        """deal_references collects all references from matched DEAL rows."""
+        t1 = realization("ref-a", "-0.08", "0.05")
+        t2 = realization("ref-b", "-0.08", "-0.03")
+        txs = _batch([t1, t2])
+        result = collect_lifecycle_realizations(pos(), txs)
+        self.assertEqual(result["deal_references"], {"ref-a", "ref-b"})
+
+    def test_raw_rows_populated_for_reconcile_completed_trade(self):
+        """raw_rows contains the original IG row dicts for downstream reconciliation."""
+        txs = _batch()
+        result = collect_lifecycle_realizations(pos(), txs)
+        self.assertEqual(len(result["raw_rows"]), 1)
+        self.assertIn("transactionType", result["raw_rows"][0])
+        self.assertEqual(result["raw_rows"][0]["transactionType"], "DEAL")
+
+    def test_lifecycle_with_unknown_position_quantity(self):
+        """When original_quantity is None: cannot determine lifecycle completeness."""
+        txs = _batch()
+        result = collect_lifecycle_realizations(pos(original_quantity=None), txs)
+        # Still collects the match; lifecycle state is partial_close (indeterminate)
+        self.assertEqual(len(result["realizations"]), 1)
+        self.assertFalse(result["quantity_accounted"])
+
+    def test_lifecycle_raises_on_invalid_inputs(self):
+        with self.assertRaises(EvidenceError):
+            collect_lifecycle_realizations("not-a-dict", [])
+        with self.assertRaises(EvidenceError):
+            collect_lifecycle_realizations(pos(), "not-a-list")
 
 
 if __name__ == "__main__":
