@@ -14,6 +14,8 @@ import json
 from unittest.mock import Mock
 from test_broker_pending import FaultClient
 from redis.exceptions import ConnectionError
+from broker_finality import cost_statement_consistent, economic_evidence_complete
+from broker_reconcile import reconcile_position
 
 
 class SourceIdentityTests(unittest.TestCase):
@@ -138,6 +140,7 @@ class LateCollisionTests(unittest.TestCase):
         self.assertEqual(before, self.client.hgetall(self.store.key))
         self.assertEqual(self.store.get_projection('fixture')['prior_projection'], self.prior)
 
+
     def test_collision_disconnect_before_exec_never_half_invalidates(self):
         pos = position(deal_id='late-collision')
         receipt = {'source': 'june.accepted_entry_confirm', 'dealId': pos['deal_id'],
@@ -173,3 +176,131 @@ class LateCollisionTests(unittest.TestCase):
         raw = json.loads(self.client.hget(self.store.key, self.store._field('opening-1')))
         self.assertEqual(raw['record']['status'], 'unresolved')
         self.assertEqual(self.store.get_projection('fixture')['prior_projection'], self.prior)
+
+
+class PostingFinalityTests(unittest.TestCase):
+    def setUp(self):
+        self.client = fakeredis.FakeRedis()
+        self.store = PendingCloseStore(self.client, 'fixture-account')
+        self.pos = register(self.store)
+        self.evidence = deepcopy(COST_EVIDENCE)
+
+    def run_rows(self, rows, batch=None):
+        return reconcile_position(self.store, 'opening-1', batch or history(rows), self.pos,
+            entry_reference='entry-reference', cost_evidence=self.evidence)[0]
+
+    def assert_uncertified(self, record):
+        self.assertNotEqual(record['status'], 'complete')
+        self.assertIsNone(record['net_realized_pnl'])
+        self.assertIsNone(record['won'])
+        self.assertEqual(record['cost_state'], 'UNRESOLVED')
+        self.assertFalse(record['provenance']['broker_posting_finalized'])
+        self.assertFalse(record['provenance']['economic_evidence_complete'])
+
+    def test_consistent_statement_is_not_authenticated_posting_finality(self):
+        batch = history()
+        record = self.run_rows([], batch)
+        self.assertTrue(cost_statement_consistent(self.pos, record, batch, self.evidence))
+        self.assertFalse(economic_evidence_complete(self.pos, record, batch, self.evidence))
+        self.assertTrue(record['provenance']['history_request_complete'])
+        self.assertTrue(record['provenance']['history_window_covered'])
+        self.assert_uncertified(record)
+
+    def test_arbitrary_long_wait_does_not_manufacture_finality(self):
+        batch = history()
+        batch['to'] = '2046-09-23T00:00:00'
+        self.evidence['covered_through'] = batch['to']
+        self.evidence['posting_finality']['posted_through'] = batch['to']
+        self.assert_uncertified(self.run_rows([], batch))
+
+    def test_late_commission_after_claimed_final_zero_remains_revisable_after_restart(self):
+        first = self.run_rows([realization()])
+        self.assert_uncertified(first)
+        self.store = PendingCloseStore(self.client, 'fixture-account')
+        rows = [realization(), comm_row('close-1')]
+        later = self.run_rows(rows)
+        self.assert_uncertified(later)
+        self.assertEqual(later['net_identified_pnl'], '-9.16')
+        self.assertEqual(len(later['costs']), 1)
+        self.assertEqual(later, self.run_rows(rows))
+
+    def test_late_financing_after_claimed_final_zero_is_preserved_and_blocks(self):
+        self.run_rows([realization()])
+        self.store = PendingCloseStore(self.client, 'fixture-account')
+        rows = [realization(), {'transactionType': 'SWAP', 'profitAndLoss': '-$0.50',
+                               'currency': '$', 'instrumentName': 'Daily financing adjustment Gold'}]
+        later = self.run_rows(rows)
+        self.assert_uncertified(later)
+        self.assertEqual(later['status'], 'pending_costs')
+        with self.assertRaisesRegex(EvidenceError, 'Previously observed cost rows'):
+            self.run_rows([realization()])
+
+    def test_delayed_residual_does_not_finalize_gross_or_net(self):
+        first = realization('partial', '-0.08', '0.09')
+        self.assertEqual(self.run_rows([first])['status'], 'pending_realizations')
+        self.store = PendingCloseStore(self.client, 'fixture-account')
+        later = self.run_rows([first, realization('residual', '-0.08', '-0.08')])
+        self.assertEqual(later['gross_realized_pnl'], '0.01')
+        self.assertEqual(later['remaining_quantity'], '0')
+        self.assert_uncertified(later)
+
+    def test_manually_claimed_verified_record_cannot_bypass_consumption_gate(self):
+        record = self.run_rows([realization()])
+        record.update(status='complete', identity_state='VERIFIED', net_realized_pnl='-0.16')
+        record['provenance'].update(economic_evidence_complete=True, broker_posting_finalized=True)
+        entry = self.store.get_entry('opening-1')
+        entry['record'] = record
+        self.client.hset(self.store.key, self.store._field('opening-1'), json.dumps(entry))
+        reducer = Mock()
+        with self.assertRaises(EvidenceError):
+            self.store.project_once('opening-1', 'fixture', reducer)
+        with self.assertRaises(EvidenceError):
+            completed_history_view(record)
+        reducer.assert_not_called()
+
+    def test_finality_assertions_are_retained_as_unverified_audit_inputs(self):
+        self.run_rows([realization()])
+        self.evidence['reference'] = 'second-unverified-claim'
+        self.run_rows([realization()])
+        entry = self.store.get_entry('opening-1')
+        self.assertEqual(len(entry['unverified_cost_statements']), 2)
+        self.assert_uncertified(entry['record'])
+
+    def test_backdated_fee_in_already_covered_window_is_not_final(self):
+        first = self.run_rows([realization()])
+        self.store = PendingCloseStore(self.client, 'fixture-account')
+        fee = {**comm_row(), 'dateUtc': '2026-09-21T06:00:00'}
+        later = self.run_rows([realization(), fee])
+        self.assertEqual(first['provenance']['history_window'], later['provenance']['history_window'])
+        self.assertNotEqual(first['net_identified_pnl'], later['net_identified_pnl'])
+        self.assert_uncertified(first)
+        self.assert_uncertified(later)
+
+    def test_distinct_observations_survive_full_pipeline_and_duplicate_retry(self):
+        rows = [realization(quantity='-0.08', period='SEP-26'),
+                realization(quantity='-0.08', period='DEC-26'),
+                {**comm_row(), 'dateUtc': '2026-09-21T06:00:00'},
+                {**comm_row(), 'dateUtc': '2026-09-21T07:00:00'}]
+        first = self.run_rows(rows)
+        self.assertEqual(len(first['realizations']), 2)
+        self.assertEqual(len(first['costs']), 2)
+        self.assertEqual(first['commissions'], '-18')
+        self.store = PendingCloseStore(self.client, 'fixture-account')
+        batch = history(rows)
+        # Duplicate delivery to reconciliation, not duplicate rows in pagination.
+        batch['transactions'] += deepcopy(rows)
+        self.assertEqual(first, self.run_rows([], batch))
+        self.assert_uncertified(first)
+
+    def test_cost_revision_without_lineage_cannot_replace_or_certify(self):
+        rows = [realization(), comm_row(amount='-9')]
+        self.run_rows(rows)
+        self.store = PendingCloseStore(self.client, 'fixture-account')
+        before = self.client.hgetall(self.store.key)
+        with self.assertRaisesRegex(EvidenceError, 'Previously observed cost rows'):
+            self.run_rows([realization(), comm_row(amount='-10')])
+        self.assertEqual(before, self.client.hgetall(self.store.key))
+        # Both representations are observations, not proven distinct events.
+        record = self.run_rows(rows + [comm_row(amount='-10')])
+        self.assertEqual(len(record['costs']), 2)
+        self.assert_uncertified(record)

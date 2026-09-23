@@ -111,6 +111,9 @@ class ReviewCostIdentityTests(unittest.TestCase):
         batch = history()
         batch['to'] = '2026-09-23T00:00:00'
         again = PendingCloseStore(client, 'fixture-account').reconcile(pos['deal_id'], batch, [cost])
+        # Wider fetch provenance changes; economic observations must not.
+        self.assertNotEqual(first['provenance']['history_window'], again['provenance']['history_window'])
+        first['provenance']['history_window'] = again['provenance']['history_window']
         self.assertEqual(first, again)
         self.assertEqual(again['commissions'], '-9')
 

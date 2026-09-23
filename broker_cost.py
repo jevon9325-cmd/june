@@ -5,8 +5,8 @@ for reconcile_completed_trade().  No bot import, network, Redis, or orders.
 
 Attribution scopes
 ------------------
-POSITION    — uniquely attributable to one specific position; the COMM reference
-              matches a confirmed deal reference (opening or closing leg).
+POSITION    — provisional position-cost candidate; the COMM reference matches
+              an opening or closing reference. This is not unique event proof.
 INSTRUMENT  — identifiable by instrument but not a single position; typical for
               SWAP financing rows where multiple concurrent positions are possible.
 ACCOUNT     — account-wide only; no position or instrument context.
@@ -44,7 +44,8 @@ cost_complete semantics
 -----------------------
 cost_complete=True means only that the supplied batch has no unresolved cost
 rows. It is NOT economic finality and says nothing about delayed postings.
-broker_finality separately validates positive finality evidence. This requires:
+broker_finality checks assertion consistency only; certification is unavailable.
+Batch attribution requires:
   1. deal_references supplied (closing-leg commissions confirmed)
   2. entry_reference supplied (opening-leg commission confirmed)
   3. No unresolved COMM rows (all referenced COMM rows in known deal refs)
@@ -57,7 +58,7 @@ from broker_ledger import EvidenceError, _key, _number, _text
 from broker_transaction import UNKNOWN
 from broker_source import source_fields
 
-POSITION    = "position"      # uniquely attributable to one trade
+POSITION    = "position"      # candidate attribution, not certified ownership
 INSTRUMENT  = "instrument"    # instrument-level only; multiple positions possible
 ACCOUNT     = "account"       # account-wide; no instrument or position context
 NON_TRADING = "non_trading"   # account capital movement; excluded from all trade costs

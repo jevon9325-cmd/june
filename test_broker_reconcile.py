@@ -1,21 +1,8 @@
-"""C2c-8 (delayed evidence) and C2c-9 (restart / idempotency) tests.
+"""Offline delayed evidence and restart tests for provisional C2c arithmetic.
 
-Drives the full pipeline: normalize → lifecycle → attribute → store.
-Uses fakeredis; no bot import, live Redis, or broker access.
-
-C2c-8 — delayed evidence
-  Broker history arrives asynchronously.  Tests cover:
-    T0: neither DEAL nor COMM has arrived yet → pending_realizations
-    T1: DEAL row arrived, COMM still absent  → pending_costs
-    T2: DEAL + COMM + cost_evidence          → complete
-  Key invariant: the record must NOT be prematurely finalized at T0 or T1.
-
-C2c-9 — restart / idempotency
-  Key invariant: the same economic event must never become two completed
-  outcomes.  Tests cover: restart before evidence, restart mid-progression,
-  repeated reconciliation, duplicate batches, lost acknowledgements, and the
-  opening-collision guard that prevents two positions from claiming the same
-  realization.
+History and synthetic statement assertions can agree without proving finality.
+No scenario in this module certifies broker-net P&L or delivers a consumer update.
+Transport failures, cumulative evidence and identical retries remain covered.
 """
 
 import unittest
@@ -111,8 +98,8 @@ class DelayedEvidenceTests(unittest.TestCase):
 
     # ── T2: full evidence available ────────────────────────────────────────
 
-    def test_t2_deal_and_comm_with_attestation_is_complete(self):
-        """C2c-8 T2: DEAL + both COMM rows + cost_evidence → complete."""
+    def test_t2_deal_and_comm_with_assertion_is_provisional(self):
+        """DEAL + both COMM rows + consistent assertion remain provisional."""
         record, attribution = reconcile_position(
             self.store, POS["deal_id"], raw_batch(FULL_ROWS), POS,
             entry_reference=ENTRY_REF, cost_evidence=COST_EVIDENCE)
@@ -123,11 +110,11 @@ class DelayedEvidenceTests(unittest.TestCase):
 
     # ── T1 → restart → T2 ─────────────────────────────────────────────────
 
-    def test_delayed_comm_after_restart_completes_record(self):
-        """C2c-8: DEAL at T1, COMM at T2 after restart → complete.
+    def test_delayed_comm_after_restart_updates_provisional_record(self):
+        """DEAL at T1, COMM at T2 after restart update provisional arithmetic.
 
         No special-casing needed: re-calling reconcile_position is sufficient.
-        The store advances from pending_costs to complete automatically.
+        The store advances from pending_costs to provisional, never certified.
         """
         # T1
         record, _ = reconcile_position(

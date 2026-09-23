@@ -1,20 +1,20 @@
-"""Validate externally verified broker cost statements; never infer finality.
+"""Validate cost assertions for consistency, never authenticate posting finality.
 
-This is an evidence-input contract, not a statement fetcher or authenticator.
-An adapter must retain and verify the referenced broker documents before supplying
-this object. No current runtime adapter produces it. History timestamps, elapsed
-time and empty fee lists are not substitutes for broker posting finality.
+Reviewed IG transaction/activity/confirmation schemas establish observations and
+execution facts, not an authoritative all-postings-final watermark. The current
+capture path adds no such proof. C2c therefore has NO supported certification
+adapter. A caller's final=True, statement reference, zero totals or elapsed
+waiting period cannot enable economic completion.
 
-covered_from/covered_through describe the economic accrual interval. A separate
-posting_finality attestation states that all postings for that interval are final,
-including delayed commissions/financing. posted_through is the posting horizon
-that must be included in the fetched history. Component totals are signed USD;
-explicit final zero totals are necessary to establish a zero-cost position.
+The legacy version-2 object remains an audit/consistency input. Its covered_from
+and covered_through describe claimed accrual coverage; posted_through describes
+claimed posting coverage. Validating these claims does not authenticate them.
 """
 from broker_ledger import EvidenceError, _number, _utc
 
 
-def economic_evidence_complete(position, record, batch, evidence):
+def cost_statement_consistent(position, record, batch, evidence):
+    """Check supplied scope/totals only; True is NOT broker finality."""
     if evidence is None:
         return False
     if not isinstance(evidence, dict) or any(
@@ -55,3 +55,13 @@ def economic_evidence_complete(position, record, batch, evidence):
     return (totals['commission'] == _number(record['commissions'])
             and totals['financing'] == 0
             and totals['other'] == _number(record['other_costs']))
+
+
+def economic_evidence_complete(position, record, batch, evidence):
+    """Fail closed until an independently specified evidence adapter is reviewed.
+
+    No configuration flag or caller dictionary may change this capability.
+    Retain validation errors for malformed/mismatched assertions.
+    """
+    cost_statement_consistent(position, record, batch, evidence)
+    return False

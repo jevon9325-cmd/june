@@ -8,16 +8,16 @@ No bot import, live Redis construction, network, or broker orders.
 Delayed evidence model
 ----------------------
 Broker history arrives asynchronously after June observes a close.  The
-progression is always forward — callers simply re-call reconcile_position
-as more evidence arrives; the store advances automatically.
+caller re-calls reconcile_position with cumulative evidence. Observed arithmetic
+can change; economic certification is unavailable for this source.
 
   T0  history window empty             → pending_realizations
   T1  DEAL row present, COMM absent    → pending_costs
-  T2  DEAL + COMM + cost_evidence      → complete
+  T2  DEAL + COMM + consistent assertion → provisional, costs still unresolved
 
-cost_evidence follows broker_finality's version-2 position-scoped statement
-contract: final component totals plus positive broker posting-finality evidence.
-History coverage or an empty cost list never establishes economic completion.
+cost_evidence is an unverified position-scoped assertion. Version-2 consistency
+checks never authenticate broker posting finality. History, statements and empty
+cost lists cannot enable finalization. See C2C_EVIDENCE_CONTRACT.md.
 
 Idempotency
 -----------
@@ -53,11 +53,9 @@ def reconcile_position(store, deal_id, raw_batch, position_evidence,
                         the registered broker opening.
     entry_reference   : str or None — opening COMM reference from the entry
                         confirmation.  Needed to attribute the opening-leg commission.
-    cost_evidence     : dict or None — broker_finality version-2 statement.
-                        Only passed to the store when attribution.cost_complete is
-                        True — unattributed costs must not be silently ignored.
-                        When None, the record stays pending_costs even if all costs
-                        in the current batch were attributed.
+    cost_evidence     : dict or None — unverified version-2 statement assertion.
+                        The store retains it for audit, validates consistency and
+                        independently checks unresolved rows. It cannot finalize.
 
     Returns
     -------
@@ -118,15 +116,10 @@ def reconcile_position(store, deal_id, raw_batch, position_evidence,
         entry_reference=entry_reference,
     )
 
-    # Only pass cost_evidence to the store when attribution confirms all costs in
-    # this batch were accounted for.  If unattributed COMM rows remain, we must
-    # NOT silently treat unknown costs as zero.
-    effective_cost_evidence = cost_evidence if attribution["cost_complete"] else None
-
     record = store.reconcile(
         deal_id,
         raw_batch,
         costs=tuple(attribution["position_costs"]),
-        cost_evidence=effective_cost_evidence,
+        cost_evidence=cost_evidence,
     )
     return record, attribution

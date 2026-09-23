@@ -14,7 +14,7 @@ import json
 from redis.exceptions import WatchError
 
 from broker_ledger import EvidenceError, _key, _number, _text, _utc, reconcile_completed_trade
-from broker_finality import economic_evidence_complete
+from broker_finality import cost_statement_consistent
 
 
 def _json(value):
@@ -24,9 +24,10 @@ def _json(value):
 def _quarantine_record(record, reason):
     record = deepcopy(record)
     record.update(status='unresolved', economic_state='UNRESOLVED',
-                  identity_state='AMBIGUOUS', net_realized_pnl=None, won=None)
+                  identity_state='AMBIGUOUS', cost_state='UNRESOLVED', net_realized_pnl=None, won=None)
     record.setdefault('provenance', {}).update(economic_evidence_complete=False,
-                                             identity_evidence_complete=False)
+                                             identity_evidence_complete=False,
+                                             costs_complete=False, broker_posting_finalized=False)
     record['uncertainty_reasons'] = sorted(set(record.get('uncertainty_reasons', []) + [reason]))
     return record
 
@@ -216,12 +217,12 @@ class PendingCloseStore:
         return _entry_view(self._update(change))
 
     def reconcile(self, deal_id, batch, costs=(), *, cost_evidence=None):
-        """Persist pending or completed result; completion never guesses zero costs.
+        """Persist provisional or unresolved observations; never certify net P&L.
 
-        `cost_evidence` must satisfy broker_finality's version-2 contract:
-        position-scoped final component totals and broker posting finality over
-        the full lifecycle. Legacy coverage alone leaves costs pending.
-        Delayed/corrected evidence cannot overwrite a completed outcome.
+        Version-2 cost_evidence is retained as an UNVERIFIED assertion. Its
+        consistency is checked independently of certification. No supported
+        broker identity/posting-finality adapter exists, so even consistent
+        evidence remains provisional with unresolved costs and no certified net.
         """
         field = self._field(deal_id)
         costs = tuple(costs)
@@ -255,8 +256,8 @@ class PendingCloseStore:
             entry['observed_cost_rows'] = observed_cost_rows
             record = reconcile_completed_trade(pos, batch["transactions"], costs,
                                                history_complete=True, costs_complete=False)
-            economics_complete = economic_evidence_complete(pos, record, batch, cost_evidence)
-            if economics_complete:
+            statement_consistent = cost_statement_consistent(pos, record, batch, cost_evidence)
+            if statement_consistent:
                 # Direct store callers must not bypass unresolved raw costs.
                 from broker_cost import build_cost_record
                 from broker_transaction import normalize_batch
@@ -265,20 +266,26 @@ class PendingCloseStore:
                     if tx['transaction_type'] in ('deal', 'deposit', 'withdrawal'):
                         continue
                     if tx['transaction_type'] != 'commission':
-                        economics_complete = False
+                        statement_consistent = False
                         break
                     if tx['close_utc'] != 'UNKNOWN' and not (
                             _utc(batch['from']) <= _utc(tx['close_utc']) <= _utc(batch['to'])):
                         raise EvidenceError('Cost posting outside fetched history window')
                     candidate = build_cost_record(tx, self.account_id, deal_id)
                     if candidate is None or candidate['cost_id'] not in identified:
-                        economics_complete = False
+                        statement_consistent = False
                         break
-            if economics_complete:
+            if statement_consistent:
                 record = reconcile_completed_trade(pos, batch['transactions'], costs,
                                                    history_complete=True, costs_complete=True)
+            record['provenance']['history_request_complete'] = True
+            record['provenance']['history_window_covered'] = True
+            record['provenance']['history_window'] = {k: batch[k] for k in ('from', 'to')}
+            record['provenance']['broker_posting_finalized'] = False
             record['provenance']['history_fetch_complete'] = True
-            record['provenance']['cost_statement_consistent'] = economics_complete
+            if cost_evidence is not None:
+                entry.setdefault('unverified_cost_statements', {})[_key(cost_evidence)] = deepcopy(cost_evidence)
+            record['provenance']['cost_statement_consistent'] = statement_consistent
             record['provenance']['economic_evidence_complete'] = False
             for part in record["realizations"]:
                 if _utc(part["exit_utc"]) > _utc(batch["to"]):
@@ -295,10 +302,6 @@ class PendingCloseStore:
                 if data.get(claim, field) != field:
                     raise EvidenceError('Cost already attributed to another position')
                 data[claim] = field
-            if record["status"] == "complete":
-                if _utc(cost_evidence["covered_through"]) < _utc(record["exit_utc"]):
-                    raise EvidenceError("Cost evidence ends before final realization")
-                record["provenance"]["cost_coverage"] = deepcopy(cost_evidence)
             previous = entry["record"]
             if previous:
                 for collection, identity in (("realizations", "realization_id"), ("costs", "cost_id")):
@@ -313,40 +316,22 @@ class PendingCloseStore:
         return self._update(change)
 
     def project_once(self, deal_id, consumer, project):
-        """Atomically update a JOURNAL-OWNED projection and its delivery marker.
+        """Reserved compatibility boundary: C2c currently refuses every delivery.
 
-        `project(state, record)` must return JSON-safe state and have NO external
-        side effects. This is NOT an acknowledgement API for existing June/Redis
-        learning functions: those are not transactionally integrated yet.
+        There is no supported finality adapter. Never execute the reducer, even
+        for a legacy record claiming complete. Historical projections are read
+        only through get_projection's quarantined audit view. External reversal
+        or rebuilding is a Stage E responsibility, not implemented here.
         """
         field = self._field(deal_id)
         if not isinstance(consumer, str) or not consumer:
             raise EvidenceError("Consumer identity required")
-        state_key, delivery_key = "consumer:" + consumer, "delivery:" + _key([field, consumer])
-
         def change(data):
             entry = data.get(field)
             record = entry.get("record") if entry else None
             if not record or record["status"] != "complete":
                 raise EvidenceError("Pending outcome cannot be delivered")
-            if record.get('identity_state') != 'VERIFIED':
-                raise EvidenceError('Legacy identity cannot be certified or delivered')
-            if record.get('provenance', {}).get('economic_evidence_complete') is not True:
-                raise EvidenceError('Legacy economic completion requires evidence review')
-            if record.get('provenance', {}).get('realization_identity_version') != 2:
-                raise EvidenceError('Legacy realization records cannot be delivered')
-            if record.get('costs') and entry.get('cost_claim_version') != 2:
-                raise EvidenceError('Legacy cost records cannot be delivered')
-            if data[entry["opening_key"]] != [field]:
-                raise EvidenceError("Ambiguous opening tuple cannot be delivered")
-            for cost in record.get('costs', []):
-                owners = data.get('entry_reference:' + _key(cost['broker_reference']), [])
-                if owners and owners != [field]:
-                    raise EvidenceError('Ambiguous commission reference cannot be delivered')
-            if delivery_key not in data:
-                data[state_key] = project(deepcopy(data.get(state_key, {})), deepcopy(record))
-                data[delivery_key] = record["trade_id"]
-            return data[state_key]
+            raise EvidenceError('Legacy identity/posting finality has no supported certification adapter')
         return self._update(change)
 
     def entries(self):

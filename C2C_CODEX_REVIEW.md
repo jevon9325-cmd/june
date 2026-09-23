@@ -339,3 +339,87 @@ Seven new tests cover the original failure, duplicate registration/restart,
 legacy read boundaries, lost acknowledgement, pre-EXEC failure, WATCH concurrency,
 and late commission-reference collision. Full suite 320 PASS; compile/diff checks
 PASS; all correction changes reviewed. No live Redis or runtime adapter used.
+
+## Resumed independent review: posting finality and evidence contract
+
+Resumed with user authorization at f6e52b7, preserving both prior corrections and
+all surviving changes. Reviewed actual diffs of 9a3d475 and f6e52b7, not just their
+commit messages. Initial index was empty. The eight modified files were:
+broker_cost.py (attribution wording), broker_finality.py (consistency versus
+certification), broker_ledger.py (unresolved costs and output refusal),
+broker_pending.py (fetch provenance, assertion retention and delivery refusal),
+broker_reconcile.py (pass assertions for audit), test_broker_reconcile.py
+(provisional semantics), test_c2c_boundaries.py (seven finality adversaries), and
+test_c2c_review.py (wider fetch-window provenance). The untracked
+C2C_EVIDENCE_CONTRACT.md documented precisely that boundary. No unrelated change
+was found. Before editing: fresh full suite 327 PASS; 28 broker/test modules
+compiled; staged and unstaged diff checks passed.
+
+The remaining change is deliberately fail-closed. Version-2 statements are
+UNVERIFIED audit assertions: matching their scope and totals never establishes
+posting finality. economic_evidence_complete always returns false (or rejects
+malformed input). Current records retain gross and identified-cost arithmetic,
+cost_state=UNRESOLVED, broker_posting_finalized=false, and null certified net/win.
+project_once and completed_history_view refuse every current or legacy outcome;
+even forged VERIFIED/complete flags do not execute a reducer. There is no delay,
+feature flag or fabricated broker identifier enabling finalization.
+
+The evidence contract separates request completion, observed window coverage,
+broker posting finality, and economic completeness. It documents the trusted
+batch-input boundary, insufficient event/correction lineage, legacy quarantine,
+required future authenticated evidence, and the alternative of explicitly named
+policy-based provisional reporting. No such adapter or policy is implemented.
+
+Official activity, confirmation, REST guide and statement instructions were
+retrieved again. They do not establish an all-postings-final lifecycle guarantee.
+The transaction-schema URL was unavailable on this retry; its earlier inspection
+is recorded above. This conclusion is limited to reviewed sources, not all IG
+services. Local capture retains evidence; it cannot authenticate posting finality.
+Sources and retrieval limitations are linked in C2C_EVIDENCE_CONTRACT.md.
+
+Three additional tests independently check backdated costs within an unchanged
+covered window, distinct observations through the full pipeline plus duplicate
+retry/restart, and cost revisions without lineage. Revised evidence cannot erase
+previous observations. Retaining both representations remains explicitly
+provisional, never proof of two economic events. Targeted boundary suite: 22 PASS.
+
+## Final 12-point acceptance audit
+
+This supersedes the earlier NOT APPROVED audit for the reviewed C2c candidate.
+PASS means the guarantee is established under the user's explicit allowance for
+AMBIGUOUS / UNRESOLVED / PROVISIONAL outcomes. It does not mean missing broker
+evidence was obtained. Original question subjects and ordering are retained.
+
+| # | Acceptance question | Result and evidence |
+|---|---|---|
+| 1 | Can opening ownership or a late collision falsely certify an outcome? | PASS: exact tuple/receipt checks; all history ownership remains unresolved; late collisions atomically quarantine records and existing aggregates. Matching, late-collision and WATCH tests pass. |
+| 2 | Does repeated realization delivery count once without assuming correction lineage? | PASS: identical observations are idempotent; conflicting representations are refused or explicitly provisional; no certified output. SourceIdentityTests and ledger conflict/restart tests pass. |
+| 3 | Are distinguishable realizations preserved and indistinguishable events handled honestly? | PASS: instrument/time/period discriminators survive; multiplicity remains UNRESOLVED; excess/conflicting quantities are refused. Full-pipeline distinct-observation test passes. |
+| 4 | Can a source cost be claimed or delivered twice? | PASS: claimant-independent fingerprints and atomic claims reject competing owners; identical retry counts once; changed representations never establish event lineage or certified net. Claim-race/lost-ack/revision tests pass. |
+| 5 | Do distinguishable costs survive without inventing uniqueness for identical rows? | PASS: distinct posting times/instruments/periods survive, duplicate observations count once; cost and identity states remain unresolved. Cost identity and pipeline tests pass. |
+| 6 | Are partial and residual realizations reconciled without double-counting? | PASS: Decimal quantities, duplicate partial checks and cumulative history; late residual remains provisional. No residual-only certified outcome. |
+| 7 | Are capital flows excluded while unknown account costs remain unresolved? | PASS: DEPO/WITH excluded; unknown/reference-less costs cannot establish completion. Classification and finality tests pass. |
+| 8 | Is unattributable financing retained through delay/restart? | PASS: no guessed position allocation; observed financing survives and missing prior rows are refused. Delayed-financing/restart tests pass. |
+| 9 | Is broker-net completion supported only by actual posting-finality evidence? | PASS by explicit refusal: no supported source establishes it, so all assertions and waits leave costs unresolved and certified net null. Consistency, long-wait, delayed and backdated tests pass. |
+| 10 | Are retries, overlapping windows, failures and restarts safe? | PASS: atomic journal claims/quarantine, lost-ack retry, WATCH contention, cumulative evidence checks and no reducer delivery. Existing opaque projections are quarantined, not inverted. |
+| 11 | Can incomplete/ambiguous evidence become falsely complete? | PASS: current inputs cannot emit COMPLETE; legacy reads quarantine; forged completion flags fail both output boundaries. Gross and identified net remain explicitly provisional. |
+| 12 | Are runtime/adaptive consumers disconnected? | PASS: repository call search finds only definitions outside tests; june.py is unchanged from pre-C2c 9e7a2ab. No Stage D/E integration. |
+
+C2c APPROVED as an offline evidence/uncertainty boundary. It is NOT a certified
+net-P&L producer and NOT deployment-ready. COMPLETE is reserved and unreachable
+for current sources; PROVISIONAL is observation arithmetic; UNRESOLVED means no
+trusted conclusion (known collisions are AMBIGUOUS and quarantined). Identity
+and cost uncertainty remain explicit even when provisional arithmetic is present.
+
+The five-equity-trade historical +3.68/-90/-86.32 proof remains unestablished;
+no synthetic fixture is represented as that historical proof. Legacy migration,
+external already-consumed projections and consumer recovery remain a Stage E
+boundary, not completed work. Their unresolved status does not enable output.
+No strategy/sizing/order payload changes, broker actions, production Redis access,
+deployment, push, production restart, or Stage D/E work occurred. Stop at C2c.
+
+Final verification: python -m unittest discover -q: 330 tests PASS (18.262s).
+The live_save_state disconnect warning is an injected offline failure test.
+All 28 broker/test Python modules compile. git diff --check passes. No skipped or
+expected-failure tests. The posting-finality correction includes the surviving
+work, ten finality/contract tests beyond f6e52b7, and this completed audit.

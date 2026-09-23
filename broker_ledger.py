@@ -70,7 +70,7 @@ def _money(row, currency):
 
 def reconcile_completed_trade(position, transactions, costs=(), *,
                               history_complete=False, costs_complete=False):
-    """Build one JSON-safe record from explicit broker evidence, without I/O.
+    """Build provisional observation arithmetic, without I/O or certification.
 
     position: account_id, deal_id, instrument, broker_instrument, direction,
       opened_utc (exact broker time), entry_price, original_quantity, currency;
@@ -80,6 +80,10 @@ def reconcile_completed_trade(position, transactions, costs=(), *,
     costs: explicitly attributed signed USD amounts with account_id, deal_id,
       cost_id, amount, kind ('commission' or 'other'), source, broker_reference.
       Never allocate a fee by instrument name alone. Unknown costs stay pending.
+
+    history_complete/costs_complete are legacy caller claims for candidate
+    arithmetic only. They cannot enable certification; net_realized_pnl/won are
+    always null. Exposed source fields identify observations, not unique events.
 
     Exact opening identity deliberately avoids time/price tolerance joins that
     can assign adjacent entries or an add-on to the wrong position. Callers
@@ -166,8 +170,8 @@ def reconcile_completed_trade(position, transactions, costs=(), *,
     commissions = sum((_number(x["amount"]) for x in fees if x["kind"] == "commission"), Decimal(0))
     other = sum((_number(x["amount"]) for x in fees if x["kind"] == "other"), Decimal(0))
     identified_net = gross + commissions + other
-    complete = bool(history_complete and costs_complete and parts and remaining == 0)
-    status = ("provisional" if complete else "pending_realizations"
+    candidate_complete = bool(history_complete and costs_complete and parts and remaining == 0)
+    status = ("provisional" if candidate_complete else "pending_realizations"
               if not history_complete or remaining or not parts else "pending_costs")
     unit_notional = position.get("notional_per_quantity")
     exposure = None
@@ -185,8 +189,8 @@ def reconcile_completed_trade(position, transactions, costs=(), *,
         "asset_class": position.get("asset_class"), "direction": position["direction"],
         "currency": position["currency"], "status": status,
         "entry_utc": opened.isoformat(), "entry_price": _text(price),
-        "exit_utc": closed.isoformat() if complete else None,
-        "hold_seconds": (closed - opened).total_seconds() if complete else None,
+        "exit_utc": closed.isoformat() if candidate_complete else None,
+        "hold_seconds": (closed - opened).total_seconds() if candidate_complete else None,
         "original_quantity": _text(quantity), "remaining_quantity": _text(remaining),
         "original_notional": _text(exposure) if exposure is not None else None,
         "remaining_notional": _text(remaining * unit_notional) if exposure is not None else None,
@@ -196,6 +200,7 @@ def reconcile_completed_trade(position, transactions, costs=(), *,
         "won": None,
         "economic_state": "PROVISIONAL" if parts else "UNRESOLVED",
         "identity_state": "UNRESOLVED",
+        "cost_state": "UNRESOLVED",
         "uncertainty_reasons": [IDENTITY_REASON],
         "realizations": parts, "costs": fees,
         "partial_close_count": len(parts) if remaining else max(0, len(parts) - 1),
@@ -204,35 +209,14 @@ def reconcile_completed_trade(position, transactions, costs=(), *,
         "provenance": {"pnl": "broker_realizations", "context": "matched_strategy_metadata",
                        "realization_identity_version": 3,
                        "identity_evidence_complete": False,
-                       "history_complete": bool(history_complete), "costs_complete": bool(costs_complete)},
+                       "history_complete": bool(history_complete), "costs_complete": False,
+                       "costs_claimed_complete": bool(costs_complete),
+                       "broker_posting_finalized": False, "economic_evidence_complete": False},
     }
 
 
 def completed_history_view(record):
-    """Compatibility view: one whole-position outcome, never a residual outcome.
-
-    Pending evidence is rejected. The complete canonical record remains the
-    authority; this projection is not a separately estimated outcome.
-    """
+    """Reserved output boundary; no current source supports certified history."""
     if record.get("status") != "complete":
         raise EvidenceError("Pending evidence cannot enter completed-trade history")
-    if (record.get('identity_state') != 'VERIFIED'
-            or record.get('provenance', {}).get('economic_evidence_complete') is not True):
-        raise EvidenceError('Legacy completion cannot enter certified history')
-    gross = _number(record["gross_realized_pnl"])
-    notional = record["original_notional"]
-    context = record["strategy_context"]
-    quantity = _number(record["original_quantity"])
-    weighted_exit = sum((_number(p["quantity"]) * _number(p["exit_price"])
-                         for p in record["realizations"]), Decimal(0)) / quantity
-    return {
-        "trade_id": record["trade_id"], "source": "broker_ledger_v1",
-        "instrument": record["instrument"], "direction": record["direction"],
-        "entry_price": float(record["entry_price"]), "exit_price": float(weighted_exit),
-        "ig_size": float(quantity), "notional": float(notional) if notional is not None else None,
-        "pnl_pct": float(gross / _number(notional)) if notional is not None else None,
-        "dollar_pnl": float(record["net_realized_pnl"]), "won": record["won"],
-        "commission": -float(record["commissions"]), "hold_min": record["hold_seconds"] / 60,
-        "exit_epoch": _utc(record["exit_utc"]).timestamp(), "exit_reason": record["exit_reason"],
-        "conviction": context.get("conviction"), "claudia_pts": context.get("claudia_pts"),
-    }
+    raise EvidenceError('No supported identity/posting-finality adapter for certified history')
