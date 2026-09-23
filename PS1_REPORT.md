@@ -321,3 +321,54 @@ The only production inspection was read-only historical journal inspection.
 ### F/G verification
 
 F/G targeted: 15 passed. Final full offline suite: 172 passed in 8.712s (135 baseline + 37 PS1 tests). Initial red cases covered unknown-role fields, invented BUY, opposite-direction grouping, 100x fallback, skipped sub-dollar cache; later edge regressions covered valid-row management, known-addon identity preservation and date-only timestamp inference. py_compile and git diff --check/stat/status passed. Full source/test diff reviewed. AST scope is market-data cache reconciliation, cached price inversion, provenance carryover in primary promotion, new recovery metadata helper and recovery. All module-level assignments/constants match the previous commit. Actual order-sizing, entry helpers and circuit-breaker formula are unchanged. Existing JSON schemas accept additive provenance/pending fields; C2b identity, immutable capture, storage-failure, replay and economic-completion separation tests pass.
+
+## Final code checkpoint and behavior inventory
+
+| Repair | Commit |
+|---|---|
+| A/B close and inventory contracts | `46df9635b23d0a612df9b5f30e93dc0cc2af21c5` |
+| C partial residual tracking | `46885697b4440ef6b972353806e0eb8f4c732897` |
+| D margin/position evidence | `bbc8779cf0d51d317c40456dabeeb9421695dc72` |
+| F/G recovery provenance and units | `4fe0404ba85cbb5d5e52db226248681820c59d33` |
+
+This report's final follow-up commit is documentation only. The reviewed code
+checkpoint is `4fe0404ba85cbb5d5e52db226248681820c59d33`; branch remains
+`integration/broker-truth-main-20260922`.
+
+Every intended trading/lifecycle behavior change:
+
+1. All three close helpers now submit validated, deal-restricted DELETE override
+   requests; ordinary opening POSTs are unchanged. Missing/invalid close fields
+   cause no request.
+2. Recovery and verification read documented v2 inventory and distinguish the
+   requested deal from unrelated account exposure.
+3. Ambiguous partial closes retain quantity/evidence and prevent another partial;
+   lost/rejected confirmations do not automatically trigger a full close. Only
+   verified residual quantity applies the existing partial economics and stop
+   tightening; explicit inventory absence permits clearing.
+4. Margin zero/positive/delta no longer proves deal state or suppresses protective
+   exits. Protective deal-specific closes remain possible under unavailable
+   inventory/manual-review caution, subject to the unchanged kill-switch guard.
+5. Accepted full/addon requests need matched closure or inventory absence before
+   completion/removal; full-close learning/history waits for that evidence.
+6. Ambiguous partial size is refreshed before a protective full close; original
+   basis and unresolved economic evidence remain. Unresolved addons are retained
+   and retried; uncertain exposure blocks new entry/pyramid expansion.
+7. Recovered roles are management assignments with unknown historical origin;
+   timestamps retain their source, missing direction is not guessed, and invalid
+   or incompatible rows remain explicit unresolved exposure. Compatible valid
+   positions remain manageable. Known opening evidence survives reassignment
+   without duplicate addon tracking.
+8. SOYBEANS cached-price/stop fallbacks use the override's units, and valid market
+   metadata repairs sub-dollar/absent legacy cache seeds. This can correct
+   eligibility; the 100 override, native order sizing and P&L formulas are unchanged.
+
+Final baseline-to-code AST review confirms all module-level assignments/constants
+unchanged. Opening primary/addon helpers, actual sizing, balance polling, P&L
+polling and circuit-breaker functions match d29c520 exactly. Full baseline-to-HEAD
+diff whitespace check passed. No alpha, conviction, ranking, allocation, leverage,
+target, reversal or instrument strategy was redesigned.
+
+Recommended next step: independent review of these local commits and resolution
+of the dated capital-flow evidence and remaining operational risks before any
+separate deployment decision. PS1 stops here; C2c has not begun.
