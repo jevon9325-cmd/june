@@ -314,3 +314,28 @@ Transport/WATCH tests continue to exercise atomic provisional journal writes.
 Full suite: 313 PASS. Compile/diff checks PASS; all changes reviewed.
 This closes the false-certification path for new history-derived results.
 Historical projections and posting-finality semantics are the next blockers.
+
+## Continuation blocker 2: late contradiction and historical projections
+
+Reproduced the old completed/projection state using an explicitly seeded legacy
+journal fixture; no test-only certification bypass was added. Opening collisions
+now atomically mark every affected record UNRESOLVED/AMBIGUOUS and retain its
+previous version. Shared entry-reference collisions invalidate known commission
+owners as well. Identity quarantine cannot be cleared by reconciliation retries.
+
+Opaque journal aggregates cannot be safely inverted. On a collision all existing
+account consumer fields are atomically wrapped as quarantined, with value=None
+and the untouched prior_projection retained for audit. HSCAN occurs only on this
+exceptional path under WATCH. A concurrent update forces a full retry. Duplicate
+registration does not wrap the archive twice or change totals. No reducer runs.
+
+Store read/scan/capture/registration views also quarantine legacy complete records;
+get_projection never exposes a legacy aggregate as certified. Raw archival hash
+fields are not an economic-truth API. Already consumed external learning effects
+cannot be reversed within C2c: they require Stage E recovery/rebuild, which was
+NOT implemented. That boundary is explicit on every quarantined projection.
+
+Seven new tests cover the original failure, duplicate registration/restart,
+legacy read boundaries, lost acknowledgement, pre-EXEC failure, WATCH concurrency,
+and late commission-reference collision. Full suite 320 PASS; compile/diff checks
+PASS; all correction changes reviewed. No live Redis or runtime adapter used.

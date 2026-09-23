@@ -10,6 +10,10 @@ from broker_pending import PendingCloseStore
 from test_broker_ledger import position, realization
 from test_broker_cost import comm_row
 from test_broker_pending import register, history, COST_EVIDENCE
+import json
+from unittest.mock import Mock
+from test_broker_pending import FaultClient
+from redis.exceptions import ConnectionError
 
 
 class SourceIdentityTests(unittest.TestCase):
@@ -64,3 +68,108 @@ class SourceIdentityTests(unittest.TestCase):
         self.assertFalse(again['provenance']['economic_evidence_complete'])
         with self.assertRaises(EvidenceError):
             restarted.project_once('opening-1', 'fixture', lambda *_: self.fail('must not consume'))
+
+
+class LateCollisionTests(unittest.TestCase):
+    def setUp(self):
+        self.client = fakeredis.FakeRedis()
+        self.store = PendingCloseStore(self.client, 'fixture-account')
+        register(self.store)
+        record = self.store.reconcile('opening-1', history(), cost_evidence=COST_EVIDENCE)
+        # A historical on-disk outcome/projection from the old implementation.
+        # Do not give the new implementation a test-only certification bypass.
+        record.update(status='complete', net_realized_pnl='-0.16', won=False)
+        record['provenance']['economic_evidence_complete'] = True
+        entry = self.store.get_entry('opening-1')
+        entry['record'] = record
+        self.client.hset(self.store.key, self.store._field('opening-1'), json.dumps(entry))
+        self.prior = {'count': 1, 'net': -0.16}
+        self.client.hset(self.store.key, 'consumer:fixture', json.dumps(self.prior))
+
+    def collide(self, store=None):
+        return register(store or self.store, position(deal_id='late-collision'))
+
+    def test_late_collision_quarantines_existing_record_and_projection(self):
+        self.collide()
+        stored = json.loads(self.client.hget(self.store.key, self.store._field('opening-1')))
+        self.assertEqual(stored['record']['status'], 'unresolved')
+        self.assertIsNone(stored['record']['net_realized_pnl'])
+        self.assertEqual(stored['record']['identity_state'], 'AMBIGUOUS')
+        projection = self.store.get_projection('fixture')
+        self.assertEqual(projection['status'], 'quarantined')
+        self.assertIsNone(projection['value'])
+        self.assertEqual(projection['prior_projection'], self.prior)
+        self.assertTrue(projection['stage_e_recovery_required'])
+
+    def test_collision_retry_and_restart_do_not_wrap_or_count_twice(self):
+        self.collide()
+        before = self.client.hgetall(self.store.key)
+        restarted = PendingCloseStore(self.client, 'fixture-account')
+        self.collide(restarted)
+        self.assertEqual(before, self.client.hgetall(self.store.key))
+        reducer = Mock()
+        with self.assertRaises(EvidenceError):
+            restarted.project_once('opening-1', 'fixture', reducer)
+        reducer.assert_not_called()
+
+    def test_legacy_complete_is_not_certified_by_read_or_scan(self):
+        raw = json.loads(self.client.hget(self.store.key, self.store._field('opening-1')))
+        with self.assertRaises(EvidenceError):
+            completed_history_view(raw['record'])
+        self.assertNotEqual(self.store.get_entry('opening-1')['record']['status'], 'complete')
+        self.assertNotEqual(next(self.store.iter_entries())['record']['status'], 'complete')
+        self.assertEqual(self.store.get_projection('fixture')['status'], 'quarantined')
+        captured = self.store.capture('opening-1', 'fixture.retry', {})
+        self.assertNotEqual(captured['record']['status'], 'complete')
+        receipt = self.store.get_entry('opening-1')['ownership_evidence']
+        registered = self.store.register_opening(position(), receipt)
+        self.assertNotEqual(registered['record']['status'], 'complete')
+
+    def test_collision_lost_acknowledgement_is_idempotent(self):
+        pos = position(deal_id='late-collision')
+        receipt = {'source': 'june.accepted_entry_confirm', 'dealId': pos['deal_id'],
+                   'dealReference': 'entry-reference', 'dealStatus': 'ACCEPTED'}
+        self.store.capture(pos['deal_id'], receipt['source'], {'receipt': receipt, 'position': pos})
+        faulty = PendingCloseStore(FaultClient(self.client, 'after'), 'fixture-account')
+        with self.assertRaises(ConnectionError):
+            faulty.register_opening(pos, receipt)
+        before = self.client.hgetall(self.store.key)
+        self.store.register_opening(pos, receipt)
+        self.assertEqual(before, self.client.hgetall(self.store.key))
+        self.assertEqual(self.store.get_projection('fixture')['prior_projection'], self.prior)
+
+    def test_collision_disconnect_before_exec_never_half_invalidates(self):
+        pos = position(deal_id='late-collision')
+        receipt = {'source': 'june.accepted_entry_confirm', 'dealId': pos['deal_id'],
+                   'dealReference': 'entry-reference', 'dealStatus': 'ACCEPTED'}
+        self.store.capture(pos['deal_id'], receipt['source'], {'receipt': receipt})
+        before = self.client.hgetall(self.store.key)
+        faulty = PendingCloseStore(FaultClient(self.client, 'before'), 'fixture-account')
+        with self.assertRaises(ConnectionError):
+            faulty.register_opening(pos, receipt)
+        self.assertEqual(before, self.client.hgetall(self.store.key))
+        self.store.register_opening(pos, receipt)
+        self.assertEqual(self.store.get_projection('fixture')['status'], 'quarantined')
+
+    def test_watch_retry_quarantines_concurrently_added_aggregate(self):
+        pos = position(deal_id='late-collision')
+        receipt = {'source': 'june.accepted_entry_confirm', 'dealId': pos['deal_id'],
+                   'dealReference': 'entry-reference', 'dealStatus': 'ACCEPTED'}
+        self.store.capture(pos['deal_id'], receipt['source'], {'receipt': receipt})
+        def concurrent_projection():
+            self.client.hset(self.store.key, 'consumer:concurrent', json.dumps({'count': 4}))
+        racing = PendingCloseStore(FaultClient(self.client, 'race', concurrent_projection), 'fixture-account')
+        racing.register_opening(pos, receipt)
+        result = self.store.get_projection('concurrent')
+        self.assertEqual(result['status'], 'quarantined')
+        self.assertEqual(result['prior_projection'], {'count': 4})
+
+    def test_late_entry_reference_collision_quarantines_commission_owner(self):
+        entry = json.loads(self.client.hget(self.store.key, self.store._field('opening-1')))
+        entry['record']['costs'] = [{'broker_reference': 'entry-reference', 'cost_id': 'historical-fee'}]
+        self.client.hset(self.store.key, self.store._field('opening-1'), json.dumps(entry))
+        register(self.store, position(deal_id='different-opening', entry_price='999'))
+        self.assertEqual(self.store.get_entry('opening-1')['record']['identity_state'], 'AMBIGUOUS')
+        raw = json.loads(self.client.hget(self.store.key, self.store._field('opening-1')))
+        self.assertEqual(raw['record']['status'], 'unresolved')
+        self.assertEqual(self.store.get_projection('fixture')['prior_projection'], self.prior)

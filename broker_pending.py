@@ -21,6 +21,55 @@ def _json(value):
     return json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False)
 
 
+def _quarantine_record(record, reason):
+    record = deepcopy(record)
+    record.update(status='unresolved', economic_state='UNRESOLVED',
+                  identity_state='AMBIGUOUS', net_realized_pnl=None, won=None)
+    record.setdefault('provenance', {}).update(economic_evidence_complete=False,
+                                             identity_evidence_complete=False)
+    record['uncertainty_reasons'] = sorted(set(record.get('uncertainty_reasons', []) + [reason]))
+    return record
+
+
+def _entry_view(entry):
+    """Old completed records cannot regain certification merely by being read."""
+    entry = deepcopy(entry)
+    if entry and (entry.get('record') or {}).get('status') == 'complete':
+        entry.setdefault('record_before_quarantine', deepcopy(entry['record']))
+        entry['record'] = _quarantine_record(entry['record'], 'Legacy completion is not certified by C2c')
+    return entry
+
+
+def _projection_view(value, reason):
+    if isinstance(value, dict) and value.get('quarantine_version') == 1:
+        result = deepcopy(value)
+        result['reasons'] = sorted(set(result['reasons'] + [reason]))
+        return result
+    return {'quarantine_version': 1, 'status': 'quarantined', 'economic_state': 'UNRESOLVED',
+            'value': None, 'prior_projection': deepcopy(value), 'reasons': [reason],
+            'stage_e_recovery_required': True}
+
+
+def _quarantine_collision(data, owners, reason):
+    """One WATCH/HSET invalidates records and opaque historical aggregates.
+
+    Old reducers have no inverse/dependency ledger. Quarantine every account
+    projection rather than subtracting an invented correction from an aggregate.
+    HSCAN is used only on this exceptional collision path, never normal capture.
+    """
+    for owner in owners:
+        entry = data.get(owner)
+        if entry is None:
+            continue
+        entry['identity_quarantine'] = sorted(set(entry.get('identity_quarantine', []) + [reason]))
+        if entry.get('record'):
+            entry.setdefault('record_before_quarantine', deepcopy(entry['record']))
+            entry['record'] = _quarantine_record(entry['record'], reason)
+    for key, _ in data.client.hscan_iter(data.key, match='consumer:*', count=100):
+        key = key.decode() if isinstance(key, bytes) else key
+        data[key] = _projection_view(data[key], reason)
+
+
 class _TargetedFields:
     """Lazy reads inside WATCH; only touched fields participate in serialization."""
     def __init__(self, client, key):
@@ -109,7 +158,7 @@ class PendingCloseStore:
                                            "events": {}, "opening": None, "record": None})
             entry["events"].setdefault(event_id, event)
             return entry
-        return self._update(change)
+        return _entry_view(self._update(change))
 
     def register_opening(self, position, ownership_evidence):
         """Attach exact broker identity and explicit evidence of June entry.
@@ -155,8 +204,16 @@ class PendingCloseStore:
             reference_owners = data.setdefault(reference_key, [])
             if field not in reference_owners:
                 reference_owners.append(field)
+            if len(owners) > 1:
+                _quarantine_collision(data, owners, 'Opening identity collision: ' + owner_key)
+            if len(reference_owners) > 1:
+                affected = [owner for owner in reference_owners
+                            if any(cost['broker_reference'] == ownership_evidence['dealReference']
+                                   for cost in (data.get(owner, {}).get('record') or {}).get('costs', []))]
+                if affected:
+                    _quarantine_collision(data, affected, 'Commission reference collision: ' + reference_key)
             return entry
-        return self._update(change)
+        return _entry_view(self._update(change))
 
     def reconcile(self, deal_id, batch, costs=(), *, cost_evidence=None):
         """Persist pending or completed result; completion never guesses zero costs.
@@ -175,6 +232,8 @@ class PendingCloseStore:
             entry = data.get(field)
             if not entry or entry["opening"] is None:
                 raise EvidenceError("Exact broker opening still missing")
+            if entry.get('identity_quarantine'):
+                raise EvidenceError('Ambiguous identity is quarantined; no automatic resurrection')
             if (entry.get('record') and entry['record'].get('costs')
                     and entry.get('cost_claim_version') != 3):
                 raise EvidenceError('Legacy cost records require explicit evidence review')
@@ -270,6 +329,8 @@ class PendingCloseStore:
             record = entry.get("record") if entry else None
             if not record or record["status"] != "complete":
                 raise EvidenceError("Pending outcome cannot be delivered")
+            if record.get('identity_state') != 'VERIFIED':
+                raise EvidenceError('Legacy identity cannot be certified or delivered')
             if record.get('provenance', {}).get('economic_evidence_complete') is not True:
                 raise EvidenceError('Legacy economic completion requires evidence review')
             if record.get('provenance', {}).get('realization_identity_version') != 2:
@@ -295,7 +356,23 @@ class PendingCloseStore:
     def get_entry(self, deal_id):
         """Read one position without enumerating account history."""
         raw = self.client.hget(self.key, self._field(deal_id))
-        return json.loads(raw) if raw is not None else None
+        return _entry_view(json.loads(raw)) if raw is not None else None
+
+    def get_projection(self, consumer):
+        """Audit-only view. Never return an old aggregate as certified value.
+
+        Reversing external learning effects or rebuilding aggregates is Stage E.
+        Raw consumer:* fields are internal archival storage, not a truth API.
+        """
+        if not isinstance(consumer, str) or not consumer:
+            raise EvidenceError('Consumer identity required')
+        raw = self.client.hget(self.key, 'consumer:' + consumer)
+        if raw is None:
+            return None
+        value = json.loads(raw)
+        if isinstance(value, dict) and value.get('quarantine_version') == 1:
+            return value
+        return _projection_view(value, 'Legacy projection has no C2c certification')
 
     def iter_entries(self, count=100):
         """Incremental HSCAN, not a consistent snapshot; retry/dedup by deal ID.
@@ -306,4 +383,4 @@ class PendingCloseStore:
         if type(count) is not int or count <= 0:
             raise ValueError("Positive scan count required")
         for _, raw in self.client.hscan_iter(self.key, match="trade:*", count=count):
-            yield json.loads(raw)
+            yield _entry_view(json.loads(raw))

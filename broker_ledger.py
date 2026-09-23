@@ -216,6 +216,9 @@ def completed_history_view(record):
     """
     if record.get("status") != "complete":
         raise EvidenceError("Pending evidence cannot enter completed-trade history")
+    if (record.get('identity_state') != 'VERIFIED'
+            or record.get('provenance', {}).get('economic_evidence_complete') is not True):
+        raise EvidenceError('Legacy completion cannot enter certified history')
     gross = _number(record["gross_realized_pnl"])
     notional = record["original_notional"]
     context = record["strategy_context"]

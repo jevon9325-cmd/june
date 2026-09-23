@@ -313,7 +313,7 @@ class ReviewCostFinalityTests(unittest.TestCase):
         entry['record']['status'] = 'complete'  # historical on-disk fixture
         entry['record']['provenance'].pop('economic_evidence_complete')
         self.client.hset(self.store.key, self.store._field(self.pos['deal_id']), json.dumps(entry))
-        with self.assertRaisesRegex(EvidenceError, 'Legacy economic completion'):
+        with self.assertRaisesRegex(EvidenceError, 'Legacy identity'):
             self.store.project_once(self.pos['deal_id'], 'fixture', lambda *_: {})
 
     def test_unresolved_cost_cannot_disappear_after_restart(self):
@@ -361,6 +361,6 @@ class ReviewRealizationIdentityTests(unittest.TestCase):
         before = client.hgetall(store.key)
         with self.assertRaisesRegex(EvidenceError, 'Legacy realization'):
             store.reconcile(pos['deal_id'], history(), cost_evidence=COST_EVIDENCE)
-        with self.assertRaisesRegex(EvidenceError, 'Legacy realization'):
+        with self.assertRaisesRegex(EvidenceError, 'Legacy identity'):
             store.project_once(pos['deal_id'], 'fixture', lambda *_: {})
         self.assertEqual(before, client.hgetall(store.key))
