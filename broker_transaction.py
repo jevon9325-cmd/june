@@ -7,10 +7,9 @@ preserved verbatim for provenance audit.
 """
 
 from copy import deepcopy
-from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 
-from broker_ledger import EvidenceError
+from broker_ledger import EvidenceError, _cash_number, _utc
 
 
 UNKNOWN = "UNKNOWN"  # Field unavailable in source row: absent, empty, or unparseable
@@ -42,14 +41,9 @@ def parse_utc(value):
 
     Returns UNKNOWN when absent, empty, or unparseable.
     """
-    if value is None or (isinstance(value, str) and not value.strip()):
-        return UNKNOWN
     try:
-        stamp = datetime.fromisoformat(str(value).strip().replace("Z", "+00:00"))
-        if stamp.tzinfo is None:
-            stamp = stamp.replace(tzinfo=timezone.utc)
-        return stamp.astimezone(timezone.utc).isoformat()
-    except (ValueError, AttributeError, TypeError):
+        return _utc(value).isoformat()
+    except (EvidenceError, ValueError, TypeError):
         return UNKNOWN
 
 
@@ -59,20 +53,10 @@ def _parse_cash(raw):
     Handles all observed IG formats: '$-0.16', '-$9', '$0.17', '1.23', etc.
     Returns a plain Decimal string or UNKNOWN.
     """
-    if raw is None:
+    try:
+        return str(_cash_number(raw))
+    except EvidenceError:
         return UNKNOWN
-    s = str(raw).replace(",", "").strip()
-    if not s:
-        return UNKNOWN
-    negative = False
-    if s.startswith("-"):
-        negative = True
-        s = s[1:].strip()
-    if s.startswith("$"):
-        s = s[1:]
-    if negative:
-        s = "-" + s
-    return _parse_decimal(s)
 
 
 def _parse_currency(raw):

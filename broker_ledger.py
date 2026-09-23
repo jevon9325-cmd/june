@@ -10,6 +10,7 @@ from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from hashlib import sha256
 import json
+import re
 
 
 class EvidenceError(ValueError):
@@ -28,7 +29,10 @@ def _number(value):
 
 def _utc(value):
     try:
-        stamp = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        text = str(value).strip()
+        if not re.match(r"^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}", text):
+            raise ValueError("Broker timestamp must include seconds")
+        stamp = datetime.fromisoformat(text.replace("Z", "+00:00"))
     except ValueError as exc:
         raise EvidenceError("Invalid broker UTC timestamp") from exc
     # IG openDateUtc/dateUtc are explicitly UTC even when the offset is absent.
@@ -45,13 +49,22 @@ def _key(parts):
     return sha256(json.dumps(parts, separators=(",", ":"), sort_keys=True).encode()).hexdigest()
 
 
+def _cash_number(value):
+    """Strict decimal cash syntax; accept a single sign before or after USD $."""
+    text = str(value).strip()
+    if text.startswith(("-$", "+$")):
+        text = text[0] + text[2:]
+    elif text.startswith("$"):
+        text = text[1:]
+    if not re.fullmatch(r"[+-]?(?:[0-9]+|[0-9]{1,3}(?:,[0-9]{3})+)(?:\.[0-9]+)?", text):
+        raise EvidenceError("Invalid broker cash syntax")
+    return _number(text.replace(",", ""))
+
+
 def _money(row, currency):
     if currency != "USD" or row.get("currency") not in ("$", "USD"):
         raise EvidenceError("USD evidence required; do not guess FX conversion")
-    raw = str(row.get("profitAndLoss", "")).replace(",", "")
-    if raw.startswith("$"):
-        raw = raw[1:]
-    return _number(raw)
+    return _cash_number(row.get("profitAndLoss"))
 
 
 def reconcile_completed_trade(position, transactions, costs=(), *,

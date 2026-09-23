@@ -54,3 +54,19 @@ Next: independently reproduce and repair cost attribution/finality, source IDs,
 parsing; test persistence/claim concurrency and the five-trade pipeline fixture;
 finish contract review including broker_capture; give final trust verdict.
 No production source/Redis/order/restart/deployment/push actions performed.
+
+## Correction 2: cash and timestamp parsing
+
+Use one strict cash parser in normalization and the ledger. Accept USD sign
+placement before/after $, outer whitespace, correctly grouped commas, plain
+signed decimal and signed zero. Reject malformed grouping, repeated signs,
+parentheses (no supported source evidence), missing values and nonfinite money.
+Require timestamps to include seconds; date-only/minute-only evidence remains
+unknown rather than inventing precision. No tolerance or rounded-time matching.
+Unsupported/missing currency remains refused; no FX conversion introduced.
+
+Three new adversarial tests cover multiple sign, malformed-money and timestamp
+cases. Targeted 77 tests PASS. Full suite: 280 tests PASS.
+Cash helpers are offline only; _utc callers reviewed in history/pending and
+normalization. June does not call these helpers. june.py remains byte-unchanged
+from the pre-C2c baseline. py_compile and diff checks PASS; full diff reviewed.

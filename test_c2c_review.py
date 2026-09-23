@@ -54,3 +54,33 @@ class ReviewMatchingTests(unittest.TestCase):
         pos = register(store)
         with self.assertRaises(EvidenceError):
             reconcile_position(store, pos['deal_id'], history(), pos, entry_reference='unrelated')
+
+
+class ReviewParsingTests(unittest.TestCase):
+    def test_ledger_and_normalizer_agree_on_money_signs(self):
+        from broker_ledger import reconcile_completed_trade
+        for cash, expected in [("$-0.16", "-0.16"), ("-$0.16", "-0.16"),
+                               ("-$9", "-9"), (" $0.17 ", "0.17"),
+                               ("1,234.50", "1234.5"), ("-0", "0"), ("+0", "0")]:
+            with self.subTest(cash=cash):
+                row = realization(profitAndLoss=cash)
+                record = reconcile_completed_trade(position(), [row])
+                self.assertEqual(record['gross_realized_pnl'], expected)
+                self.assertEqual(float(normalized([row])[0]['cash_amount']), float(expected))
+
+    def test_malformed_cash_never_becomes_number(self):
+        from broker_ledger import reconcile_completed_trade
+        for cash in ('1,2', '1,,234', '(9)', '-$-9', 'NaN', '', '$'):
+            with self.subTest(cash=cash):
+                row = realization(profitAndLoss=cash)
+                self.assertEqual(normalized([row])[0]['cash_amount'], 'UNKNOWN')
+                with self.assertRaises(EvidenceError):
+                    reconcile_completed_trade(position(), [row])
+
+    def test_date_only_opening_is_not_exact_broker_time(self):
+        from broker_ledger import reconcile_completed_trade
+        row = realization(openDateUtc='2026-09-21')
+        pos = position(opened_utc='2026-09-21')
+        self.assertNotEqual(match_realizations(pos, normalized([row]))['confidence'], 'EXACT')
+        with self.assertRaises(EvidenceError):
+            reconcile_completed_trade(pos, [row])
