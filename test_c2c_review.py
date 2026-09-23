@@ -312,3 +312,38 @@ class ReviewCostFinalityTests(unittest.TestCase):
         self.client.hset(self.store.key, self.store._field(self.pos['deal_id']), json.dumps(entry))
         with self.assertRaisesRegex(EvidenceError, 'Legacy economic completion'):
             self.store.project_once(self.pos['deal_id'], 'fixture', lambda *_: {})
+
+
+class ReviewRealizationIdentityTests(unittest.TestCase):
+    def test_same_reference_and_opening_values_across_instruments_stay_distinct(self):
+        from broker_ledger import reconcile_completed_trade
+        a = reconcile_completed_trade(position(), [realization()])
+        b = reconcile_completed_trade(position(deal_id='silver', broker_instrument='Silver'),
+                                      [realization(instrumentName='Silver')])
+        self.assertNotEqual(a['realizations'][0]['realization_id'],
+                            b['realizations'][0]['realization_id'])
+
+    def test_cross_instrument_realizations_can_both_be_persisted(self):
+        store = PendingCloseStore(fakeredis.FakeRedis(), 'fixture-account')
+        a = register(store)
+        b = register(store, position(deal_id='silver', broker_instrument='Silver'))
+        rows = history([realization(), realization(instrumentName='Silver')])
+        self.assertEqual(len(store.reconcile(a['deal_id'], rows)['realizations']), 1)
+        self.assertEqual(len(store.reconcile(b['deal_id'], rows)['realizations']), 1)
+
+    def test_legacy_realizations_are_quarantined_without_rekeying(self):
+        import json
+        from test_broker_pending import COST_EVIDENCE
+        client = fakeredis.FakeRedis()
+        store = PendingCloseStore(client, 'fixture-account')
+        pos = register(store)
+        store.reconcile(pos['deal_id'], history(), cost_evidence=COST_EVIDENCE)
+        entry = store.get_entry(pos['deal_id'])
+        entry['record']['provenance'].pop('realization_identity_version')
+        client.hset(store.key, store._field(pos['deal_id']), json.dumps(entry))
+        before = client.hgetall(store.key)
+        with self.assertRaisesRegex(EvidenceError, 'Legacy realization'):
+            store.reconcile(pos['deal_id'], history(), cost_evidence=COST_EVIDENCE)
+        with self.assertRaisesRegex(EvidenceError, 'Legacy realization'):
+            store.project_once(pos['deal_id'], 'fixture', lambda *_: {})
+        self.assertEqual(before, client.hgetall(store.key))

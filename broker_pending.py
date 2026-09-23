@@ -178,6 +178,9 @@ class PendingCloseStore:
             if (entry.get('record') and entry['record'].get('costs')
                     and entry.get('cost_claim_version') != 2):
                 raise EvidenceError('Legacy cost records require explicit evidence review')
+            if (entry.get('record') and entry['record'].get('realizations')
+                    and entry['record'].get('provenance', {}).get('realization_identity_version') != 2):
+                raise EvidenceError('Legacy realization records require explicit evidence review')
             if data[entry["opening_key"]] != [field]:
                 raise EvidenceError("Ambiguous opening tuple; manual attribution required")
             pos = entry["opening"]
@@ -260,6 +263,8 @@ class PendingCloseStore:
                 raise EvidenceError("Pending outcome cannot be delivered")
             if record.get('provenance', {}).get('economic_evidence_complete') is not True:
                 raise EvidenceError('Legacy economic completion requires evidence review')
+            if record.get('provenance', {}).get('realization_identity_version') != 2:
+                raise EvidenceError('Legacy realization records cannot be delivered')
             if record.get('costs') and entry.get('cost_claim_version') != 2:
                 raise EvidenceError('Legacy cost records cannot be delivered')
             if data[entry["opening_key"]] != [field]:

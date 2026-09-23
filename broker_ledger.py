@@ -125,7 +125,8 @@ def reconcile_completed_trade(position, transactions, costs=(), *,
         if exit_price <= 0:
             raise EvidenceError("Invalid closing price")
         amount = _money(row, position["currency"])
-        identity = [position["account_id"], reference, opened.isoformat(),
+        identity = ['IG.realization.v2', position["account_id"],
+                    row['instrumentName'], reference, opened.isoformat(),
                     _text(price), _text(signed_size), closed.isoformat(), _text(exit_price)]
         realization_id = _key(identity)
         realization = {
@@ -196,6 +197,7 @@ def reconcile_completed_trade(position, transactions, costs=(), *,
         "role": position.get("role", "unknown"), "exit_reason": position.get("exit_reason", "unknown"),
         "strategy_context": deepcopy(position.get("strategy_context", {})),
         "provenance": {"pnl": "broker_realizations", "context": "matched_strategy_metadata",
+                       "realization_identity_version": 2,
                        "history_complete": bool(history_complete), "costs_complete": bool(costs_complete)},
     }
 

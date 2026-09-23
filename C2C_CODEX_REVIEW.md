@@ -177,3 +177,13 @@ delayed entry/exit commissions and financing after restart, unknown account cost
 direct-store bypass, position/window mismatch, non-trading flows, offsetting costs,
 out-of-window postings, and legacy projection quarantine. Full offline suite:
 304 PASS. Compile and diff checks PASS; complete change reviewed.
+
+## Correction 6: realization instrument discriminator
+
+Two new adversarial tests reproduced a collision between Gold and Silver with
+otherwise identical reference/opening/close fields; the second legitimate trade
+was refused as already claimed. Realization identity now includes the source
+instrument and a versioned namespace, still excluding the June claimant ID.
+A third test verifies saved pre-versioned realization records are quarantined
+without rekeying or projection. Existing claims/history are preserved for review.
+Full suite 307 PASS; compile and diff checks PASS; complete diff reviewed.
