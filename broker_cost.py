@@ -52,7 +52,7 @@ cost_complete=False: pass costs_complete=False to reconcile_completed_trade and
 leave net_realized_pnl as None.  Do not treat missing costs as zero.
 """
 
-from broker_ledger import EvidenceError, _key
+from broker_ledger import EvidenceError, _key, _number, _text
 from broker_transaction import UNKNOWN
 
 POSITION    = "position"      # uniquely attributable to one trade
@@ -145,7 +145,19 @@ def build_cost_record(norm_tx, account_id, deal_id):
 
     kind    = "commission" if tx_type == "commission" else "other"
     raw_t   = norm_tx.get("raw_transaction_type") or tx_type.upper()
-    cost_id = _key([account_id, deal_id, str(ref), str(amount)])
+    if norm_tx.get('account_id') != account_id:
+        raise EvidenceError('Cost source belongs to another account')
+    # A source-row fingerprint, never a claimant-dependent identity. Preserve
+    # every normalized economic discriminator available in the history row.
+    # This does not prove that two economically distinct, identical source rows
+    # are one event; certification needs stronger broker evidence in that case.
+    identity = {k: norm_tx.get(k, UNKNOWN) for k in (
+        'source', 'raw_transaction_type', 'reference', 'instrument_name',
+        'open_utc', 'close_utc', 'direction', 'currency')}
+    for key in ('cash_amount', 'open_price', 'close_price', 'close_quantity'):
+        value = norm_tx.get(key, UNKNOWN)
+        identity[key] = UNKNOWN if value == UNKNOWN else _text(_number(value))
+    cost_id = 'cost-v2:' + _key([account_id, identity])
 
     return {
         "account_id":       account_id,

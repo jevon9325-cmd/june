@@ -111,3 +111,27 @@ failure-injection tests. No Stage D/E or runtime adapters were connected.
 Checkpoint verdict: REVIEW INCOMPLETE / NOT APPROVED. Do not interpret 280 passing
 tests as certification of cost attribution or broker-net completed outcomes.
 Stopped at independent verified commits per the requested token-discipline rule.
+
+## Correction 3: source cost fingerprints and atomic claims
+
+Resumed at the requested clean 8ff64e5; independently verified 280 tests PASS.
+Eight added adversarial tests cover claimant independence, distinct posting times
+and instruments, same-cost duplicate delivery/overlapping windows after restart,
+two-position atomic claims, lost EXEC acknowledgement, WATCH contention, and
+legacy record quarantine. Four tests failed before the implementation change.
+
+Cost fingerprints now exclude June deal_id and include the normalized source
+economic fields, with canonical numeric representations. Distinct postings with
+shared reference/amount remain separate. Cost claims commit in the same WATCH /
+HSET transaction as realization claims and the trade record. Legacy records with
+costs but without the new claim-version marker are refused for reconciliation
+and projection; no silent migration or replay is performed.
+
+Validation: full offline suite 288 PASS; targeted review 17 PASS; py_compile and
+git diff --check PASS; full diff reviewed. june.py unchanged from pre-C2c 9e7a2ab.
+
+Limits: this is a source-row fingerprint, not a broker-issued unique event ID.
+Indistinguishable distinct rows and corrected rows still need stronger evidence.
+Atomic exclusion also does not prove that the first claimant is the right owner.
+Reference-only ambiguous attribution and economic finality remain blockers.
+No C2c certification, deployment, runtime wiring or production action.

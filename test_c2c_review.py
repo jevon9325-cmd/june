@@ -9,6 +9,8 @@ from broker_pending import PendingCloseStore
 from broker_reconcile import reconcile_position
 from test_broker_ledger import position, realization
 from test_broker_pending import register, history
+from broker_cost import build_cost_record
+from test_broker_cost import comm_row
 
 
 def normalized(rows):
@@ -84,3 +86,91 @@ class ReviewParsingTests(unittest.TestCase):
         self.assertNotEqual(match_realizations(pos, normalized([row]))['confidence'], 'EXACT')
         with self.assertRaises(EvidenceError):
             reconcile_completed_trade(pos, [row])
+
+
+class ReviewCostIdentityTests(unittest.TestCase):
+    def cost(self, deal='opening-1', **changes):
+        row = {**comm_row(), 'dateUtc': '2026-09-21T07:00:00',
+               'instrumentName': 'Spot Gold ($1)', **changes}
+        return build_cost_record(normalized([row])[0], 'fixture-account', deal)
+
+    def test_cost_identity_does_not_depend_on_claimant(self):
+        self.assertEqual(self.cost()['cost_id'], self.cost('another')['cost_id'])
+
+    def test_distinct_postings_and_instruments_do_not_collapse(self):
+        costs = [self.cost(), self.cost(dateUtc='2026-09-21T07:00:01'),
+                 self.cost(instrumentName='Silver')]
+        self.assertEqual(len({c['cost_id'] for c in costs}), 3)
+
+    def test_duplicate_delivery_and_overlapping_window_after_restart(self):
+        client = fakeredis.FakeRedis()
+        store = PendingCloseStore(client, 'fixture-account')
+        pos = register(store)
+        cost = self.cost()
+        first = store.reconcile(pos['deal_id'], history(), [cost, deepcopy(cost)])
+        batch = history()
+        batch['to'] = '2026-09-23T00:00:00'
+        again = PendingCloseStore(client, 'fixture-account').reconcile(pos['deal_id'], batch, [cost])
+        self.assertEqual(first, again)
+        self.assertEqual(again['commissions'], '-9')
+
+    def test_cost_claim_is_atomic_across_positions_and_restart(self):
+        client = fakeredis.FakeRedis()
+        store = PendingCloseStore(client, 'fixture-account')
+        a = register(store)
+        b = register(store, position(deal_id='opening-2', entry_price='999'))
+        store.reconcile(a['deal_id'], history(), [self.cost()])
+        before = client.hgetall(store.key)
+        with self.assertRaisesRegex(EvidenceError, 'Cost already attributed'):
+            PendingCloseStore(client, 'fixture-account').reconcile(
+                b['deal_id'], history([realization(openLevel='999')]), [self.cost(b['deal_id'])])
+        self.assertEqual(client.hgetall(store.key), before)
+
+    def test_distinct_similar_costs_both_contribute(self):
+        store = PendingCloseStore(fakeredis.FakeRedis(), 'fixture-account')
+        pos = register(store)
+        record = store.reconcile(pos['deal_id'], history(),
+            [self.cost(), self.cost(dateUtc='2026-09-21T07:00:01')])
+        self.assertEqual(record['commissions'], '-18')
+        self.assertEqual(len(record['costs']), 2)
+
+    def test_cost_claim_survives_lost_acknowledgement(self):
+        from test_broker_pending import FaultClient
+        from redis.exceptions import ConnectionError
+        client = fakeredis.FakeRedis()
+        store = PendingCloseStore(client, 'fixture-account')
+        pos = register(store)
+        faulty = PendingCloseStore(FaultClient(client, 'after'), 'fixture-account')
+        with self.assertRaises(ConnectionError):
+            faulty.reconcile(pos['deal_id'], history(), [self.cost()])
+        record = store.reconcile(pos['deal_id'], history(), [self.cost()])
+        self.assertEqual(record['commissions'], '-9')
+        self.assertEqual(len(record['costs']), 1)
+
+    def test_legacy_cost_record_requires_review_without_migration(self):
+        import json
+        client = fakeredis.FakeRedis()
+        store = PendingCloseStore(client, 'fixture-account')
+        pos = register(store)
+        store.reconcile(pos['deal_id'], history(), [self.cost()])
+        entry = store.get_entry(pos['deal_id'])
+        entry.pop('cost_claim_version')
+        client.hset(store.key, store._field(pos['deal_id']), json.dumps(entry))
+        before = client.hgetall(store.key)
+        with self.assertRaisesRegex(EvidenceError, 'Legacy cost'):
+            store.reconcile(pos['deal_id'], history(), [self.cost()])
+        self.assertEqual(before, client.hgetall(store.key))
+
+    def test_competing_claim_retries_watch_and_refuses_loser(self):
+        from test_broker_pending import FaultClient
+        client = fakeredis.FakeRedis()
+        store = PendingCloseStore(client, 'fixture-account')
+        a = register(store)
+        b = register(store, position(deal_id='opening-2', entry_price='999'))
+        def win():
+            store.reconcile(a['deal_id'], history(), [self.cost()])
+        racing = PendingCloseStore(FaultClient(client, 'race', win), 'fixture-account')
+        with self.assertRaisesRegex(EvidenceError, 'Cost already attributed'):
+            racing.reconcile(b['deal_id'], history([realization(openLevel='999')]),
+                             [self.cost(b['deal_id'])])
+        self.assertIsNone(store.get_entry(b['deal_id'])['record'])

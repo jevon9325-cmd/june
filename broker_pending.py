@@ -166,6 +166,9 @@ class PendingCloseStore:
             entry = data.get(field)
             if not entry or entry["opening"] is None:
                 raise EvidenceError("Exact broker opening still missing")
+            if (entry.get('record') and entry['record'].get('costs')
+                    and entry.get('cost_claim_version') != 2):
+                raise EvidenceError('Legacy cost records require explicit evidence review')
             if data[entry["opening_key"]] != [field]:
                 raise EvidenceError("Ambiguous opening tuple; manual attribution required")
             pos = entry["opening"]
@@ -183,6 +186,11 @@ class PendingCloseStore:
                 if data.get(claim, field) != field:
                     raise EvidenceError("Realization already attributed to another position")
                 data[claim] = field
+            for cost in record['costs']:
+                claim = 'cost:' + cost['cost_id']
+                if data.get(claim, field) != field:
+                    raise EvidenceError('Cost already attributed to another position')
+                data[claim] = field
             if record["status"] == "complete":
                 if _utc(cost_evidence["covered_through"]) < _utc(record["exit_utc"]):
                     raise EvidenceError("Cost evidence ends before final realization")
@@ -196,6 +204,7 @@ class PendingCloseStore:
             if previous and previous["status"] == "complete" and previous != record:
                 raise EvidenceError("Completed evidence changed; review rather than redeliver")
             entry["record"] = record
+            entry['cost_claim_version'] = 2
             return record
         return self._update(change)
 
@@ -216,6 +225,8 @@ class PendingCloseStore:
             record = entry.get("record") if entry else None
             if not record or record["status"] != "complete":
                 raise EvidenceError("Pending outcome cannot be delivered")
+            if record.get('costs') and entry.get('cost_claim_version') != 2:
+                raise EvidenceError('Legacy cost records cannot be delivered')
             if data[entry["opening_key"]] != [field]:
                 raise EvidenceError("Ambiguous opening tuple cannot be delivered")
             if delivery_key not in data:
