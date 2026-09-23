@@ -344,10 +344,10 @@ class CostReconcileIntegrationTests(unittest.TestCase):
         record = reconcile_completed_trade(
             pos, lc["raw_rows"], costs["position_costs"],
             history_complete=True, costs_complete=True)
-        self.assertEqual(record["status"], "complete")
+        self.assertEqual(record["status"], "provisional")
         self.assertEqual(record["gross_realized_pnl"], "5.27")
-        self.assertEqual(record["net_realized_pnl"], "-12.73")
-        self.assertFalse(record["won"])
+        self.assertEqual(record["net_identified_pnl"], "-12.73")
+        self.assertIsNone(record["won"])
 
     def test_partial_close_remains_pending_with_costs(self):
         """C2c-3 + C2c-5: partial realization with attributed costs → pending_realizations."""

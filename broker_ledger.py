@@ -11,6 +11,7 @@ from decimal import Decimal, InvalidOperation
 from hashlib import sha256
 import json
 import re
+from broker_source import source_fields, IDENTITY_REASON
 
 
 class EvidenceError(ValueError):
@@ -125,9 +126,10 @@ def reconcile_completed_trade(position, transactions, costs=(), *,
         if exit_price <= 0:
             raise EvidenceError("Invalid closing price")
         amount = _money(row, position["currency"])
-        identity = ['IG.realization.v2', position["account_id"],
+        identity = ['IG.realization.v3', position["account_id"],
                     row['instrumentName'], reference, opened.isoformat(),
-                    _text(price), _text(signed_size), closed.isoformat(), _text(exit_price)]
+                    _text(price), _text(signed_size), closed.isoformat(), _text(exit_price),
+                    source_fields(row)]
         realization_id = _key(identity)
         realization = {
             "realization_id": realization_id, "broker_reference": reference,
@@ -165,7 +167,7 @@ def reconcile_completed_trade(position, transactions, costs=(), *,
     other = sum((_number(x["amount"]) for x in fees if x["kind"] == "other"), Decimal(0))
     identified_net = gross + commissions + other
     complete = bool(history_complete and costs_complete and parts and remaining == 0)
-    status = ("complete" if complete else "pending_realizations"
+    status = ("provisional" if complete else "pending_realizations"
               if not history_complete or remaining or not parts else "pending_costs")
     unit_notional = position.get("notional_per_quantity")
     exposure = None
@@ -190,14 +192,18 @@ def reconcile_completed_trade(position, transactions, costs=(), *,
         "remaining_notional": _text(remaining * unit_notional) if exposure is not None else None,
         "gross_realized_pnl": _text(gross), "commissions": _text(commissions),
         "other_costs": _text(other), "net_identified_pnl": _text(identified_net),
-        "net_realized_pnl": _text(identified_net) if complete else None,
-        "won": identified_net > 0 if complete else None,
+        "net_realized_pnl": None,
+        "won": None,
+        "economic_state": "PROVISIONAL" if parts else "UNRESOLVED",
+        "identity_state": "UNRESOLVED",
+        "uncertainty_reasons": [IDENTITY_REASON],
         "realizations": parts, "costs": fees,
         "partial_close_count": len(parts) if remaining else max(0, len(parts) - 1),
         "role": position.get("role", "unknown"), "exit_reason": position.get("exit_reason", "unknown"),
         "strategy_context": deepcopy(position.get("strategy_context", {})),
         "provenance": {"pnl": "broker_realizations", "context": "matched_strategy_metadata",
-                       "realization_identity_version": 2,
+                       "realization_identity_version": 3,
+                       "identity_evidence_complete": False,
                        "history_complete": bool(history_complete), "costs_complete": bool(costs_complete)},
     }
 

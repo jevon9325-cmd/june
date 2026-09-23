@@ -116,8 +116,8 @@ class DelayedEvidenceTests(unittest.TestCase):
         record, attribution = reconcile_position(
             self.store, POS["deal_id"], raw_batch(FULL_ROWS), POS,
             entry_reference=ENTRY_REF, cost_evidence=COST_EVIDENCE)
-        self.assertEqual(record["status"], "complete")
-        self.assertEqual(record["net_realized_pnl"], EXPECTED_NET)
+        self.assertEqual(record["status"], "provisional")
+        self.assertEqual(record["net_identified_pnl"], EXPECTED_NET)
         self.assertTrue(attribution["cost_complete"])
         self.assertEqual(len(attribution["position_costs"]), 2)
 
@@ -143,8 +143,8 @@ class DelayedEvidenceTests(unittest.TestCase):
         record, _ = reconcile_position(
             restarted, POS["deal_id"], raw_batch(FULL_ROWS), POS,
             entry_reference=ENTRY_REF, cost_evidence=COST_EVIDENCE)
-        self.assertEqual(record["status"], "complete")
-        self.assertEqual(record["net_realized_pnl"], EXPECTED_NET)
+        self.assertEqual(record["status"], "provisional")
+        self.assertEqual(record["net_identified_pnl"], EXPECTED_NET)
 
     # ── cost_evidence attestation is required; attribution alone is not enough ──
 
@@ -204,7 +204,7 @@ class IdempotencyTests(unittest.TestCase):
         record, _ = reconcile_position(
             store, POS["deal_id"], raw_batch(FULL_ROWS), POS,
             entry_reference=ENTRY_REF, cost_evidence=COST_EVIDENCE)
-        self.assertEqual(record["status"], "complete")
+        self.assertEqual(record["status"], "provisional")
         return record
 
     # ── restart before history ─────────────────────────────────────────────
@@ -218,7 +218,7 @@ class IdempotencyTests(unittest.TestCase):
 
         # After restart, full reconciliation succeeds
         record = self.complete(restarted)
-        self.assertEqual(record["status"], "complete")
+        self.assertEqual(record["status"], "provisional")
 
     # ── repeated reconciliation — primary idempotency invariant ───────────
 
@@ -260,7 +260,7 @@ class IdempotencyTests(unittest.TestCase):
                 POS, entry_reference=ENTRY_REF, cost_evidence=COST_EVIDENCE)
         # Original record is unchanged
         surviving = self.store.get_entry(POS["deal_id"])["record"]
-        self.assertEqual(surviving["net_realized_pnl"], EXPECTED_NET)
+        self.assertEqual(surviving["net_identified_pnl"], EXPECTED_NET)
 
     # ── duplicate batch ────────────────────────────────────────────────────
 
@@ -297,8 +297,8 @@ class IdempotencyTests(unittest.TestCase):
         record, _ = reconcile_position(
             self.restart(), POS["deal_id"], raw_batch(FULL_ROWS), POS,
             entry_reference=ENTRY_REF, cost_evidence=COST_EVIDENCE)
-        self.assertEqual(record["status"], "complete")
-        self.assertEqual(record["net_realized_pnl"], EXPECTED_NET)
+        self.assertEqual(record["status"], "provisional")
+        self.assertEqual(record["net_identified_pnl"], EXPECTED_NET)
 
     # ── restart mid-progression ────────────────────────────────────────────
 
@@ -313,8 +313,8 @@ class IdempotencyTests(unittest.TestCase):
         record, _ = reconcile_position(
             self.restart(), POS["deal_id"], raw_batch(FULL_ROWS), POS,
             entry_reference=ENTRY_REF, cost_evidence=COST_EVIDENCE)
-        self.assertEqual(record["status"], "complete")
-        self.assertEqual(record["net_realized_pnl"], EXPECTED_NET)
+        self.assertEqual(record["status"], "provisional")
+        self.assertEqual(record["net_identified_pnl"], EXPECTED_NET)
 
     # ── API failure before commit leaves state unchanged ──────────────────
 
@@ -369,34 +369,16 @@ class IdempotencyTests(unittest.TestCase):
 
     # ── realization claim blocks cross-position attribution ────────────────
 
-    def test_complete_outcome_delivers_exactly_once_per_consumer(self):
-        """C2c-9: project_once delivers exactly once per consumer, even after restart
-        and re-reconciliation.
-
-        This proves the combined invariant: reconcile_position is idempotent
-        (same record on re-call) AND project_once's delivery marker ensures the
-        learning callback fires only once — not once per reconcile_position call.
-        """
-        self.complete()
-
-        def count_up(state, record):
-            return {"count": state.get("count", 0) + 1}
-
-        # First delivery
-        r1 = self.store.project_once(POS["deal_id"], "c2c9-consumer", count_up)
-        self.assertEqual(r1["count"], 1)
-
-        # Restart → re-reconcile (idempotent) → attempt re-delivery
-        restarted = self.restart()
-        reconcile_position(
-            restarted, POS["deal_id"], raw_batch(FULL_ROWS), POS,
-            entry_reference=ENTRY_REF, cost_evidence=COST_EVIDENCE)
-
-        # project_once skips when delivery marker is present
-        blocker = Mock(side_effect=AssertionError("callback must not fire again"))
-        r2 = restarted.project_once(POS["deal_id"], "c2c9-consumer", blocker)
-        blocker.assert_not_called()
-        self.assertEqual(r2["count"], 1)  # same accumulated state, not doubled
+    def test_provisional_outcome_never_delivers_after_restart(self):
+        first = self.complete()
+        reducer = Mock(side_effect=AssertionError('must not deliver'))
+        for store in (self.store, self.restart()):
+            record, _ = reconcile_position(store, POS['deal_id'], raw_batch(FULL_ROWS), POS,
+                entry_reference=ENTRY_REF, cost_evidence=COST_EVIDENCE)
+            self.assertEqual(first, record)
+            with self.assertRaises(EvidenceError):
+                store.project_once(POS['deal_id'], 'c2c9-consumer', reducer)
+        reducer.assert_not_called()
 
 
 if __name__ == "__main__":

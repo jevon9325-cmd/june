@@ -159,47 +159,52 @@ class PendingTests(unittest.TestCase):
         self.assertEqual(record["status"], "pending_costs")
         record = restarted.reconcile("opening-1", history([first, realization("residual", "-0.08", "-0.08")]),
                                      cost_evidence=COST_EVIDENCE)
-        self.assertEqual(record["net_realized_pnl"], "0.01")
+        self.assertEqual(record["net_identified_pnl"], "0.01")
 
     def test_broker_close_without_software_confirm(self):
         register(self.store, position(exit_reason="unknown"))
         self.store.capture("opening-1", "june.reconcile_absent", {"exit_reason": "unknown"})
         result = self.restart().reconcile("opening-1", history(), cost_evidence=COST_EVIDENCE)
-        self.assertEqual(result["status"], "complete")
+        self.assertEqual(result["status"], "provisional")
         self.assertEqual(result["exit_reason"], "unknown")
-        self.assertEqual(self.restart().project_once("opening-1", "fixture-performance", count_outcome),
-                         {"count": 1, "net": -.16})
+        with self.assertRaises(EvidenceError):
+            self.restart().project_once("opening-1", "fixture-performance", count_outcome)
 
     def test_repeated_observation_and_projection_are_idempotent(self):
-        self.complete()
-        first = self.store.project_once("opening-1", "performance", count_outcome)
+        first = self.complete()
         restarted = self.restart()
-        restarted.reconcile("opening-1", history(), cost_evidence=COST_EVIDENCE)
-        reducer = Mock(side_effect=AssertionError("must not repeat consumer"))
-        self.assertEqual(restarted.project_once("opening-1", "performance", reducer), first)
+        self.assertEqual(first, restarted.reconcile('opening-1', history(), cost_evidence=COST_EVIDENCE))
+        reducer = Mock(side_effect=AssertionError('provisional outcomes cannot be consumed'))
+        for store in (self.store, restarted):
+            with self.assertRaises(EvidenceError):
+                store.project_once('opening-1', 'performance', reducer)
         reducer.assert_not_called()
-        self.assertEqual(len(restarted.entries()), 1)
+        self.assertIsNone(self.client.hget(self.store.key, 'consumer:performance'))
 
     def test_disconnect_before_commit_leaves_no_marker_or_projection(self):
-        self.complete()
-        failed = self.restart(FaultClient(self.client, "before"))
+        register(self.store)
+        failed = self.restart(FaultClient(self.client, 'before'))
         with self.assertRaises(ConnectionError):
-            failed.project_once("opening-1", "performance", count_outcome)
-        self.assertEqual(self.restart().project_once("opening-1", "performance", count_outcome), {"count": 1, "net": -.16})
+            failed.reconcile('opening-1', history(), cost_evidence=COST_EVIDENCE)
+        self.assertIsNone(self.store.get_entry('opening-1')['record'])
+        record = self.restart().reconcile('opening-1', history(), cost_evidence=COST_EVIDENCE)
+        self.assertEqual(record['status'], 'provisional')
 
     def test_disconnect_after_commit_retry_does_not_double_count(self):
-        self.complete()
-        failed = self.restart(FaultClient(self.client, "after"))
+        register(self.store)
+        failed = self.restart(FaultClient(self.client, 'after'))
         with self.assertRaises(ConnectionError):
-            failed.project_once("opening-1", "performance", count_outcome)
-        reducer = Mock(side_effect=AssertionError("already committed"))
-        self.assertEqual(self.restart().project_once("opening-1", "performance", reducer), {"count": 1, "net": -.16})
-        reducer.assert_not_called()
+            failed.reconcile('opening-1', history(), cost_evidence=COST_EVIDENCE)
+        before = self.client.hgetall(self.store.key)
+        record = self.restart().reconcile('opening-1', history(), cost_evidence=COST_EVIDENCE)
+        self.assertEqual(before, self.client.hgetall(self.store.key))
+        self.assertEqual(len(record['realizations']), 1)
 
     def test_watch_conflict_preserves_concurrent_capture(self):
-        self.complete()
-        racing = self.restart(FaultClient(self.client, "race", lambda: self.store.capture("other-deal", "fixture", {"role": "add_on"})))
-        self.assertEqual(racing.project_once("opening-1", "performance", count_outcome), {"count": 1, "net": -.16})
+        register(self.store)
+        racing = self.restart(FaultClient(self.client, 'race', lambda: self.store.capture('other-deal', 'fixture', {'role': 'add_on'})))
+        record = racing.reconcile('opening-1', history(), cost_evidence=COST_EVIDENCE)
+        self.assertEqual(record['status'], 'provisional')
         self.assertEqual(len(self.restart().entries()), 2)
 
     def test_capture_lost_acknowledgement_is_safe_to_retry(self):
@@ -228,15 +233,18 @@ class PendingTests(unittest.TestCase):
         with self.assertRaises(ConnectionError):
             failed.reconcile("opening-1", history(), cost_evidence=COST_EVIDENCE)
         result = self.restart().reconcile("opening-1", history(), cost_evidence=COST_EVIDENCE)
-        self.assertEqual(result["net_realized_pnl"], "-0.16")
+        self.assertEqual(result["net_identified_pnl"], "-0.16")
         self.assertEqual(len(self.store.entries()), 1)
 
-    def test_independent_consumers_each_receive_once(self):
+    def test_independent_consumers_all_refuse_provisional_outcome(self):
         self.complete()
-        for consumer in ("performance", "history", "streak"):
+        for consumer in ('performance', 'history', 'streak'):
+            reducer = Mock()
             for _ in range(2):
-                result = self.restart().project_once("opening-1", consumer, count_outcome)
-                self.assertEqual(result["count"], 1)
+                with self.assertRaises(EvidenceError):
+                    self.restart().project_once('opening-1', consumer, reducer)
+            reducer.assert_not_called()
+            self.assertIsNone(self.client.hget(self.store.key, 'consumer:' + consumer))
 
     def test_opening_collision_blocks_both_positions(self):
         register(self.store)
@@ -264,15 +272,19 @@ class PendingTests(unittest.TestCase):
 
     def test_projector_failure_cannot_commit_delivery_marker(self):
         self.complete()
-        with self.assertRaises(RuntimeError):
-            self.store.project_once("opening-1", "performance", Mock(side_effect=RuntimeError("fixture")))
-        self.assertEqual(self.restart().project_once("opening-1", "performance", count_outcome)["count"], 1)
+        reducer = Mock(side_effect=RuntimeError('must not be called'))
+        with self.assertRaises(EvidenceError):
+            self.store.project_once('opening-1', 'performance', reducer)
+        reducer.assert_not_called()
+        self.assertIsNone(self.client.hget(self.store.key, 'consumer:performance'))
 
     def test_non_json_projection_cannot_commit(self):
         self.complete()
-        with self.assertRaises(ValueError):
-            self.store.project_once("opening-1", "performance", lambda *_: {"net": float("nan")})
-        self.assertEqual(self.restart().project_once("opening-1", "performance", count_outcome)["count"], 1)
+        reducer = Mock(return_value={'net': float('nan')})
+        with self.assertRaises(EvidenceError):
+            self.store.project_once('opening-1', 'performance', reducer)
+        reducer.assert_not_called()
+        self.assertIsNone(self.client.hget(self.store.key, 'consumer:performance'))
 
 
 if __name__ == "__main__":

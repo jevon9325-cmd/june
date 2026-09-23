@@ -176,10 +176,10 @@ class PendingCloseStore:
             if not entry or entry["opening"] is None:
                 raise EvidenceError("Exact broker opening still missing")
             if (entry.get('record') and entry['record'].get('costs')
-                    and entry.get('cost_claim_version') != 2):
+                    and entry.get('cost_claim_version') != 3):
                 raise EvidenceError('Legacy cost records require explicit evidence review')
             if (entry.get('record') and entry['record'].get('realizations')
-                    and entry['record'].get('provenance', {}).get('realization_identity_version') != 2):
+                    and entry['record'].get('provenance', {}).get('realization_identity_version') != 3):
                 raise EvidenceError('Legacy realization records require explicit evidence review')
             if data[entry["opening_key"]] != [field]:
                 raise EvidenceError("Ambiguous opening tuple; manual attribution required")
@@ -219,7 +219,8 @@ class PendingCloseStore:
                 record = reconcile_completed_trade(pos, batch['transactions'], costs,
                                                    history_complete=True, costs_complete=True)
             record['provenance']['history_fetch_complete'] = True
-            record['provenance']['economic_evidence_complete'] = economics_complete
+            record['provenance']['cost_statement_consistent'] = economics_complete
+            record['provenance']['economic_evidence_complete'] = False
             for part in record["realizations"]:
                 if _utc(part["exit_utc"]) > _utc(batch["to"]):
                     raise EvidenceError("Realization outside fetched history window")
@@ -248,7 +249,7 @@ class PendingCloseStore:
             if previous and previous["status"] == "complete" and previous != record:
                 raise EvidenceError("Completed evidence changed; review rather than redeliver")
             entry["record"] = record
-            entry['cost_claim_version'] = 2
+            entry['cost_claim_version'] = 3
             return record
         return self._update(change)
 

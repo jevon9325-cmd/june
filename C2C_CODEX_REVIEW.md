@@ -287,3 +287,30 @@ Continuation should start from this committed clean checkpoint and the blockers
 above. Do not reconstruct old history or interpret 308 passing tests as C2c
 certification. Resolve the source-evidence and registry-finality contracts before
 claiming all twelve acceptance invariants. Stop at C2c.
+
+## Continuation from db4abef: blocker 1, source identity
+
+Verified the requested branch, clean db4abef and 308 passing tests before editing.
+Official schema inspected 2026-09-23:
+https://labs.ig.com/reference/history-transactions.html
+It documents row attributes and pagination, without declaring reference unique
+or providing transaction revision lineage. This is insufficient evidence for
+unconditional event uniqueness. Additional captured fields (including period)
+now participate in observation fingerprints instead of disappearing.
+
+All history-derived results now explicitly report identity_state=UNRESOLVED and
+economic_state=PROVISIONAL (UNRESOLVED when no realizations exist). The former
+complete branch now returns provisional with net_realized_pnl/won unset. The
+existing gross/net_identified fields are observation arithmetic, not certified
+economic totals. Caller booleans or invented ID fields cannot promote them.
+Repeated identical observations count once; distinct exposed rows survive. Their
+economic multiplicity/revision relationship remains unknown rather than guessed.
+Source fingerprint versions advance to 3; previous records remain quarantined.
+
+Five new tests cover identical delivery, distinct periods/times, false caller
+identity flags and restart. Existing arithmetic tests still assert original
+numeric results; certification/projection assertions now require refusal.
+Transport/WATCH tests continue to exercise atomic provisional journal writes.
+Full suite: 313 PASS. Compile/diff checks PASS; all changes reviewed.
+This closes the false-certification path for new history-derived results.
+Historical projections and posting-finality semantics are the next blockers.

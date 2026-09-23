@@ -55,6 +55,7 @@ leave net_realized_pnl as None.  Do not treat missing costs as zero.
 
 from broker_ledger import EvidenceError, _key, _number, _text
 from broker_transaction import UNKNOWN
+from broker_source import source_fields
 
 POSITION    = "position"      # uniquely attributable to one trade
 INSTRUMENT  = "instrument"    # instrument-level only; multiple positions possible
@@ -158,7 +159,8 @@ def build_cost_record(norm_tx, account_id, deal_id):
     for key in ('cash_amount', 'open_price', 'close_price', 'close_quantity'):
         value = norm_tx.get(key, UNKNOWN)
         identity[key] = UNKNOWN if value == UNKNOWN else _text(_number(value))
-    cost_id = 'cost-v2:' + _key([account_id, identity])
+    identity['additional_source_fields'] = source_fields(norm_tx.get('raw', {}))
+    cost_id = 'cost-v3:' + _key([account_id, identity])
 
     return {
         "account_id":       account_id,

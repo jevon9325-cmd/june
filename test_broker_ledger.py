@@ -36,26 +36,27 @@ class BrokerLedgerTests(unittest.TestCase):
                 realization("7H3QM7AD", "-0.08", "0.09", closeLevel="4351.44",
                             dateUtc="2026-09-21T05:50:31")]
         record = complete(position(), rows)
-        self.assertEqual(record["net_realized_pnl"], "0.01")
+        self.assertEqual(record["net_identified_pnl"], "0.01")
         self.assertEqual(record["remaining_quantity"], "0")
         self.assertEqual(record["original_notional"], "696.4048")
         self.assertEqual(record["remaining_notional"], "0")
-        self.assertTrue(record["won"])
-        self.assertEqual(completed_history_view(record)["dollar_pnl"], .01)
+        self.assertIsNone(record["won"])
+        with self.assertRaises(EvidenceError):
+            completed_history_view(record)
         self.assertEqual(record["realizations"][0]["broker_reference"], "7H3QM7AD")
 
     def test_partial_outcome_combinations(self):
         for a, b, result in [("2", "-1", "1"), ("2", "-3", "-1"), ("-2", "3", "1")]:
             with self.subTest(a=a, b=b):
                 rec = complete(position(), [realization("a", "-0.08", a), realization("b", "-0.08", b)])
-                self.assertEqual(rec["net_realized_pnl"], result)
-                self.assertEqual(rec["won"], result == "1")
+                self.assertEqual(rec["net_identified_pnl"], result)
+                self.assertIsNone(rec["won"])
 
     def test_multiple_partials(self):
         rec = complete(position(), [realization("a", "-0.04", "0.1"),
                                     realization("b", "-0.04", "0.2"),
                                     realization("c", "-0.08", "-0.15")])
-        self.assertEqual(rec["net_realized_pnl"], "0.15")
+        self.assertEqual(rec["net_identified_pnl"], "0.15")
         self.assertEqual(rec["partial_close_count"], 2)
 
     def test_partial_remains_pending_with_proportional_exposure(self):
@@ -84,9 +85,9 @@ class BrokerLedgerTests(unittest.TestCase):
 
     def test_broker_stop_needs_no_software_close_receipt(self):
         rec = complete(position(exit_reason="broker_close"), [realization()])
-        self.assertEqual(rec["status"], "complete")
+        self.assertEqual(rec["status"], "provisional")
         self.assertEqual(rec["exit_reason"], "broker_close")
-        self.assertFalse(rec["won"])
+        self.assertIsNone(rec["won"])
 
     def test_repeat_observations_and_order_independence(self):
         a = realization("a", "-0.08", "0.09")
@@ -101,8 +102,8 @@ class BrokerLedgerTests(unittest.TestCase):
                          opened_utc="2026-09-21T05:46:56", notional_per_quantity="4341.05", role="addon")
         r1 = complete(position(), [first, second])
         r2 = complete(addon, [first, second])
-        self.assertEqual(r1["net_realized_pnl"], "0.17")
-        self.assertEqual(r2["net_realized_pnl"], "-0.11")
+        self.assertEqual(r1["net_identified_pnl"], "0.17")
+        self.assertEqual(r2["net_identified_pnl"], "-0.11")
         self.assertNotEqual(r1["trade_id"], r2["trade_id"])
         self.assertNotEqual(r1["realizations"][0]["realization_id"], r2["realizations"][0]["realization_id"])
         self.assertEqual(r2["original_notional"], "173.642")
@@ -125,9 +126,10 @@ class BrokerLedgerTests(unittest.TestCase):
                      broker_reference=k, source="IG.history.transactions") for k in ("entry-fee", "exit-fee")]
         rec = complete(pos, [row], fees + fees)
         self.assertEqual(rec["gross_realized_pnl"], "5.27")
-        self.assertEqual(rec["net_realized_pnl"], "-12.73")
-        self.assertFalse(rec["won"])
-        self.assertEqual(completed_history_view(rec)["commission"], 18)
+        self.assertEqual(rec["net_identified_pnl"], "-12.73")
+        self.assertIsNone(rec["won"])
+        with self.assertRaises(EvidenceError):
+            completed_history_view(rec)
 
     def test_unattributed_costs_are_not_assigned_by_symbol(self):
         other = dict(account_id="different-account", deal_id="opening-1", amount="-99")
@@ -145,12 +147,14 @@ class BrokerLedgerTests(unittest.TestCase):
 
     def test_strategy_estimate_cannot_override_broker_pnl(self):
         rec = complete(position(strategy_context={"dollar_pnl": 1000, "conviction": 3}), [realization()])
-        self.assertEqual(completed_history_view(rec)["dollar_pnl"], -.16)
+        with self.assertRaises(EvidenceError):
+            completed_history_view(rec)
 
     def test_unknown_exposure_is_not_invented(self):
         rec = complete(position(notional_per_quantity=None), [realization()])
         self.assertIsNone(rec["original_notional"])
-        self.assertIsNone(completed_history_view(rec)["pnl_pct"])
+        with self.assertRaises(EvidenceError):
+            completed_history_view(rec)
 
     def test_json_round_trip_and_inputs_unchanged(self):
         pos, rows = position(), [realization()]

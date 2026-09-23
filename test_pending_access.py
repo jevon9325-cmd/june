@@ -8,6 +8,7 @@ from unittest.mock import patch
 import fakeredis
 
 from broker_pending import PendingCloseStore
+from broker_ledger import EvidenceError
 from test_broker_pending import register, history, COST_EVIDENCE, count_outcome
 
 
@@ -70,11 +71,13 @@ class AccessTests(unittest.TestCase):
         store.reconcile('opening-1', history(), cost_evidence=COST_EVIDENCE)
         self.assertEqual(len(client.reads), 3)  # trade, opening owners, realization
         client.reads.clear()
-        store.project_once('opening-1', 'fixture', count_outcome)
-        self.assertEqual(len(client.reads), 4)  # trade, owners, delivery, consumer
+        with self.assertRaises(EvidenceError):
+            store.project_once('opening-1', 'fixture', count_outcome)
+        self.assertEqual(len(client.reads), 1)  # provisional record refused before reducer
         client.reads.clear()
-        store.project_once('opening-1', 'fixture', count_outcome)
-        self.assertEqual(len(client.reads), 4)
+        with self.assertRaises(EvidenceError):
+            store.project_once('opening-1', 'fixture', count_outcome)
+        self.assertEqual(len(client.reads), 1)
         self.assertFalse(any(f.startswith('trade:old-') for f in client.reads))
 
     def test_incremental_enumeration_and_direct_lookup(self):

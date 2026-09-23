@@ -243,8 +243,8 @@ class ReviewCostFinalityTests(unittest.TestCase):
     def test_zero_cost_requires_explicit_final_zero_components(self):
         self.assert_pending(self.reconcile())
         record = self.reconcile(evidence=self.evidence)
-        self.assertEqual(record['status'], 'complete')
-        self.assertEqual(record['net_realized_pnl'], '-0.16')
+        self.assertEqual(record['status'], 'provisional')
+        self.assertEqual(record['net_identified_pnl'], '-0.16')
 
     def test_delayed_commission_after_restart_completes_only_at_final_total(self):
         self.evidence['components']['commission']['total'] = '-18'
@@ -254,8 +254,8 @@ class ReviewCostFinalityTests(unittest.TestCase):
         self.assert_pending(self.reconcile(rows, self.evidence))
         rows.append(comm_row('close-1'))
         record = self.reconcile(rows, self.evidence)
-        self.assertEqual(record['status'], 'complete')
-        self.assertEqual(record['net_realized_pnl'], '-18.16')
+        self.assertEqual(record['status'], 'provisional')
+        self.assertEqual(record['net_identified_pnl'], '-18.16')
 
     def test_delayed_descriptive_financing_remains_unresolved_after_restart(self):
         self.evidence['components']['financing']['final'] = False
@@ -293,7 +293,7 @@ class ReviewCostFinalityTests(unittest.TestCase):
         rows = [realization(), {'transactionType': 'DEPO', 'profitAndLoss': '$150'},
                 {'transactionType': 'WITH', 'profitAndLoss': '-$20'}]
         record = self.reconcile(rows, self.evidence)
-        self.assertEqual(record['net_realized_pnl'], '-0.16')
+        self.assertEqual(record['net_identified_pnl'], '-0.16')
 
     def test_financing_cannot_cancel_other_credit_to_invent_zero_cost(self):
         self.evidence['components']['financing']['total'] = '-1'
@@ -310,6 +310,7 @@ class ReviewCostFinalityTests(unittest.TestCase):
         import json
         self.reconcile(evidence=self.evidence)
         entry = self.store.get_entry(self.pos['deal_id'])
+        entry['record']['status'] = 'complete'  # historical on-disk fixture
         entry['record']['provenance'].pop('economic_evidence_complete')
         self.client.hset(self.store.key, self.store._field(self.pos['deal_id']), json.dumps(entry))
         with self.assertRaisesRegex(EvidenceError, 'Legacy economic completion'):
@@ -353,6 +354,8 @@ class ReviewRealizationIdentityTests(unittest.TestCase):
         pos = register(store)
         store.reconcile(pos['deal_id'], history(), cost_evidence=COST_EVIDENCE)
         entry = store.get_entry(pos['deal_id'])
+        entry['record']['status'] = 'complete'  # historical on-disk fixture
+        entry['record']['provenance']['economic_evidence_complete'] = True
         entry['record']['provenance'].pop('realization_identity_version')
         client.hset(store.key, store._field(pos['deal_id']), json.dumps(entry))
         before = client.hgetall(store.key)
