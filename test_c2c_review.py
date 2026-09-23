@@ -174,3 +174,27 @@ class ReviewCostIdentityTests(unittest.TestCase):
             racing.reconcile(b['deal_id'], history([realization(openLevel='999')]),
                              [self.cost(b['deal_id'])])
         self.assertIsNone(store.get_entry(b['deal_id'])['record'])
+
+
+class ReviewCostAttributionTests(unittest.TestCase):
+    def test_shared_gold_close_reference_is_unattributed_for_both_positions(self):
+        from broker_cost import attribute_costs
+        a = position()
+        b = position(deal_id='second', entry_price='999')
+        rows = normalized([realization('shared'), realization('shared', openLevel='999'),
+                           comm_row('shared')])
+        for pos in (a, b):
+            result = attribute_costs(pos, rows, {'shared'}, 'entry-reference')
+            self.assertEqual(result['position_costs'], [])
+            self.assertEqual(len(result['unattributed_costs']), 1)
+            self.assertFalse(result['cost_complete'])
+
+    def test_shared_entry_reference_is_not_awarded_to_first_claimant(self):
+        store = PendingCloseStore(fakeredis.FakeRedis(), 'fixture-account')
+        a = register(store)
+        b = register(store, position(deal_id='second', entry_price='999'))
+        for pos, row in ((a, realization()), (b, realization(openLevel='999'))):
+            with self.assertRaisesRegex(EvidenceError, 'Ambiguous commission'):
+                reconcile_position(store, pos['deal_id'], history([row, comm_row('entry-reference')]),
+                                   pos, entry_reference='entry-reference')
+            self.assertIsNone(store.get_entry(pos['deal_id'])['record'])

@@ -230,6 +230,15 @@ def attribute_costs(position_evidence, normalized_transactions,
     unattributed     = []
     financing_present = False
 
+    # A shared closing reference is not a position identity. Inspect every
+    # opening in the supplied batch, including rows belonging to other trades.
+    reference_openings = {}
+    for tx in normalized_transactions:
+        if tx.get('account_id') == account_id and tx.get('transaction_type') == 'deal':
+            signature = tuple(tx.get(k, UNKNOWN) for k in (
+                'instrument_name', 'open_utc', 'open_price', 'direction'))
+            reference_openings.setdefault(tx.get('reference'), set()).add(signature)
+
     for norm_tx in normalized_transactions:
         if norm_tx.get("transaction_type") == "deal":
             continue
@@ -258,7 +267,7 @@ def attribute_costs(position_evidence, normalized_transactions,
 
         # scope == POSITION (commission with reference)
         ref = norm_tx.get("reference")
-        if known_refs and ref in known_refs:
+        if known_refs and ref in known_refs and len(reference_openings.get(ref, ())) <= 1:
             rec = build_cost_record(norm_tx, account_id, deal_id)
             if rec is not None:
                 position_costs.append(rec)

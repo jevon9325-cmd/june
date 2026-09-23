@@ -135,3 +135,18 @@ Indistinguishable distinct rows and corrected rows still need stronger evidence.
 Atomic exclusion also does not prove that the first claimant is the right owner.
 Reference-only ambiguous attribution and economic finality remain blockers.
 No C2c certification, deployment, runtime wiring or production action.
+
+## Correction 4: known shared-reference ambiguity
+
+Shared closing references spanning different opening tuples in the input history
+are now left unattributed. Registered entry references have an atomic owner index;
+multiple owners prevent cost reconciliation and delivery. Accepted entry receipts
+cannot be replaced after registration. Two adversarial tests exercise shared Gold
+closing references and concurrent same-instrument positions sharing an entry ref.
+The bounded-access test includes the additional reference-index read (no scan).
+Full suite 290 PASS; compile/diff checks PASS; correction diff reviewed.
+
+This detects known ambiguity; it does not establish completeness of the opening
+registry, resolve absent history rows, or undo already delivered historical data.
+Existing pre-index registrations need evidence review/re-registration before use.
+The first-claim rule alone remains insufficient as economic ownership proof.

@@ -144,9 +144,16 @@ class PendingCloseStore:
             # Retain collisions rather than silently choosing either position.
             if entry["opening"] is not None and entry["opening"] != pos:
                 raise EvidenceError("Conflicting broker opening identity")
+            if (entry.get('ownership_evidence') is not None
+                    and entry['ownership_evidence'] != ownership_evidence):
+                raise EvidenceError('Conflicting accepted entry receipt')
             entry["opening"] = pos
             entry["opening_key"] = owner_key
             entry["ownership_evidence"] = deepcopy(ownership_evidence)
+            reference_key = 'entry_reference:' + _key(ownership_evidence['dealReference'])
+            reference_owners = data.setdefault(reference_key, [])
+            if field not in reference_owners:
+                reference_owners.append(field)
             return entry
         return self._update(change)
 
@@ -187,6 +194,9 @@ class PendingCloseStore:
                     raise EvidenceError("Realization already attributed to another position")
                 data[claim] = field
             for cost in record['costs']:
+                owners = data.get('entry_reference:' + _key(cost['broker_reference']), [])
+                if owners and owners != [field]:
+                    raise EvidenceError('Ambiguous commission reference ownership')
                 claim = 'cost:' + cost['cost_id']
                 if data.get(claim, field) != field:
                     raise EvidenceError('Cost already attributed to another position')
@@ -229,6 +239,10 @@ class PendingCloseStore:
                 raise EvidenceError('Legacy cost records cannot be delivered')
             if data[entry["opening_key"]] != [field]:
                 raise EvidenceError("Ambiguous opening tuple cannot be delivered")
+            for cost in record.get('costs', []):
+                owners = data.get('entry_reference:' + _key(cost['broker_reference']), [])
+                if owners and owners != [field]:
+                    raise EvidenceError('Ambiguous commission reference cannot be delivered')
             if delivery_key not in data:
                 data[state_key] = project(deepcopy(data.get(state_key, {})), deepcopy(record))
                 data[delivery_key] = record["trade_id"]

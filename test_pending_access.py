@@ -65,7 +65,7 @@ class AccessTests(unittest.TestCase):
     def test_register_reconcile_and_delivery_use_only_related_fields(self):
         store, client, _ = seeded(1000)
         register(store)
-        self.assertEqual(len(client.reads), 3)  # capture + trade/opening index
+        self.assertEqual(len(client.reads), 4)  # capture + trade/opening/reference indexes
         client.reads.clear()
         store.reconcile('opening-1', history(), cost_evidence=COST_EVIDENCE)
         self.assertEqual(len(client.reads), 3)  # trade, opening owners, realization
