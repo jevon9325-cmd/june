@@ -8846,7 +8846,7 @@ def _live_close_position(exit_reason: str, signals: dict) -> None:
                             "initial_sl_pct":     _addon_leg.get("stop_pct", pos.get("stop_pct", 0.005)),
                             "tp_pct":             _addon_leg.get("tp_pct", pos.get("tp_pct", 0.01)),
                             "stop_dist":          abs(_agg_stop - _a_fill) if _agg_stop and _a_fill else 0.0,
-                            "broker_stop_level":  _agg_stop,
+                            "broker_stop_level":  _addon_leg.get("broker_stop_level"),
                             "entry_time":         _addon_leg.get("entry_time", time.time()),
                             "entry_vol":          0.0,
                             "entry_change_15m":   0.0,
@@ -8860,9 +8860,16 @@ def _live_close_position(exit_reason: str, signals: dict) -> None:
                             "broker_entry_evidence": _addon_leg.get("broker_entry_evidence"),
                         }
                         for _key in ("historical_origin", "entry_time_source", "broker_opened_utc",
-                                     "recovery_observed_at", "broker_created_date_raw"):
+                                     "recovery_observed_at", "broker_created_date_raw",
+                                     "intended_stop_level", "acknowledged_stop_level", "stop_sync",
+                                     "defensive_soft_sl", "defensive_stop_level", "defensive_stop_active"):
                             if _key in _addon_leg:
                                 _promoted[_key] = _addon_leg[_key]
+                        if _agg_stop:
+                            from winner_protection import strongest
+                            _promoted["defensive_soft_sl"] = strongest(
+                                _promoted["direction"], _agg_stop, _promoted.get("defensive_soft_sl"))
+                            _promoted["defensive_stop_active"] = True
                         _promoted["management_role"] = "primary"
                         _promoted["management_role_basis"] = "surviving_addon_promotion"
                         _live_log(
@@ -8968,6 +8975,28 @@ def _live_close_position(exit_reason: str, signals: dict) -> None:
 
 
 # ── Partial TP exit (live mirror of _sim_partial_tp_exit) ──────────────────────
+
+def _live_protect_stop(position, proposed, can_send=True):
+    from winner_protection import protect
+    return protect(position, proposed, put=_ig_live_put, confirm=_live_confirm_deal,
+                   save=_live_save_state, now=time.time(), log=_live_log, can_send=can_send)
+
+
+def _live_retry_stop_sync(signals):
+    # Run only AFTER protective exits. Unknown PUTs cannot stall a due close.
+    for position in [_live.get("open_position"), *_live.get("pyramid_legs", [])]:
+        if not position or (position.get("stop_sync") or {}).get("status") == "acknowledged":
+            continue
+        target = position.get("intended_stop_level")
+        sym = position.get("instrument")
+        mid = signals.get(sym, {}).get("price", 0.)
+        if not target or mid <= 0:
+            continue
+        distance = mid - target if position["direction"] == "long" else target - mid
+        minimum = (_live_min_stop_pts.get(sym, 4) + 1) * _live_pip_sizes.get(sym, _LIVE_FX_PIP)
+        if distance >= minimum:
+            _live_protect_stop(position, target)
+
 
 def _live_partial_tp_exit(signals: dict) -> None:
     """Close 50% of live position at TP; let remaining 50% run with breakeven stop.
@@ -9143,12 +9172,14 @@ def _live_partial_tp_exit(signals: dict) -> None:
         _live["open_position"].setdefault("original_notional", pos.get("notional", partial_notional * ig_sz / half_sz))
         _live["open_position"]["notional"] = pos.get("notional", partial_notional * ig_sz / half_sz) * remaining_sz / ig_sz
         _live["open_position"]["ig_size"]            = remaining_sz
-        _live["open_position"]["stop_pct"]           = _spread_flr
-        _live["open_position"]["initial_sl_pct"]     = _spread_flr
+        _live["open_position"]["stop_pct"]           = min(pos.get("stop_pct", _spread_flr), _spread_flr)
+        _live["open_position"]["initial_sl_pct"]     = min(pos.get("initial_sl_pct", _spread_flr), _spread_flr)
         _live["open_position"]["partial_exit_done"]  = True
         _live["open_position"]["partial_dollar_pnl"] = pos.get("partial_dollar_pnl", 0.0) + partial_dollar_pnl
         _live["open_position"]["breakeven_locked"]   = True
-        _live["open_position"]["dple_effective_sl"]  = -_spread_flr
+        _prior_dple = pos.get("dple_effective_sl")
+        _live["open_position"]["dple_effective_sl"] = max(
+            _prior_dple if _prior_dple is not None else -_spread_flr, -_spread_flr)
 
         _live_log(
             f"✅ LIVE PARTIAL TP CONFIRMED: {sym} closed {half_sz} @ {real_exit:.5f} "
@@ -9178,15 +9209,7 @@ def _live_partial_tp_exit(signals: dict) -> None:
             _ptp_min_l  = max(_ptp_ig_min, (_ptp_spn_l / _ptp_pip_l + 1) * _ptp_pip_l)
             _ptp_synced = False
             if _ptp_dist_l >= _ptp_min_l:
-                _ptp_put = _ig_live_put(
-                    f"/positions/otc/{_live['open_position'].get('deal_id', '')}",
-                    {"stopLevel": round(_ptp_stop_level, 5), "guaranteedStop": False},
-                    version="2",
-                )
-                if _ptp_put:
-                    _ptp_synced = True
-                    _live['open_position']['defensive_stop_level'] = _ptp_stop_level
-                    _live['open_position']['defensive_stop_active'] = True
+                _ptp_synced = _live_protect_stop(pos, _ptp_stop_level)
             _live_log(
                 f"🔒 [PARTIAL-TP SYNC] {sym}: broker stop -> breakeven "
                 f"stopLevel={_ptp_stop_level:.5f} | broker_sync={_ptp_synced}"
@@ -9348,16 +9371,7 @@ def _live_check_exit(signals: dict, regime: str) -> None:
                     _dple_min_l  = max(_dple_ig_min, (_dple_spn_l / _dple_pip_l + 1) * _dple_pip_l)
                     _dple_synced = False
                     if _dple_dist_l >= _dple_min_l:
-                        _dple_put = _ig_live_put(
-                            f"/positions/otc/{pos.get('deal_id', '')}",
-                            {"stopLevel": round(_dple_sl_abs, 5), "guaranteedStop": False},
-                            version="2",
-                        )
-                        if _dple_put:
-                            _dple_synced = True
-                            _live['open_position']['defensive_stop_level'] = _dple_sl_abs
-                            _live['open_position']['defensive_stop_active'] = True
-                            pos = _live['open_position']
+                        _dple_synced = _live_protect_stop(pos, _dple_sl_abs)
                     _live_log(
                         f"📈 [DPLE SYNC] {sym}: trail floor {_trail_sl_l*100:.3f}% "
                         f"-> stopLevel={_dple_sl_abs:.5f} | broker_sync={_dple_synced}"
@@ -9393,34 +9407,21 @@ def _live_check_exit(signals: dict, regime: str) -> None:
                 fill_px + _mpd_spn_l + _mpd_mgp_l if dirn == "long"
                 else fill_px - _mpd_spn_l - _mpd_mgp_l
             )
-            _cur_dsl_l = pos.get("defensive_stop_level", None)
+            from winner_protection import effective
+            _cur_dsl_l = effective(pos)
             _improve_l = (
                 _cur_dsl_l is None or
                 (dirn == "long"  and _p_stop_l > _cur_dsl_l) or
                 (dirn == "short" and _p_stop_l < _cur_dsl_l)
             )
             if _improve_l:
-                _live["open_position"]["defensive_stop_active"] = True
-                _live["open_position"]["defensive_stop_level"]  = _p_stop_l
                 pos = _live["open_position"]
                 # Try broker-side stop update; fall back to software mirror if too close
                 _mpd_dist_l = abs(mid - _p_stop_l)
                 _mpd_ig_min = (_live_min_stop_pts.get(sym, 4) + 1) * _mpd_pip_l
                 _mpd_min_l  = max(_mpd_ig_min, (_mpd_spn_l / _mpd_pip_l + 1) * _mpd_pip_l)
                 _mpd_synced = False
-                if _mpd_dist_l >= _mpd_min_l:
-                    _put_r = _ig_live_put(
-                        f"/positions/otc/{pos.get('deal_id', '')}",
-                        {"stopLevel": round(_p_stop_l, 5), "guaranteedStop": False},
-                        version="2",
-                    )
-                    if _put_r:
-                        _mpd_synced = True
-                        _live["open_position"]["defensive_soft_sl"] = None
-                    else:
-                        _live["open_position"]["defensive_soft_sl"] = _p_stop_l
-                else:
-                    _live["open_position"]["defensive_soft_sl"] = _p_stop_l
+                _mpd_synced = _live_protect_stop(pos, _p_stop_l, _mpd_dist_l >= _mpd_min_l)
                 pos = _live["open_position"]
                 _live_log(
                     f"\U0001f6e1\ufe0f [PROFIT DEFENSE] {sym}: Micro-profit lock at "
@@ -9429,7 +9430,8 @@ def _live_check_exit(signals: dict, regime: str) -> None:
                 )
                 _live_save_state()
         if pos.get("defensive_stop_active"):
-            _dsl_l = pos.get("defensive_soft_sl") or pos.get("defensive_stop_level", 0.0)
+            from winner_protection import effective
+            _dsl_l = effective(pos)
             if _dsl_l:
                 if dirn == "long"  and _exit_px < _dsl_l:
                     _live_close_position("mpd_floor", signals)
@@ -9921,6 +9923,14 @@ def _live_add_pyramid_leg(signals: dict) -> None:
         else approx_blended * (1.0 + _PYRAMID_AGG_STOP_PCT)
     )
     approx_stop_dist = _live_compute_stop_pts(sym, _PYRAMID_AGG_STOP_PCT, mid)
+    from winner_protection import campaign_stop
+    try:
+        campaign_stop([primary, *_existing_legs],
+                      {"direction": dirn, "ig_size": ig_size, "fill_price": mid},
+                      approx_agg_stop, _live.get("pyramid_agg_stop_level"))
+    except (ValueError, TypeError, KeyError, ZeroDivisionError) as exc:
+        _live_log(f"[PYRAMID] established protection unavailable -- {exc}")
+        return
 
     _live_log(
         f"[PYRAMID] {'WOULD-BUY' if not _june_live_trading_enabled else 'BUY'} leg {leg_index}: "
@@ -10009,11 +10019,16 @@ def _live_add_pyramid_leg(signals: dict) -> None:
         "actual_notional": actual_notional,
         "leverage": lev,
         "consumed_allocation": actual_notional / lev,
+        "broker_stop_level": confirm.get("stopLevel"),
         "stop_pct":   stop_pct,
         "tp_pct":     tp_pct,
         "entry_time": time.time(),
         "leg_index":  leg_index,
     }
+    from winner_protection import campaign_stop
+    agg_stop_level = campaign_stop(
+        [primary, *_live.get("pyramid_legs", [])], leg, agg_stop_level,
+        _live.get("pyramid_agg_stop_level"))
     leg["broker_entry_evidence"] = _live_entry_evidence(
         sym, "add_on", body, resp, confirm,
         {"entry_time": leg["entry_time"], "leg_index": leg_index, "parent_deal_id": primary.get("deal_id")})
@@ -10027,30 +10042,10 @@ def _live_add_pyramid_leg(signals: dict) -> None:
     _pip_sz       = _live_pip_sizes.get(sym, _LIVE_FX_PIP)
     dist_to_agg   = abs(mid - agg_stop_level)
     min_stop_dist = (_live_min_stop_pts.get(sym, 4) + 1) * _pip_sz
-    primary_deal  = primary.get("deal_id", "")
-    _all_deal_ids = [d for d in
-                     [primary_deal] +
-                     [l.get("deal_id", "") for l in _live.get("pyramid_legs", [])]
-                     if d]
-    if dist_to_agg >= min_stop_dist:
-        for _d in _all_deal_ids:
-            _put_r = _ig_live_put(
-                f"/positions/otc/{_d}",
-                {"stopLevel": round(agg_stop_level, 5), "guaranteedStop": False},
-                version="2",
-            )
-            if _put_r:
-                _live_log(f"[PYRAMID] Agg stop PUT deal {_d}: stopLevel={agg_stop_level:.5f}")
-            else:
-                _live_log(f"[PYRAMID] Agg stop PUT failed deal {_d} -- software check only")
-        if primary_deal:
-            _live["open_position"]["defensive_stop_level"] = agg_stop_level
-            _live["open_position"]["defensive_stop_active"] = True
-    else:
-        _live_log(
-            f"[PYRAMID] Agg stop {agg_stop_level:.5f} too close to mid {mid:.5f} "
-            f"({dist_to_agg:.5f} < {min_stop_dist:.5f}) -- software check only"
-        )
+    _correct_side = agg_stop_level < mid if dirn == "long" else agg_stop_level > mid
+    for _protected_leg in [primary, *_live.get("pyramid_legs", [])]:
+        _live_protect_stop(_protected_leg, agg_stop_level,
+                           _correct_side and dist_to_agg >= min_stop_dist)
 
     _live_log(
         f"✅ PYRAMID LEG {leg_index} OPENED: {sym} {ig_dir} @ {fill_price:.5f} "
@@ -10665,6 +10660,7 @@ def run_live_step(signals: dict) -> None:
             _live_check_pyramid_exits(signals)
             if _live.get("open_position"):
                 _live_check_pyramid_entry(signals, regime)
+            _live_retry_stop_sync(signals)
             return    # still holding — skip entry logic
 
     # A failed addon close is unresolved exposure, never disposable stale state.

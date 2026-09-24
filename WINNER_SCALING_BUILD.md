@@ -49,3 +49,35 @@ This is conservative retry safety, not exactly-once execution certification.
 Validation: 20 new accounting tests; baseline suite 330 tests. Stage verification
 also includes existing live accounting/PS1 tests, Python compilation, diff checks,
 full diff and caller review. No strategy constants or close payloads changed.
+
+Stage A verified commit: `30eed81`; full offline suite **350 passed**.
+
+## Stage B
+
+Protection comparison is directional (higher for long, lower for short).
+Partial TP takes the stronger DPLE floor and preserves previously tightened
+stop percentages. DPLE M1/M2 thresholds and 50% peak trail remain unchanged.
+Barbie pending position adjustments already explicitly tighten only; unchanged.
+
+The aggregate stop takes the strongest existing absolute floor AND the level
+needed to preserve the old legs' estimated liquidation P&L after adding the new
+quantity. Same-instrument price-point economics cancel the common dollar
+multiplier; this selects no new profit target. Realized P&L is unchanged during
+addition and cancels in the comparison. Costs, gaps and slippage are not certified.
+The normal opening stopDistance policy is unchanged; post-fill amendments and
+software protection may be tighter to enforce the invariant. Broker minimum
+distance can prevent immediate synchronization; software protection remains.
+
+`defensive_stop_level`, `defensive_soft_sl`, and `intended_stop_level` express
+software/intended protection. `broker_stop_level` / `acknowledged_stop_level`
+advance only after an ACCEPTED confirmation matching reference, deal and level.
+`stop_sync` stores target, reference, attempt timestamp and status. HTTP success
+alone is insufficient. Legacy defensive fields are never certified as broker ack.
+Promotion preserves that separation. Rejected/unknown PUTs do not remove the
+software floor; pending references survive JSON state and retry after protective
+exit checks. No changes to close POST bodies, PS1 semantics or C2b evidence storage.
+
+Stage B adds 19 tests including real exit/partial functions, long/short,
+timeout/rejection/lost/stale/duplicate replies, restart and the OIL scenario.
+Full offline suite: **369 passed**. Python compilation/3.12 grammar, full diff,
+caller review and unchanged strategy assignments are checked before commit.

@@ -11,7 +11,7 @@ from test_broker_identity import TREE
 
 
 def close_harness(direction="long", symbol="GOLD"):
-    wanted = {"_live_close_position", "_live_partial_tp_exit"}
+    wanted = {"_live_close_position", "_live_partial_tp_exit", "_live_protect_stop"}
     tree = TREE  # reuse parsed source; each test still executes the actual function
     functions = [n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name in wanted]
     assert {n.name for n in functions} == wanted

@@ -10,7 +10,7 @@ from winner_accounting import campaign_allocation, unit_exposure, validate_addon
 
 def primary():
     return dict(deal_id="primary", instrument="GOLD", direction="long",
-                ig_size=.4, fill_price=100., leverage=2, pos_size=20.)
+                ig_size=.4, fill_price=100., leverage=2, pos_size=20., stop_pct=.01)
 
 
 def harness():
@@ -35,7 +35,7 @@ def harness():
               _ig_live_put=Mock(return_value=None), _live_entry_evidence=Mock(return_value={}))
     for name in ("_live_log", "_live_save_state", "_live_capture_evidence"):
         ns[name] = Mock()
-    execute([function(n) for n in ("_live_campaign_unit", "_live_compute_ig_size",
+    execute([function(n) for n in ("_live_protect_stop", "_live_campaign_unit", "_live_compute_ig_size",
                                    "_live_add_pyramid_leg")], ns)
     return ns
 
