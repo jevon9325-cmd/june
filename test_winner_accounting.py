@@ -154,6 +154,17 @@ class AccountingTests(unittest.TestCase):
         self.assertEqual(ns["_live"]["pyramid_legs"], [])
         self.assertIn("pyramid_entry_pending", ns["_live"])
 
+    def test_incomplete_accepted_confirmation_preserves_durable_evidence(self):
+        ns = harness()
+        reply = {"dealStatus": "ACCEPTED", "dealId": "a1"}
+        ns["_live_confirm_deal"].return_value = reply
+        add(ns)
+        call = ns["_live_capture_evidence"].call_args
+        self.assertEqual(call.args[1], "addon_opening_outcome_unresolved")
+        self.assertEqual(call.kwargs["confirmation"], reply)
+        self.assertIn("pyramid_entry_pending", ns["_live"])
+        self.assertEqual(ns["_live"]["pyramid_legs"], [])
+
     def test_accepted_round_trip(self):
         ns = harness()
         add(ns)
@@ -167,6 +178,21 @@ class AccountingTests(unittest.TestCase):
         add(ns)
         add(ns)
         ns["_ig_live_post"].assert_called_once()
+
+    def test_malformed_price_unit_fails_closed(self):
+        ns = harness()
+        ns["_live_price_unit"]["GOLD"] = "malformed"
+        add(ns)
+        ns["_ig_live_post"].assert_not_called()
+
+    def test_three_and_four_legs_use_existing_decay_and_cap(self):
+        ns = harness()
+        for i in range(3):
+            ns["_live_confirm_deal"].return_value = {"dealStatus": "ACCEPTED", "dealId": f"a{i}", "level": 100.}
+            add(ns)
+        self.assertEqual([leg["intended_notional"] for leg in ns["_live"]["pyramid_legs"]], [40., 28., 20.])
+        add(ns)
+        self.assertEqual(ns["_ig_live_post"].call_count, 3)
 
 
 if __name__ == "__main__":

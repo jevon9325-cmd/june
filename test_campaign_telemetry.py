@@ -172,6 +172,13 @@ class TelemetryTests(unittest.TestCase):
         self.observe(s)
         self.assertEqual(s, original)
 
+    def test_account_uses_retained_opening_evidence(self):
+        s = state()
+        s["open_position"]["broker_entry_evidence"] = {"account_id": "original-account"}
+        self.observe(s)
+        self.assertEqual(self.data()["account"], "original-account")
+        self.assertEqual(self.data()["account_basis"], "retained_opening_account_evidence")
+
     def wire(self, ns):
         ns.update(_live_sess={"account_id": "acct"}, _current_cycle_signals_snap={},
                   _live_campaign_unit=lambda s, p: p, POLL_ACTIVE=60)

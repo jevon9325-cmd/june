@@ -144,3 +144,74 @@ Stage C validation: 28 new tests, all 399 offline tests; telemetry/evidence
 regressions, compilation, Python 3.12 grammar, diff/caller review. AST comparison
 with telemetry calls removed and the evaluation wrapper unwrapped finds **zero
 changes to existing trading function bodies**. Strategy assignments are identical.
+
+Stage C commit: `572fb32`.
+
+## Stage D acceptance audit
+
+`python -X utf8 audit_winner_scaling.py` parses all 38 Python files under Python
+3.12 grammar and compiles them without importing June. Local execution uses Python
+3.14; production was freshly read-only verified as 3.12.3. Runtime execution under
+production Python, fresh broker inventory and live amendment behavior remain for
+the separate controlled deployment audit; no live behavior is certified here.
+
+The audit asserts all module assignments unchanged, primary opening/size/stop
+functions unchanged after removing observation calls, unchanged initial entry
+ranking, unchanged opening and close body definitions, unchanged PS1 POST/DELETE
+implementation and unchanged capture/replay/reconciliation functions. All 11
+existing `broker_*.py` modules are byte-equivalent after newline normalization.
+No C2c import or integration was introduced. Stage C's isolated AST comparison
+shows no trading function changes after removing its observation hooks.
+
+Acceptance coverage additionally found and fixed malformed addon sizing metadata
+escaping a guard; numeric primary allocation/leverage are validated before use.
+A live-path test confirms all four legs use the existing size-decay schedule and
+cap. Telemetry prefers retained opening-account evidence over a changed current
+session, and labels the fallback as session-only. An incomplete accepted addon
+confirmation now explicitly preserves its raw response/confirmation in C2b before
+failing closed, with no fabricated deal identity and no loss of pending intent.
+
+Final validation: **403 offline tests**, including **73 new tests** over the 330-test
+baseline, plus the AST/grammar/payload audit and diff checks. All existing C2a/C2b,
+PS1 and C2c test modules are included in discovery. Storage/restart compatibility
+is exercised by JSON round trips, legacy positions without new fields, telemetry
+SQLite restart/pruning/real-lock tests and the unchanged broker-evidence suites.
+New runtime modules use only the Python standard library and each other; no new
+third-party package is needed. SQLite telemetry is additive, in a separate file;
+existing Redis TTL/key and broker SQLite schemas are unchanged.
+
+Acceptance checklist:
+
+| Requirement | Result |
+| --- | --- |
+| Initial sizing, tier percentages, initial leverage mapping | Unchanged |
+| TP, partial fraction, pyramid trigger and size-decay schedule | Unchanged |
+| DPLE activation/trail and MPD thresholds | Unchanged |
+| Reversal patience, max hold, entry scoring/ranking, universe | Unchanged |
+| PS1 close payloads/DELETE and evidence guards | Preserved |
+| C2b evidence preservation | Preserved; unresolved addon capture added |
+| C2c | Dormant/unwired |
+| Telemetry cannot veto exits | Failure-injection and real SQLite lock tests pass |
+| Failed/unknown broker PUT is not an acknowledgement | Matching accepted confirmation required |
+| Protection monotonicity | Directional price and planned campaign P&L invariants tested |
+| Final rounded addon exposure | Recomputed, budget/oversize/margin checked |
+| Duplicates/restart | Pending intent, cap, identity and state-roundtrip tests pass |
+
+Order payloads: **YES, stop-amendment values can change** to retain stronger
+protection. PUT keys/shape remain the same. Initial primary/addon opening body
+definitions and close payloads are unchanged; some formerly unsafe addon attempts
+are now rejected before sending. Initial sizing and strategy sizing policy are
+unchanged; accounting/capacity enforcement has been repaired.
+
+Final production recheck: still `fb8bb1c`, clean tracked tree, PID 2699577 and start
+time 2026-09-23 19:34:34 UTC unchanged. No deploy, push, restart, production Redis
+write or broker order. Fresh broker inventory: **NOT CERTIFIED** (no live broker
+session was acquired or queried during this build).
+
+Remaining limits: unknown addon submissions deliberately require broker-evidence
+review before releasing their pending gate; they are not automatically retried.
+Primary reservation is not reclaimed after skim. Recovery/promotion reservation
+semantics remain as before and are not silently reinterpreted. FX sizing retains
+the pre-existing base-unit convention; the baseline's structural live FX exclusion
+is unchanged. Quote-to-fill slippage can exceed a preflight budget; estimated
+protection cannot guarantee realized net P&L through gaps, costs or outages.

@@ -9870,6 +9870,8 @@ def _live_add_pyramid_leg(signals: dict) -> None:
     _tier_budget    = bal * _live_tier_risk_pct(bal) if bal > 0 else 0.0
     from winner_accounting import campaign_allocation, positive, validate_addon
     try:
+        pos_sz = positive(primary.get("pos_size"))
+        lev = positive(primary.get("leverage"))
         positive(_live_min_deal.get(sym))
         _campaign = campaign_allocation(
             primary, _live.get("pyramid_legs", []),
@@ -9896,9 +9898,10 @@ def _live_add_pyramid_leg(signals: dict) -> None:
     elif leg_index >= 4:
         notional = round(notional * _PYRAMID_4LEG_SIZE_DECAY, 2)
 
-    ig_size  = _live_compute_ig_size(sym, notional, mid)
-    if ig_size <= 0:
-        _live_log(f"[PYRAMID] {sym}: ig_size=0 -- addon aborted")
+    try:
+        ig_size = positive(_live_compute_ig_size(sym, notional, mid))
+    except (ValueError, TypeError, KeyError, OverflowError) as exc:
+        _live_log(f"[PYRAMID] {sym}: invalid sizing metadata -- addon aborted: {exc}")
         return
 
     try:
@@ -10024,6 +10027,9 @@ def _live_add_pyramid_leg(signals: dict) -> None:
         actual_notional = ig_size * _live_campaign_unit(sym, fill_price)
     except (ValueError, TypeError, KeyError, OverflowError) as exc:
         _live_log(f"[PYRAMID] accepted outcome needs reconciliation: {exc}")
+        _live_capture_evidence(
+            {"instrument": sym, "direction": dirn, "deal_ref": deal_ref, "leg_index": leg_index},
+            "addon_opening_outcome_unresolved", order=body, response=resp, confirmation=confirm)
         _live_save_state()
         return
 

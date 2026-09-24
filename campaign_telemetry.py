@@ -88,6 +88,10 @@ class Store:
         legs = [p for p in [state.get("open_position"), *state.get("pyramid_legs", [])] if p]
         if position and not any(p.get("deal_id") == position.get("deal_id") for p in legs):
             legs.append(position)
+        opening_account = ((legs[0].get("broker_entry_evidence") or {}).get("account_id")
+                           if legs else None)
+        account_basis = "retained_opening_account_evidence" if opening_account else "current_session_only"
+        account = opening_account or account
         legs = json.loads(json.dumps([{k: p[k] for k in FIELDS if k in p} for p in legs]))
         account_key = account or "account_unavailable"
         details = dict(details or {})
@@ -136,6 +140,7 @@ class Store:
                 row = db.execute("SELECT data FROM campaigns WHERE id=?", (cid,)).fetchone()
                 data = json.loads(row[0]) if row else dict(
                     account=account, campaign_id=cid, primary_deal_id=primary.get("deal_id"),
+                    account_basis=account_basis,
                     instrument=primary.get("instrument"), direction=primary.get("direction"),
                     identity_basis="broker_deal" if primary.get("deal_id") and account else "incomplete_identity",
                     started_observing_at=now, extrema={}, realized_by_deal={}, once=[],
