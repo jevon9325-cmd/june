@@ -9209,7 +9209,7 @@ def _live_partial_tp_exit(signals: dict) -> None:
             _ptp_min_l  = max(_ptp_ig_min, (_ptp_spn_l / _ptp_pip_l + 1) * _ptp_pip_l)
             _ptp_synced = False
             if _ptp_dist_l >= _ptp_min_l:
-                _ptp_synced = _live_protect_stop(pos, _ptp_stop_level)
+                _ptp_synced = _live_protect_stop(_live["open_position"], _ptp_stop_level)
             _live_log(
                 f"🔒 [PARTIAL-TP SYNC] {sym}: broker stop -> breakeven "
                 f"stopLevel={_ptp_stop_level:.5f} | broker_sync={_ptp_synced}"

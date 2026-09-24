@@ -81,3 +81,11 @@ Stage B adds 19 tests including real exit/partial functions, long/short,
 timeout/rejection/lost/stale/duplicate replies, restart and the OIL scenario.
 Full offline suite: **369 passed**. Python compilation/3.12 grammar, full diff,
 caller review and unchanged strategy assignments are checked before commit.
+
+Stage B commit: `659ca82`. Subsequent telemetry integration review found the
+partial-close path passed its local position copy into stop synchronization.
+A separately verified follow-up passes the persisted position instead. Two
+regressions verify acknowledged and pending fields actually survive in `_live`.
+The follow-up index was exported independently of unfinished telemetry work:
+**35 targeted/regression tests and all 371 offline tests passed**, with compile
+and diff checks. This changes no stop target, threshold or order payload.
