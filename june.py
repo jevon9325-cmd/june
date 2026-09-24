@@ -9787,6 +9787,15 @@ def _live_check_pyramid_entry(signals: dict, regime: str) -> None:
     _live_add_pyramid_leg(signals)
 
 
+def _live_campaign_unit(sym, price):
+    from winner_accounting import unit_exposure
+    return unit_exposure(
+        price, kind=("equity" if sym in _live_equity_cfd else
+                     "fx" if sym in _live_fx_instruments else "commodity"),
+        lot=_live_lot_sizes.get(sym), price_unit=_live_price_unit.get(sym),
+        fx=_live_fx_base.get(sym), pip=_live_pip_sizes.get(sym))
+
+
 def _live_add_pyramid_leg(signals: dict) -> None:
     # Open the pyramid addon leg for the existing primary position.
     # Uses same ig_size formula as primary (minDeal-clamped, reuses pos_size/leverage).
@@ -9796,6 +9805,13 @@ def _live_add_pyramid_leg(signals: dict) -> None:
         return
     primary = _live.get("open_position")
     if not primary:
+        return
+
+    # Persisted unknown submissions must never be blindly submitted again.
+    # Exit management remains enabled; only new exposure is gated.
+    if (_live.get("pyramid_entry_pending") or _live.get("orphan_suspected")
+            or _live.get("manual_review_required") or primary.get("partial_exit_pending")
+            or len(_live.get("pyramid_legs", [])) >= _pyramid_active_max_legs() - 1):
         return
 
     sym   = primary["instrument"]
@@ -9821,7 +9837,16 @@ def _live_add_pyramid_leg(signals: dict) -> None:
     skimmed  = _live.get("skimmed_total", 0.0)
     bal      = max(0.0, total - skimmed)
     _tier_budget    = bal * _live_tier_risk_pct(bal) if bal > 0 else 0.0
-    _addon_budget   = max(0.0, _tier_budget - pos_sz)
+    from winner_accounting import campaign_allocation, positive, validate_addon
+    try:
+        positive(_live_min_deal.get(sym))
+        _campaign = campaign_allocation(
+            primary, _live.get("pyramid_legs", []),
+            lambda price: _live_campaign_unit(sym, price), _tier_budget)
+        _addon_budget = _campaign["remaining_allocation"]
+    except (ValueError, TypeError, KeyError, OverflowError) as exc:
+        _live_log(f"[PYRAMID] {sym}: accounting unavailable -- {exc}")
+        return
     if _addon_budget < 2.0:
         _live_log(
             f"[PYRAMID] {sym}: addon budget exhausted "
@@ -9845,16 +9870,26 @@ def _live_add_pyramid_leg(signals: dict) -> None:
         _live_log(f"[PYRAMID] {sym}: ig_size=0 -- addon aborted")
         return
 
+    try:
+        actual_notional = positive(ig_size) * _live_campaign_unit(sym, mid)
+        validate_addon(
+            actual_notional, notional, lev, _addon_budget,
+            _real_margin_fraction(sym, positive(_live_margin.get(sym))),
+            bal, _campaign["actual_notional"], equity=sym in _live_equity_cfd,
+            oversize_max=_MINDEAL_OVERSIZE_MAX)
+    except (ValueError, TypeError, KeyError, OverflowError) as exc:
+        _live_log(f"[PYRAMID] {sym}: rounded exposure rejected -- {exc}")
+        return
+
     stop_pct = max(_sim_get_dynamic_stop(sym), _sim_get_spread_floor(sym))
     tp_pct   = _sim_get_tp(sym, dirn, primary.get("conviction", 5))
 
     # Equity CFD gates — mirror of _live_open_position() gates; this path bypasses
     # that function so both checks must be replicated here for equity add-ons.
     if sym in _live_equity_cfd:
-        _pyr_price_unit = _live_price_unit.get(sym, 1.0)
-        _pyr_actual_n   = ig_size * mid * _pyr_price_unit
+        _pyr_actual_n   = actual_notional
         if pos_sz > 0:
-            _pyr_eff_lev = _pyr_actual_n / pos_sz
+            _pyr_eff_lev = _pyr_actual_n / (notional / lev)
             if _pyr_eff_lev > lev + 0.5:
                 _live_log(
                     f"🚫 [PYRAMID] EQUITY LEV GATE: {sym} addon blocked — "
@@ -9906,21 +9941,47 @@ def _live_add_pyramid_leg(signals: dict) -> None:
         "currencyCode":  _live_ccy.get(sym, "USD") if sym in _live_equity_cfd else "USD",
         "stopDistance":   approx_stop_dist,
     }
+    _live["pyramid_entry_pending"] = {
+        "primary_deal_id": primary.get("deal_id"), "order": body,
+        "intended_notional": notional, "sized_notional": actual_notional,
+        "created_at": time.time(), "status": "submitting"}
+    try:
+        # Unlike the general best-effort snapshot, this write MUST succeed before POST.
+        _redis().set(_LIVE_REDIS_KEY, json.dumps(_live), ex=_LIVE_REDIS_TTL)
+    except Exception as exc:
+        _live_log(f"[PYRAMID] pending intent persistence failed; no order sent: {exc}")
+        return
     resp = _ig_live_post("/positions/otc", body, version="1")
     if not resp:
         _live_log(f"[PYRAMID] {sym}: POST failed -- addon aborted")
         return
 
     deal_ref = resp.get("dealReference", "")
+    _live["pyramid_entry_pending"]["deal_ref"] = deal_ref
+    _live_save_state()
     confirm  = _live_confirm_deal(deal_ref) if deal_ref else None
     if not confirm or confirm.get("dealStatus") != "ACCEPTED":
+        if confirm and confirm.get("dealStatus") == "REJECTED":
+            _live.pop("pyramid_entry_pending", None)
+            _live_save_state()
         status = confirm.get("dealStatus", "?") if confirm else "no-confirm"
         reason = confirm.get("reason", "?") if confirm else "?"
         _live_log(f"[PYRAMID] {sym}: deal {status}: {reason} -- addon aborted")
         return
 
     deal_id    = confirm.get("dealId", "")
-    fill_price = float(confirm.get("level", mid))
+    try:
+        if (not deal_id or deal_id in {primary.get("deal_id"),
+                *(leg.get("deal_id") for leg in _live.get("pyramid_legs", []))}
+                or (confirm.get("dealReference") and confirm["dealReference"] != deal_ref)):
+            raise ValueError("accepted addon missing, stale or duplicate identity")
+        fill_price = positive(confirm.get("level"))
+        ig_size = positive(confirm.get("size", ig_size))
+        actual_notional = ig_size * _live_campaign_unit(sym, fill_price)
+    except (ValueError, TypeError, KeyError, OverflowError) as exc:
+        _live_log(f"[PYRAMID] accepted outcome needs reconciliation: {exc}")
+        _live_save_state()
+        return
 
     # N-way precise aggregate stop using actual fill (primary + all existing addons + new leg)
     _all_fill_pts = [(fill1, size1)] + [
@@ -9943,7 +10004,11 @@ def _live_add_pyramid_leg(signals: dict) -> None:
         "deal_ref":   deal_ref,
         "fill_price": fill_price,
         "ig_size":    ig_size,
-        "notional":   notional,
+        "notional":   actual_notional,
+        "intended_notional": notional,
+        "actual_notional": actual_notional,
+        "leverage": lev,
+        "consumed_allocation": actual_notional / lev,
         "stop_pct":   stop_pct,
         "tp_pct":     tp_pct,
         "entry_time": time.time(),
@@ -9954,7 +10019,9 @@ def _live_add_pyramid_leg(signals: dict) -> None:
         {"entry_time": leg["entry_time"], "leg_index": leg_index, "parent_deal_id": primary.get("deal_id")})
     _live_capture_evidence(leg, "accepted_opening")
     _live.setdefault("pyramid_legs", []).append(leg)
+    _live.pop("pyramid_entry_pending", None)
     _live["pyramid_agg_stop_level"] = agg_stop_level
+    _live_save_state()
 
     # PUT aggregate stop to ALL open deals (primary + all addon legs including the new one)
     _pip_sz       = _live_pip_sizes.get(sym, _LIVE_FX_PIP)
@@ -10074,7 +10141,7 @@ def _live_try_entry(signals: dict, regime: str, _notional_skip: set = None) -> N
         return     # one position at a time
 
     if (_live.get("orphan_suspected") or _live.get("manual_review_required")
-            or _live.get("pyramid_legs")):
+            or _live.get("pyramid_legs") or _live.get("pyramid_entry_pending")):
         _live_log("Entry blocked: unresolved position evidence requires reconciliation")
         return
 
@@ -10594,9 +10661,9 @@ def run_live_step(signals: dict) -> None:
             _sim_apply_pos_adjust()
         _live_check_exit(signals, regime)
         if _live.get("open_position"):
-            # Primary still open -- pyramid exit checks then try to add leg 2
+            # Primary still open -- exit checks then the evidence-unlocked leg cap.
             _live_check_pyramid_exits(signals)
-            if _live.get("open_position") and not _live.get("pyramid_legs"):
+            if _live.get("open_position"):
                 _live_check_pyramid_entry(signals, regime)
             return    # still holding — skip entry logic
 
