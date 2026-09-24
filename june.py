@@ -6776,6 +6776,19 @@ def _live_replay_evidence() -> None:
         _live_log(f"EVIDENCE REPLAY PENDING: {type(exc).__name__}; no reconciliation claimed")
 
 
+def _live_observe(event, signals=None, position=None, details=None):
+    """Experimental telemetry is best effort and never participates in decisions."""
+    try:
+        from campaign_telemetry import default_store
+        default_store().observe(
+            _live, signals if signals is not None else _current_cycle_signals_snap,
+            account=_live_sess.get("account_id"), now=time.time(), unit=_live_campaign_unit,
+            event=event, position=position, details=details, cadence=POLL_ACTIVE)
+    except Exception as exc:
+        import logging
+        logging.warning("CAMPAIGN TELEMETRY GAP: %s; trading continues", type(exc).__name__)
+
+
 def _live_save_state() -> None:
     _live_capture_active("state_snapshot")
     try:
@@ -8363,6 +8376,7 @@ def _live_open_position(sym: str, direction: str, signals: dict,
         sym, "primary", order_body, resp, confirm,
         {"entry_time": _live["open_position"]["entry_time"], "conviction": conviction})
     _live_capture_evidence(_live["open_position"], "accepted_opening")
+    _live_observe("entry", signals, _live["open_position"])
     _live["total_trades"]    = _live.get("total_trades", 0) + 1
     _live_log(
         f"✅ LIVE POSITION OPENED: {sym} {ig_direction} @ {fill_price:.5f} "
@@ -8531,6 +8545,7 @@ def _live_close_position(exit_reason: str, signals: dict) -> None:
     STRUCTURALLY GATED: _live_trade_guard() gates every order. With switch OFF,
     logs WOULD-SELL and returns without placing any order.
     """
+    _live_observe("exit_requested", signals, details={"reason": exit_reason})
     if (_live.get("open_position") or {}).get("partial_exit_pending"):
         _live_reconcile_positions()  # refresh residual size before a protective full close
     pos = (_live.get("open_position") or {}).copy()
@@ -8667,6 +8682,9 @@ def _live_close_position(exit_reason: str, signals: dict) -> None:
         net_dollar  = real_dollar - commission
         _partial_pnl_c = pos.get("partial_dollar_pnl", 0.0)
         complete_dollar = net_dollar + _partial_pnl_c
+        _live_observe("leg_closed", signals, pos,
+                      {"reason": exit_reason, "realized_pnl": complete_dollar,
+                       "pnl_basis": "confirmed_fill_estimate_with_June_commission_estimate"})
         original_notional = pos.get("original_notional", notional)
         complete_pnl_p = (real_dollar + _partial_pnl_c) / original_notional if original_notional > 0 else real_pnl_p
         won         = complete_dollar > 0
@@ -9026,6 +9044,7 @@ def _live_partial_tp_exit(signals: dict) -> None:
     half_sz  = round(ig_sz / 2, 4)
     # Both the close leg and the residual position must clear minDeal.
     if half_sz < min_deal or round(ig_sz - half_sz, 4) < min_deal:
+        _live_observe("mindeal_full_close_fallback", signals, pos)
         _live_log(
             f"⚠️ {sym}: partial TP not feasible "
             f"(ig_size {ig_sz:.4f} < 2×minDeal {2*min_deal:.4f}) — full close"
@@ -9100,6 +9119,7 @@ def _live_partial_tp_exit(signals: dict) -> None:
         "dealId":        deal_id,
     }
     _live_capture_evidence(pos, "close_intent", order=close_body, expected_exit_reason="partial_take_profit", local_request_time=time.time())
+    _live_observe("partial_tp_requested", signals, pos)
     _live["open_position"]["partial_exit_pending"] = {
         "requested_size": half_sz, "original_size": ig_sz,
         "status": "request_pending", "requested_at": time.time(),
@@ -9180,6 +9200,7 @@ def _live_partial_tp_exit(signals: dict) -> None:
         _prior_dple = pos.get("dple_effective_sl")
         _live["open_position"]["dple_effective_sl"] = max(
             _prior_dple if _prior_dple is not None else -_spread_flr, -_spread_flr)
+        _live_observe("partial_tp_confirmed", signals, _live["open_position"])
 
         _live_log(
             f"✅ LIVE PARTIAL TP CONFIRMED: {sym} closed {half_sz} @ {real_exit:.5f} "
@@ -9346,6 +9367,7 @@ def _live_check_exit(signals: dict, regime: str) -> None:
                 _live['open_position']['breakeven_locked']  = True
                 pos = _live['open_position']
                 _dple_sl_l = _trail_sl_l
+                _live_observe("dple_m2", signals, pos)
                 _live_log(
                     f'💰 [PROFIT TRAIL] {sym}: Locked in 50% of peak profit '
                     f'at {_trail_sl_l*100:.3f}%% floor'
@@ -9386,6 +9408,7 @@ def _live_check_exit(signals: dict, regime: str) -> None:
                 pos = _live['open_position']
                 _dple_sl_l = _be_sl_l
             _live_log(f'🛡️ [BREAKEVEN LOCK] {sym}: 50% TP distance reached. Stop moved to entry.')
+            _live_observe("dple_m1", signals, pos)
         if _dple_sl_l is not None and pnl_pct < _dple_sl_l:
             _live_close_position('dple_trail', signals); return
 
@@ -9403,6 +9426,7 @@ def _live_check_exit(signals: dict, regime: str) -> None:
             (dirn == "short" and fill_px - _exit_px >= _mpd_fric_l)
         )
         if _mpd_act:
+            _live_observe("mpd_activation", signals, pos)
             _p_stop_l = (
                 fill_px + _mpd_spn_l + _mpd_mgp_l if dirn == "long"
                 else fill_px - _mpd_spn_l - _mpd_mgp_l
@@ -9456,6 +9480,7 @@ def _live_check_exit(signals: dict, regime: str) -> None:
     opposing = (dirn == "long"  and (regime == "bear" or sig_dir == "bear")) or \
                (dirn == "short" and (regime == "bull"  or sig_dir == "bull"))
     if opposing:
+        _live_observe("reversal_signal", signals, pos)
         _brb = _barbie_overrides.get(sym, {}).get("reversal_confirm_secs")
         if _brb is not None:
             _clamped = max(_BARBIE_OVERRIDE_MIN_SECS, min(_BARBIE_OVERRIDE_MAX_SECS, int(_brb)))
@@ -9600,6 +9625,9 @@ def _live_close_addon_leg(leg: dict, exit_reason: str, signals: dict) -> None:
             return
         real_exit  = float(confirm.get("level", mid))
         real_pnl_p = (real_exit - fill_px) / fill_px if dirn == "long" else (fill_px - real_exit) / fill_px
+        _live_observe("leg_closed", signals, leg,
+                      {"reason": exit_reason, "exit_price": real_exit,
+                       "pnl_basis": "addon_confirmed_fill_gross_estimate"})
         _live_log(
             f"✅ PYRAMID LEG CLOSED: {sym} @ {real_exit:.5f} "
             f"({real_pnl_p*100:+.3f}%) | {exit_reason}"
@@ -9675,6 +9703,7 @@ def _live_check_pyramid_exits(signals: dict) -> None:
         # LS broker-stop detection (proactive, same pattern as _live_check_exit)
         if deal_id and _ls_deal_closed(deal_id):
             _live_capture_evidence(leg, "position_absence_observed", observation_source="LS.FULLY_CLOSED")
+            _live_observe("leg_closed", signals, leg, {"reason": "broker_close_observed_price_unknown"})
             _live_log(f"[LS] PYRAMID leg {leg_idx}: FULLY_CLOSED by broker -- clearing")
             _live_capture_active("before_addon_tracking_replace")
             _live["pyramid_legs"] = [l for l in _live["pyramid_legs"]
@@ -9955,6 +9984,9 @@ def _live_add_pyramid_leg(signals: dict) -> None:
         "primary_deal_id": primary.get("deal_id"), "order": body,
         "intended_notional": notional, "sized_notional": actual_notional,
         "created_at": time.time(), "status": "submitting"}
+    _live_observe("addon_proposed", signals, primary,
+                  {"attempt": _live["pyramid_entry_pending"]["created_at"],
+                   "intended_notional": notional, "rounded_notional": actual_notional})
     try:
         # Unlike the general best-effort snapshot, this write MUST succeed before POST.
         _redis().set(_LIVE_REDIS_KEY, json.dumps(_live), ex=_LIVE_REDIS_TTL)
@@ -9971,6 +10003,8 @@ def _live_add_pyramid_leg(signals: dict) -> None:
     _live_save_state()
     confirm  = _live_confirm_deal(deal_ref) if deal_ref else None
     if not confirm or confirm.get("dealStatus") != "ACCEPTED":
+        _live_observe("addon_rejected" if confirm and confirm.get("dealStatus") == "REJECTED" else "addon_outcome_unknown",
+                      signals, primary, {"attempt": deal_ref})
         if confirm and confirm.get("dealStatus") == "REJECTED":
             _live.pop("pyramid_entry_pending", None)
             _live_save_state()
@@ -10034,6 +10068,8 @@ def _live_add_pyramid_leg(signals: dict) -> None:
         {"entry_time": leg["entry_time"], "leg_index": leg_index, "parent_deal_id": primary.get("deal_id")})
     _live_capture_evidence(leg, "accepted_opening")
     _live.setdefault("pyramid_legs", []).append(leg)
+    _live_observe("addon_accepted", signals, leg)
+    _live_observe("addon_opened", signals, leg)
     _live.pop("pyramid_entry_pending", None)
     _live["pyramid_agg_stop_level"] = agg_stop_level
     _live_save_state()
@@ -10601,6 +10637,14 @@ def _live_shadow_evaluate_blocked(signals: dict, regime: str) -> None:
 # ── Top-level live step (called from poll_cycle) ──────────────────────────────
 
 def run_live_step(signals: dict) -> None:
+    _live_observe("sample", signals, details={"pyramid_trigger": _PYRAMID_PROFIT_GATE_PCT})
+    try:
+        return _run_live_step_observed(signals)
+    finally:
+        _live_observe("after_evaluation", signals)
+
+
+def _run_live_step_observed(signals: dict) -> None:
     """Called from poll_cycle() each cycle, after run_simulation_step().
     Exit/risk management runs unconditionally regardless of kill-switch state.
     june_live_enabled gates NEW positions only — never exit management.

@@ -89,3 +89,58 @@ regressions verify acknowledged and pending fields actually survive in `_live`.
 The follow-up index was exported independently of unfinished telemetry work:
 **35 targeted/regression tests and all 371 offline tests passed**, with compile
 and diff checks. This changes no stop target, threshold or order payload.
+
+Stage B follow-up commit: `4a6b52f`.
+
+## Stage C
+
+Dedicated `campaign_telemetry.sqlite3` beside the module; never the C2b broker
+evidence database. Tables: campaigns (summary/extrema), links (account/deal to
+stable original campaign), events (deduplicated decisions), samples (cadence).
+Normal pre-evaluation samples only: configured `POLL_ACTIVE` (default 60 seconds),
+not ticks. Actual elapsed time and quote timestamps (including unavailable ones)
+are recorded; operational delays/maintenance change effective resolution.
+Decision hooks and after-evaluation snapshots do not manufacture extra price
+samples. Direct bid/offer is preferred; otherwise mid/spread reconstruction is
+explicitly labeled. Missing side/spread/metadata yields gaps, not zero-cost prices.
+
+Campaign return is estimated realized-plus-open P&L divided by original primary
+entry notional (or explicitly first-observed basis when original data is absent).
+Dollar/return MAE/MFE and their observed timestamps are prospective sample extrema.
+Primary and campaign peaks, maximum/current exposure, quantities, realized P&L
+known to June and protection economics are retained. Costs are PROVISIONAL or
+UNKNOWN; nothing here certifies complete costs, fills, net finality or tick extrema.
+Unknown leg disappearance marks incomplete realized P&L. Promotion retains the
+original campaign link. Flatness/closure is labeled local management evidence;
+unresolved addon intent prevents a final-close claim. Same-cycle close/re-entry
+is handled without requiring a flat callback.
+
+Events cover entry, favorable movement, DPLE M1/M2, MPD activation, TP reached,
+partial request/confirmation, MINDEAL fallback, pyramid threshold/proposal,
+accepted/rejected/unknown addon outcome, opened/closed legs, reversal signal/exit,
+stop/max-hold exits and final campaign close. Threshold events are first-observed;
+decision hooks distinguish actual activation from an inferred threshold crossing.
+Protection snapshots separate intended, acknowledged and software floors and
+estimate liquidation economics before unknown costs/slippage. Event identifiers
+deduplicate repeated state/decision observations within retained history.
+
+Retention: 30 days plus global caps of 50,000 samples and 20,000 events; keep at
+most 2,000 closed campaign summaries. Active summaries preserve extrema across
+sample pruning and restart. Links cascade with deleted summaries. SQLite page
+limit is 128 MiB; deleted pages are reused, not VACUUMed during trading. A rollback
+journal may add temporary disk usage. No telemetry pruning touches broker evidence.
+The 50 ms SQLite lock timeout bounds lock waits; storage/import/serialization
+failures are logged by the non-throwing adapter. Tested disk-failure injection and
+an actual exclusive SQLite lock cannot veto protective close. No telemetry writes
+to Redis or trade state. C2c remains unwired.
+
+Comparisons supported: path around TP/skim/addon decisions, retained/residual
+quantity and exposure, realized estimates, sample MFE giveback, and planned P&L
+at each protection change. Counterfactual strategies still require an offline
+simulator and cannot recover unobserved post-close prices, intracycle extrema,
+or unknown costs. Do not interpret these observations as randomized causal proof.
+
+Stage C validation: 28 new tests, all 399 offline tests; telemetry/evidence
+regressions, compilation, Python 3.12 grammar, diff/caller review. AST comparison
+with telemetry calls removed and the evaluation wrapper unwrapped finds **zero
+changes to existing trading function bodies**. Strategy assignments are identical.

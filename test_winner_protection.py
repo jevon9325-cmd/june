@@ -149,7 +149,7 @@ class ProtectionTests(unittest.TestCase):
 
     def test_retry_runs_after_exit_in_live_loop(self):
         import ast
-        node = function("run_live_step")
+        node = function("_run_live_step_observed")
         calls = [(n.lineno, n.func.id) for n in ast.walk(node) if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)]
         lines = dict((name, line) for line, name in calls)
         self.assertGreater(lines["_live_retry_stop_sync"], lines["_live_check_exit"])

@@ -33,7 +33,7 @@ def harness():
               _ig_live_post=Mock(return_value={"dealReference": "r1"}),
               _live_confirm_deal=Mock(return_value={"dealStatus": "ACCEPTED", "dealId": "a1", "level": 101.}),
               _ig_live_put=Mock(return_value=None), _live_entry_evidence=Mock(return_value={}))
-    for name in ("_live_log", "_live_save_state", "_live_capture_evidence"):
+    for name in ("_live_observe", "_live_log", "_live_save_state", "_live_capture_evidence"):
         ns[name] = Mock()
     execute([function(n) for n in ("_live_protect_stop", "_live_campaign_unit", "_live_compute_ig_size",
                                    "_live_add_pyramid_leg")], ns)

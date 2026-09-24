@@ -296,7 +296,8 @@ class RuntimeTests(CaptureTests):
 
     def test_runtime_ls_addon_removal_and_unresolved_addon_retention(self):
         ns = self.runtime()
-        extract({'_live_check_pyramid_exits', 'run_live_step'}, ns)
+        extract({'_live_check_pyramid_exits', 'run_live_step', '_run_live_step_observed'}, ns)
+        ns['_PYRAMID_PROFIT_GATE_PCT'] = .0015
         leg = deepcopy(ns['_live']['open_position'])
         leg.update(deal_id='addon-deal', leg_index=2,
                    broker_entry_evidence=provenance('addon-deal', 'add_on'))
