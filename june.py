@@ -6429,15 +6429,15 @@ _LIVE_MIN_CONVICTION   = 4       # minimum conviction score for live entries; si
 # Middle layer between normal operation and the CB killswitch.
 # Global trigger: half the CB buffer (fires after ~1 stop-out at micro-balance).
 # Per-instrument trigger: 2 stop-outs on same instrument today.
-# Recovery: balance_total returns to entry level (global) / win on sym (instrument),
-#           OR 30-min time gate elapses -- whichever comes first.
+# Recovery: existing half-threshold account hysteresis (global);
+# win on symbol OR 30-minute timeout (independent instrument state).
 # Sim path completely unaffected -- state lives in _live[], not _sim[].
 _LIVE_DEF_MICRO_FLOOR_USD  = 1.00   # global defensive (micro <$30): half CB floor ($2)
 _LIVE_DEF_MICRO_PCT        = 0.15   # global defensive (micro <$30): half CB pct (30%->15%)
 _LIVE_DEF_FLOOR_USD        = 10.00  # global defensive (full >=30): half CB floor ($20)
 _LIVE_DEF_PCT              = 0.025  # global defensive (full >=30): half CB pct (5%->2.5%)
 _LIVE_DEF_INSTR_STOPOUTS   = 1      # stop-outs on one instrument before instrument-defensive
-_LIVE_DEF_TIMEOUT_SECS     = 1800   # 30-min safety valve (recovery time gate)
+_LIVE_DEF_TIMEOUT_SECS     = 1800   # instrument recovery only; never global recovery
 
 
 # ── Unified tier system (live account risk allocation) ───────────────────────
@@ -6814,47 +6814,18 @@ def _live_load_state() -> bool:
 
 
 def _live_update_defensive_mode() -> None:
-    """Check and update global and per-instrument defensive mode each cycle.
-
-    Global defensive: fires when balance_total has fallen more than half the CB
-    threshold below day_start. Lifts when dollar_loss drops below half the
-    defensive threshold (hysteresis band), OR 30-min time gate elapses.
-
-    Per-instrument defensive: fires after _LIVE_DEF_INSTR_STOPOUTS (1) stop-outs
-    on the same instrument today. Lifts when a WIN closes on that instrument after
-    entry, OR 30-min time gate elapses.
-
-    Sim path completely unaffected. Called from run_live_step after CB check.
-    """
-    now       = time.time()
-    day_start = _live.get("balance_day_start", 0.0)
-    current   = _live.get("balance_total", 0.0)
-
-    # Global defensive mode
-    if day_start > 0 and current > 0:
-        if day_start < _LIVE_CB_MICRO_THRESH:
-            def_buf = max(_LIVE_DEF_MICRO_FLOOR_USD, _LIVE_DEF_MICRO_PCT * day_start)
-        else:
-            def_buf = max(_LIVE_DEF_FLOOR_USD, _LIVE_DEF_PCT * day_start)
-        dollar_loss = day_start - current
-        gmode = _live.get("global_mode", "normal")
-        if gmode == "normal" and dollar_loss >= def_buf:
-            _live["global_mode"]            = "defensive"
-            _live["global_mode_bal_entry"]  = current
-            _live["global_mode_entered_at"] = now
-            _live_log(
-                f"⛔️ [DEFENSIVE] Global: NORMAL -> DEFENSIVE "
-                f"(loss ${dollar_loss:.2f} >= threshold ${def_buf:.2f}; "
-                f"day_start=${day_start:.2f})"
-            )
-        elif gmode == "defensive":
-            entered_at = _live.get("global_mode_entered_at", now)
-            recovered_pnl  = (day_start - current) < (def_buf * 0.5)
-            recovered_time = (now - entered_at) >= _LIVE_DEF_TIMEOUT_SECS
-            if recovered_pnl or recovered_time:
-                _live["global_mode"] = "normal"
-                why = "hysteresis cleared" if recovered_pnl else "30-min gate elapsed"
-                _live_log(f"🟢 [DEFENSIVE] Global: DEFENSIVE -> NORMAL ({why})")
+    """Update account hysteresis and independent instrument recovery each cycle."""
+    from defensive_state import update
+    now = time.time()
+    transition = update(
+        _live, now=now, max_age=_LIVE_POLL_INTERVAL + POLL_ACTIVE,
+        micro_balance=_LIVE_CB_MICRO_THRESH,
+        micro_floor=_LIVE_DEF_MICRO_FLOOR_USD, micro_pct=_LIVE_DEF_MICRO_PCT,
+        floor=_LIVE_DEF_FLOOR_USD, pct=_LIVE_DEF_PCT)
+    if transition:
+        _live_save_state()
+        _live_observe("global_mode_transition", details=transition)
+        _live_log(f"[DEFENSIVE] Global: {transition}")
 
     # Per-instrument defensive mode recovery
     instr_mode    = _live.setdefault("instrument_mode", {})
@@ -7041,12 +7012,11 @@ def _live_poll_balance() -> None:
                     except Exception:
                         pass
                     _live_log(f"Day-start balance recorded: ${_cash_only:.2f} (cash only, excl unrealized P&L) ({_today_utc})")
+                if _live.get("global_mode") == "defensive" and _live.get("balance_day_start", 0) > 0:
+                    _live.setdefault("global_mode_reference", _live["balance_day_start"])
                 _live["balance_day_start"]      = _cash_only
                 _live["balance_day_start_date"] = _today_utc
-                # New UTC day -- reset defensive modes and per-instrument counters
-                _live["global_mode"]               = "normal"
-                _live["global_mode_bal_entry"]     = 0.0
-                _live["global_mode_entered_at"]    = 0.0
+                # Instrument counters reset daily; account episodes require recovery.
                 _live["instrument_mode"]           = {}
                 _live["instrument_mode_entered_at"] = {}
                 _live["instrument_stopouts_today"] = {}
@@ -10686,6 +10656,15 @@ def _run_live_step_observed(signals: dict) -> None:
     # june_live_enabled controls new-trade authority only; any open position
     # must be managed unconditionally so live money is never left without
     # stop/TP coverage regardless of why the kill switch was disabled.
+    # Account calculation/storage failures gate new risk only, never exits.
+    _defensive_ready = False
+    try:
+        _live_update_defensive_mode()
+        _defensive_ready = True
+    except Exception:
+        import logging
+        logging.warning("Defensive state unavailable; exits continue, new risk held")
+
     if _live.get("open_position"):
         # ── Overnight DFB financing proximity warning (observational only) ─────
         # IG cutover: 22:00 UK local (BST = 21:00 UTC, GMT = 22:00 UTC).
@@ -10708,7 +10687,7 @@ def _run_live_step_observed(signals: dict) -> None:
         if _live.get("open_position"):
             # Primary still open -- exit checks then the evidence-unlocked leg cap.
             _live_check_pyramid_exits(signals)
-            if _live.get("open_position"):
+            if _live.get("open_position") and _defensive_ready:
                 _live_check_pyramid_entry(signals, regime)
             _live_retry_stop_sync(signals)
             return    # still holding — skip entry logic
@@ -10731,14 +10710,13 @@ def _run_live_step_observed(signals: dict) -> None:
     # inside _live_open_position() as belt-and-suspenders.
     # Weekend and zero-balance gates below still apply in all states.
 
-    # Update tiered defensive mode (safe to run during halted state).
-    _live_update_defensive_mode()
-
     if _live.get("balance", 0.0) <= 0:
         _live_log("balance $0 or unavailable — skipping entry logic")
         return
 
     # Entry check (FX weekend gate is now per-instrument inside _live_try_entry)
+    if not _defensive_ready:
+        return
     _live_try_entry(signals, regime)
     _live_shadow_evaluate_blocked(signals, regime)
 
