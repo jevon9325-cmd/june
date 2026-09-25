@@ -1,0 +1,47 @@
+{
+  "baseline": "d805ac592aac34a51d79680456dd12d1b1e3de87",
+  "changed_functions": [
+    "_live_add_pyramid_leg",
+    "_live_check_pyramid_entry",
+    "_live_close_addon_leg",
+    "_live_open_position",
+    "_live_poll_balance",
+    "_live_update_defensive_mode",
+    "_run_live_step_observed"
+  ],
+  "added_functions": [
+    "_live_defensive_scaling_evidence"
+  ],
+  "constants_changed": [],
+  "order_payloads_changed": false,
+  "unchanged_functions": [
+    "_live_check_circuit_breaker",
+    "_live_try_entry",
+    "_live_compute_ig_size",
+    "_live_compute_stop_pts",
+    "_live_tier_risk_pct",
+    "_live_check_exit",
+    "_live_partial_tp_exit",
+    "_live_close_position",
+    "_live_check_pyramid_exits",
+    "_live_perf_blocked",
+    "_live_perf_record",
+    "_live_reconcile_positions"
+  ],
+  "callers": {
+    "_live_update_defensive_mode": [
+      "_run_live_step_observed"
+    ],
+    "_live_check_pyramid_entry": [
+      "_run_live_step_observed"
+    ],
+    "_live_add_pyramid_leg": [
+      "_live_check_pyramid_entry"
+    ],
+    "_live_defensive_scaling_evidence": [
+      "_live_add_pyramid_leg",
+      "_live_check_pyramid_entry"
+    ]
+  },
+  "c2c": "existing modules and reconciliation unchanged; boundary tests required"
+}

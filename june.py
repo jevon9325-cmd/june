@@ -9751,6 +9751,21 @@ def _live_check_pyramid_entry(signals: dict, regime: str) -> None:
                     remaining_capacity=None, proposed_allocation=None,
                     proposed_notional=None, proposed_leverage=primary.get("leverage"),
                     decision="reject", reason="evaluation_incomplete")
+    # Collect context even when an earlier independent gate refuses the addon.
+    # Missing evidence is explicit; observation never supplies trade authority.
+    try:
+        decision.update(_live_defensive_scaling_evidence(signals))
+    except Exception as exc:
+        decision.update(protection_state="unconfirmed_or_unavailable", evidence_error=str(exc))
+    try:
+        from winner_accounting import campaign_allocation
+        capital = max(0., _live.get("balance_total", 0.) - _live.get("skimmed_total", 0.))
+        allocation = campaign_allocation(primary, _live.get("pyramid_legs", []),
+                                        lambda price: _live_campaign_unit(sym, price),
+                                        capital * _live_tier_risk_pct(capital))
+        decision["remaining_capacity"] = allocation["remaining_allocation"]
+    except Exception as exc:
+        decision["capacity_error"] = str(exc)
     try:
         if (_live.get("orphan_suspected") or _live.get("manual_review_required")
                 or primary.get("partial_exit_pending") or _live.get("pyramid_entry_pending")):
@@ -9804,6 +9819,10 @@ def _live_defensive_scaling_evidence(signals):
         raise ValueError("synthetic_equity_spread_not_execution_evidence")
     exit_px, basis = executable(sig, primary["direction"])
     positive(exit_px)
+    entry_px, _ = executable(sig, "short" if primary["direction"] == "long" else "long")
+    positive(entry_px)
+    if (primary["direction"] == "long" and entry_px < exit_px) or (primary["direction"] == "short" and entry_px > exit_px):
+        raise ValueError("crossed_execution_quotes")
     # Funding accrued across IG's UK 22:00 cutover is not certified here.
     from datetime import timedelta
     now = datetime.now(_UK_TZ)
@@ -9823,7 +9842,7 @@ def _live_defensive_scaling_evidence(signals):
         slippage=_MPD_SLIPPAGE_PIPS * max(pip, point),
         commission=2 * _IG_EQUITY_COMMISSION_USD if sym in _live_equity_cfd else 0.)
     evidence.update(exit_price=exit_px, price_basis=basis, native_point=point,
-                    minimum_stop_distance=(positive(_live_min_stop_pts.get(sym)) + 1) * max(pip, point))
+                    minimum_stop_distance=positive(_live_compute_stop_pts(sym, 0., sig["price"])) * max(pip, point))
     return evidence
 
 
@@ -9897,6 +9916,7 @@ def _live_add_pyramid_leg(signals: dict, decision=None) -> None:
         _addon_budget = _campaign["remaining_allocation"]
         decision["remaining_capacity"] = _addon_budget
     except (ValueError, TypeError, KeyError, OverflowError) as exc:
+        decision["reason_detail"] = str(exc)
         _live_log(f"[PYRAMID] {sym}: accounting unavailable -- {exc}")
         return
     decision["reason"] = "campaign_capacity_exhausted"
@@ -9944,6 +9964,7 @@ def _live_add_pyramid_leg(signals: dict, decision=None) -> None:
     try:
         ig_size = positive(_live_compute_ig_size(sym, notional, mid))
     except (ValueError, TypeError, KeyError, OverflowError) as exc:
+        decision["reason_detail"] = str(exc)
         _live_log(f"[PYRAMID] {sym}: invalid sizing metadata -- addon aborted: {exc}")
         return
 
@@ -9956,6 +9977,7 @@ def _live_add_pyramid_leg(signals: dict, decision=None) -> None:
             bal, _campaign["actual_notional"], equity=sym in _live_equity_cfd,
             oversize_max=_MINDEAL_OVERSIZE_MAX)
     except (ValueError, TypeError, KeyError, OverflowError) as exc:
+        decision["reason_detail"] = str(exc)
         _live_log(f"[PYRAMID] {sym}: rounded exposure rejected -- {exc}")
         return
 
@@ -10060,6 +10082,7 @@ def _live_add_pyramid_leg(signals: dict, decision=None) -> None:
     _live["pyramid_entry_pending"] = {
         "primary_deal_id": primary.get("deal_id"), "order": body,
         "intended_notional": notional, "sized_notional": actual_notional,
+        "risk_decision": dict(decision),
         "created_at": time.time(), "status": "submitting"}
     _live_observe("addon_proposed", signals, primary,
                   {"attempt": _live["pyramid_entry_pending"]["created_at"],
@@ -10082,6 +10105,7 @@ def _live_add_pyramid_leg(signals: dict, decision=None) -> None:
     _live_save_state()
     confirm  = _live_confirm_deal(deal_ref) if deal_ref else None
     if not confirm or confirm.get("dealStatus") != "ACCEPTED":
+        decision["submission"] = "rejected" if confirm and confirm.get("dealStatus") == "REJECTED" else "unknown"
         _live_observe("addon_rejected" if confirm and confirm.get("dealStatus") == "REJECTED" else "addon_outcome_unknown",
                       signals, primary, {"attempt": deal_ref})
         if confirm and confirm.get("dealStatus") == "REJECTED":
@@ -10093,7 +10117,7 @@ def _live_add_pyramid_leg(signals: dict, decision=None) -> None:
         return
 
     decision["submission"] = "accepted"
-    if defensive or "attempt" in decision:
+    if protection_required or "attempt" in decision:
         primary["pyramid_last_accepted_quote"] = quote_key
     deal_id    = confirm.get("dealId", "")
     try:

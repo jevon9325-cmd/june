@@ -98,6 +98,15 @@ class Store:
         db = self.connect()
         try:
             with db:
+                if event == "global_mode_transition":
+                    # Account events share the existing bounded event store.
+                    # NULL campaign is intentional: transitions can occur flat.
+                    payload = dict(details)
+                    payload.update(account=account_key, observed_at=now)
+                    self.event(db, None, now, event, payload,
+                               json.dumps([account_key, details], sort_keys=True))
+                    self.prune(db, now)
+                    return
                 if not legs:
                     if (state.get("pyramid_entry_pending") or state.get("recovery_unresolved_positions")
                             or state.get("orphan_suspected") or state.get("manual_review_required")):
