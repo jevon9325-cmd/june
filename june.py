@@ -8318,6 +8318,7 @@ def _live_open_position(sym: str, direction: str, signals: dict,
             )
     _live_capture_active("before_primary_replace")
     _live["open_position"] = {
+        "scaling_history_complete": True,
         "instrument":   sym,
         "direction":    direction,
         "deal_id":      deal_id,
@@ -9526,6 +9527,9 @@ def _live_select_instrument(signals: dict, regime: str) -> list:
 # == Pyramid management (no-decay 2-leg cap) =================================
 
 def _live_close_addon_leg(leg: dict, exit_reason: str, signals: dict) -> None:
+    # Closed-leg net economics are not yet certified for future defensive adds.
+    if _live.get("open_position"):
+        _live["open_position"]["scaling_history_complete"] = False
     # Close one pyramid addon leg. Removes from pyramid_legs on confirmed close.
     sym       = leg.get("instrument", "")
     dirn      = leg.get("direction", "long")
@@ -9721,71 +9725,106 @@ def _pyramid_active_max_legs() -> int:
 
 
 def _live_check_pyramid_entry(signals: dict, regime: str) -> None:
-    if (_live.get("orphan_suspected") or _live.get("manual_review_required")
-            or (_live.get("open_position") or {}).get("partial_exit_pending")):
-        return
-    # Evaluate whether to add a pyramid leg to the existing primary position.
-    # All defensive gates explicitly checked -- mirrors _live_try_entry exactly.
-    # Profit gate: primary must show >= _PYRAMID_PROFIT_GATE_PCT spread-adjusted P&L.
-    # LS confirmation: primary deal must NOT be in _ls_confirms_closed.
     primary = _live.get("open_position")
     if not primary:
         return
-    active_max = _pyramid_active_max_legs()
-    if len(_live.get("pyramid_legs", [])) >= active_max - 1:
-        return  # already at cap
-    sym     = primary["instrument"]
-    dirn    = primary["direction"]
-    fill    = primary.get("fill_price", 0.0)
-    deal_id = primary.get("deal_id", "")
-
-    if deal_id and _ls_deal_closed(deal_id):
-        return  # primary FULLY_CLOSED per LS -- no add-on
-
+    sym, dirn = primary["instrument"], primary["direction"]
     sig = signals.get(sym, {})
-    mid = sig.get("price", 0.0)
+    mid, fill = sig.get("price", 0.), primary.get("fill_price", 0.)
     if mid <= 0 or fill <= 0:
         return
-
-    _sp_pct  = sig.get("spread_pct", 0.0)
-    _half_sp = mid * _sp_pct / 200.0
-    _exit_px = (mid - _half_sp) if dirn == "long" else (mid + _half_sp)
-    pnl_pct  = (_exit_px - fill) / fill if dirn == "long" else (fill - _exit_px) / fill
-
+    half = mid * (sig.get("spread_pct", 0.) or 0.) / 200.
+    exit_px = mid - half if dirn == "long" else mid + half
+    pnl_pct = (exit_px - fill) / fill if dirn == "long" else (fill - exit_px) / fill
     if pnl_pct < _PYRAMID_PROFIT_GATE_PCT:
-        return  # not yet at profit gate
-
-    # Defensive gates -- explicit, same as _live_try_entry
-    if not _june_live_trading_enabled:
         return
-    _gmode = _live.get("global_mode", "normal")
-    if _gmode == "defensive" and regime == "neutral":
-        return
-    _imode = (_live.get("instrument_mode") or {}).get(sym, "normal")
-    if _imode == "defensive" and regime == "neutral":
-        return
-    if _live_perf_blocked(sym):
-        return
-    if sym in _METALS_INSTRUMENTS and _is_metals_weekend_closure():
-        return
-    pause_until = _live.get("pause_expiry", {}).get(sym, 0)
-    if time.time() < pause_until:
-        return
-    # SAR gate
-    _atr5, _atr5_fb = _compute_atr_5m(sym)
-    if _atr5 is not None and _atr5 > 0:
-        _sp_raw = (sig.get("spread_pct", 0.0) or 0.0) * (sig.get("price", 0.0) or 0.0) / 100.0
-        _sar5   = _sp_raw / _atr5
-        _thr5   = _spread_atr_threshold(sym, _atr5_fb)
-        if _sar5 > _thr5:
+    decision = dict(attempt=time.time(), instrument=sym, direction=dirn,
+                    global_mode=_live.get("global_mode", "normal"), macro=regime,
+                    instrument_mode=(_live.get("instrument_mode") or {}).get(sym, "normal"),
+                    conviction=primary.get("conviction"), primary_return=pnl_pct,
+                    protection_state="not_evaluated", liquidation_before=None,
+                    liquidation_after=None, current_campaign_pnl=None,
+                    protection=[{k: leg.get(k) for k in ("deal_id", "intended_stop_level",
+                                "broker_stop_level", "acknowledged_stop_level", "stop_sync",
+                                "dple_effective_sl", "defensive_soft_sl")}
+                                for leg in [primary, *_live.get("pyramid_legs", [])]],
+                    remaining_capacity=None, proposed_allocation=None,
+                    proposed_notional=None, proposed_leverage=primary.get("leverage"),
+                    decision="reject", reason="evaluation_incomplete")
+    try:
+        if (_live.get("orphan_suspected") or _live.get("manual_review_required")
+                or primary.get("partial_exit_pending") or _live.get("pyramid_entry_pending")):
+            decision["reason"] = "unresolved_position_or_submission"
             return
+        if len(_live.get("pyramid_legs", [])) >= _pyramid_active_max_legs() - 1:
+            decision["reason"] = "campaign_leg_cap"
+            return
+        if primary.get("deal_id") and _ls_deal_closed(primary["deal_id"]):
+            decision["reason"] = "primary_closed"
+            return
+        if not _june_live_trading_enabled:
+            decision["reason"] = "new_trade_authority_disabled"
+            return
+        if _live_perf_blocked(sym):
+            decision["reason"] = "independent_session_or_performance_block"
+            return
+        if sym in _METALS_INSTRUMENTS and _is_metals_weekend_closure():
+            decision["reason"] = "market_closed"
+            return
+        if time.time() < _live.get("pause_expiry", {}).get(sym, 0):
+            decision["reason"] = "instrument_pause"
+            return
+        atr, fallback = _compute_atr_5m(sym)
+        if atr is not None and atr > 0 and mid * (sig.get("spread_pct", 0.) or 0.) / 100. / atr > _spread_atr_threshold(sym, fallback):
+            decision["reason"] = "spread_atr_gate"
+            return
+        # Both account and instrument defensive conditions use the same campaign
+        # evidence; neither duplicates the old neutral-macro blanket veto.
+        decision["defensive_required"] = (decision["global_mode"] == "defensive" or
+                                          decision["instrument_mode"] == "defensive")
+        _live_add_pyramid_leg(signals, decision)
+    except Exception as exc:
+        decision.update(decision="reject", reason="addon_evidence_unavailable", error=type(exc).__name__)
+    finally:
+        _live_observe("pyramid_decision", signals, primary, decision)
 
-    next_leg_idx = len(_live.get("pyramid_legs", [])) + 2
-    _live_log(
-        f"[PYRAMID] {sym}: gate passed -- primary at +{pnl_pct*100:.3f}% "
-        f"(gate={_PYRAMID_PROFIT_GATE_PCT*100:.2f}%) | adding leg {next_leg_idx}/{active_max}"
-    )
-    _live_add_pyramid_leg(signals)
+
+def _live_defensive_scaling_evidence(signals):
+    from defensive_scaling import snapshot
+    from winner_accounting import positive
+    from campaign_telemetry import executable
+    primary = _live["open_position"]
+    sym = primary["instrument"]
+    if not primary.get("scaling_history_complete"):
+        raise ValueError("campaign_history_unavailable_or_closed_leg")
+    if sym in _live_fx_instruments:
+        raise ValueError("FX_allocation_basis_is_not_certified_USD_PnL")
+    sig = signals[sym]
+    if sym in _live_equity_cfd and not (sig.get("bid") and sig.get("offer")):
+        raise ValueError("synthetic_equity_spread_not_execution_evidence")
+    exit_px, basis = executable(sig, primary["direction"])
+    positive(exit_px)
+    # Funding accrued across IG's UK 22:00 cutover is not certified here.
+    from datetime import timedelta
+    now = datetime.now(_UK_TZ)
+    cutover = now.replace(hour=22, minute=0, second=0, microsecond=0)
+    if now < cutover:
+        cutover -= timedelta(days=1)
+    if positive(primary.get("entry_time")) < cutover.timestamp():
+        raise ValueError("overnight_financing_evidence_unavailable")
+    pip = positive(_live_pip_sizes.get(sym))
+    price_unit = positive(_live_price_unit.get(sym))
+    # Inverse of _live_compute_stop_pts: distance points -> native signal price.
+    point = pip / price_unit
+    evidence = snapshot(
+        [primary, *_live.get("pyramid_legs", [])],
+        aggregate=_live.get("pyramid_agg_stop_level"), exit_price=exit_px,
+        multiplier=_live_campaign_unit(sym, primary["fill_price"]) / primary["fill_price"],
+        slippage=_MPD_SLIPPAGE_PIPS * max(pip, point),
+        commission=2 * _IG_EQUITY_COMMISSION_USD if sym in _live_equity_cfd else 0.)
+    evidence.update(exit_price=exit_px, price_basis=basis, native_point=point,
+                    minimum_stop_distance=(positive(_live_min_stop_pts.get(sym)) + 1) * max(pip, point))
+    return evidence
 
 
 def _live_campaign_unit(sym, price):
@@ -9797,17 +9836,20 @@ def _live_campaign_unit(sym, price):
         fx=_live_fx_base.get(sym), pip=_live_pip_sizes.get(sym))
 
 
-def _live_add_pyramid_leg(signals: dict) -> None:
+def _live_add_pyramid_leg(signals: dict, decision=None) -> None:
     # Open the pyramid addon leg for the existing primary position.
     # Uses same ig_size formula as primary (minDeal-clamped, reuses pos_size/leverage).
     # forceOpen=True REQUIRED: opens separate deal in same instrument.
     # Sets aggregate stop on both legs after fill confirms.
+    decision = decision if decision is not None else {}
+    decision.update(decision="reject", reason="trade_guard")
     if not _live_trade_guard():
         return
     primary = _live.get("open_position")
     if not primary:
         return
 
+    decision["reason"] = "unresolved_position_or_submission"
     # Persisted unknown submissions must never be blindly submitted again.
     # Exit management remains enabled; only new exposure is gated.
     if (_live.get("pyramid_entry_pending") or _live.get("orphan_suspected")
@@ -9822,6 +9864,11 @@ def _live_add_pyramid_leg(signals: dict) -> None:
 
     sig = signals.get(sym, {})
     mid = sig.get("price", 0.0)
+    quote_key = json.dumps([sig.get(k) for k in ("price", "bid", "offer", "spread_pct", "timestamp", "price_timestamp")])
+    if primary.get("pyramid_last_accepted_quote") == quote_key:
+        decision["reason"] = "duplicate_accepted_quote_evaluation"
+        return
+    decision["reason"] = "missing_price"
     if mid <= 0:
         _live_log(f"[PYRAMID] {sym}: no price -- addon aborted")
         return
@@ -9839,6 +9886,7 @@ def _live_add_pyramid_leg(signals: dict) -> None:
     bal      = max(0.0, total - skimmed)
     _tier_budget    = bal * _live_tier_risk_pct(bal) if bal > 0 else 0.0
     from winner_accounting import campaign_allocation, positive, validate_addon
+    decision["reason"] = "campaign_accounting_unavailable"
     try:
         pos_sz = positive(primary.get("pos_size"))
         lev = positive(primary.get("leverage"))
@@ -9847,9 +9895,11 @@ def _live_add_pyramid_leg(signals: dict) -> None:
             primary, _live.get("pyramid_legs", []),
             lambda price: _live_campaign_unit(sym, price), _tier_budget)
         _addon_budget = _campaign["remaining_allocation"]
+        decision["remaining_capacity"] = _addon_budget
     except (ValueError, TypeError, KeyError, OverflowError) as exc:
         _live_log(f"[PYRAMID] {sym}: accounting unavailable -- {exc}")
         return
+    decision["reason"] = "campaign_capacity_exhausted"
     if _addon_budget < 2.0:
         _live_log(
             f"[PYRAMID] {sym}: addon budget exhausted "
@@ -9868,12 +9918,36 @@ def _live_add_pyramid_leg(signals: dict) -> None:
     elif leg_index >= 4:
         notional = round(notional * _PYRAMID_4LEG_SIZE_DECAY, 2)
 
+    # Defensive evidence is recomputed here so direct callers cannot bypass it.
+    defensive = (_live.get("global_mode", "normal") == "defensive" or
+                 (_live.get("instrument_mode") or {}).get(sym, "normal") == "defensive")
+    from winner_protection import effective
+    # A claimed breakeven/profit floor must not be spent without evidence even
+    # in normal mode. Normal unprotected campaigns retain existing controls.
+    old_legs = [primary, *_live.get("pyramid_legs", [])]
+    sign = 1 if dirn == "long" else -1
+    claims_protection = any(
+        (floor := effective(leg, _live.get("pyramid_agg_stop_level"))) is not None
+        and sign * (floor - leg["fill_price"]) >= 0 for leg in old_legs)
+    protection_required = defensive or claims_protection
+    evidence = None
+    if protection_required:
+        try:
+            evidence = _live_defensive_scaling_evidence(signals)
+            decision.update(evidence)
+            if evidence["protection_state"] == "unprotected":
+                raise ValueError("defensive_unprotected_campaign")
+        except Exception as exc:
+            decision["reason"] = str(exc)
+            return
+    decision["reason"] = "invalid_sizing_metadata"
     try:
         ig_size = positive(_live_compute_ig_size(sym, notional, mid))
     except (ValueError, TypeError, KeyError, OverflowError) as exc:
         _live_log(f"[PYRAMID] {sym}: invalid sizing metadata -- addon aborted: {exc}")
         return
 
+    decision["reason"] = "rounded_capacity_or_MINDEAL_rejected"
     try:
         actual_notional = positive(ig_size) * _live_campaign_unit(sym, mid)
         validate_addon(
@@ -9885,11 +9959,15 @@ def _live_add_pyramid_leg(signals: dict) -> None:
         _live_log(f"[PYRAMID] {sym}: rounded exposure rejected -- {exc}")
         return
 
+    decision.update(proposed_allocation=actual_notional / lev,
+                    proposed_notional=actual_notional, proposed_leverage=lev,
+                    proposed_quantity=ig_size)
     stop_pct = max(_sim_get_dynamic_stop(sym), _sim_get_spread_floor(sym))
     tp_pct   = _sim_get_tp(sym, dirn, primary.get("conviction", 5))
 
     # Equity CFD gates — mirror of _live_open_position() gates; this path bypasses
     # that function so both checks must be replicated here for equity add-ons.
+    decision["reason"] = "equity_leverage_or_commission_gate"
     if sym in _live_equity_cfd:
         _pyr_actual_n   = actual_notional
         if pos_sz > 0:
@@ -9926,6 +10004,7 @@ def _live_add_pyramid_leg(signals: dict) -> None:
     )
     approx_stop_dist = _live_compute_stop_pts(sym, _PYRAMID_AGG_STOP_PCT, mid)
     from winner_protection import campaign_stop
+    decision["reason"] = "established_protection_unavailable"
     try:
         campaign_stop([primary, *_existing_legs],
                       {"direction": dirn, "ig_size": ig_size, "fill_price": mid},
@@ -9933,6 +10012,30 @@ def _live_add_pyramid_leg(signals: dict) -> None:
     except (ValueError, TypeError, KeyError, ZeroDivisionError) as exc:
         _live_log(f"[PYRAMID] established protection unavailable -- {exc}")
         return
+
+    if protection_required:
+        try:
+            from defensive_scaling import plan, confirm_funding
+            from campaign_telemetry import executable
+            entry_px, _ = executable(sig, "short" if dirn == "long" else "long")
+            funding = plan(
+                evidence, entry_price=entry_px, exit_price=evidence["exit_price"],
+                stop_distance=approx_stop_dist * evidence["native_point"],
+                min_distance=evidence["minimum_stop_distance"], quantity=ig_size)
+            decision.update(funding)
+            # This happens before the addon order. A partial/failed tightening
+            # keeps its software floor and rejects only the addon.
+            for old_leg, target in zip([primary, *_existing_legs], funding["prefinance_targets"]):
+                if not _live_protect_stop(old_leg, target):
+                    raise ValueError("prefinancing_stop_not_acknowledged")
+            funded = _live_defensive_scaling_evidence(signals)
+            decision["funded_protection"] = funded["protection"]
+            decision["liquidation_after"] = confirm_funding(evidence, funded, funding)
+            if not _live_trade_guard() or any(_ls_deal_closed(leg["deal_id"]) for leg in [primary, *_existing_legs]):
+                raise ValueError("authority_or_campaign_changed_during_prefinancing")
+        except Exception as exc:
+            decision["reason"] = str(exc)
+            return
 
     _live_log(
         f"[PYRAMID] {'WOULD-BUY' if not _june_live_trading_enabled else 'BUY'} leg {leg_index}: "
@@ -9953,6 +10056,7 @@ def _live_add_pyramid_leg(signals: dict) -> None:
         "currencyCode":  _live_ccy.get(sym, "USD") if sym in _live_equity_cfd else "USD",
         "stopDistance":   approx_stop_dist,
     }
+    decision.update(decision="approve", reason="acknowledged_floor_finances_addon" if protection_required else "normal_existing_controls")
     _live["pyramid_entry_pending"] = {
         "primary_deal_id": primary.get("deal_id"), "order": body,
         "intended_notional": notional, "sized_notional": actual_notional,
@@ -9964,9 +10068,11 @@ def _live_add_pyramid_leg(signals: dict) -> None:
         # Unlike the general best-effort snapshot, this write MUST succeed before POST.
         _redis().set(_LIVE_REDIS_KEY, json.dumps(_live), ex=_LIVE_REDIS_TTL)
     except Exception as exc:
+        decision.update(decision="reject", reason="pending_intent_persistence_failed")
         _live_log(f"[PYRAMID] pending intent persistence failed; no order sent: {exc}")
         return
     resp = _ig_live_post("/positions/otc", body, version="1")
+    decision["submission"] = "sent_outcome_pending"
     if not resp:
         _live_log(f"[PYRAMID] {sym}: POST failed -- addon aborted")
         return
@@ -9986,6 +10092,9 @@ def _live_add_pyramid_leg(signals: dict) -> None:
         _live_log(f"[PYRAMID] {sym}: deal {status}: {reason} -- addon aborted")
         return
 
+    decision["submission"] = "accepted"
+    if defensive or "attempt" in decision:
+        primary["pyramid_last_accepted_quote"] = quote_key
     deal_id    = confirm.get("dealId", "")
     try:
         if (not deal_id or deal_id in {primary.get("deal_id"),

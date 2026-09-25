@@ -127,7 +127,10 @@ class ProtectionTests(unittest.TestCase):
         p = ns["_live"]["open_position"]
         p.update(defensive_soft_sl=100.5, broker_stop_level=99.)
         add(ns)
-        self.assertGreaterEqual(ns["_live"]["pyramid_agg_stop_level"], 100.5)
+        # Claimed profit protection with unresolved acknowledgement cannot fund
+        # an addon, including in normal mode. Existing floor is retained.
+        ns["_ig_live_post"].assert_not_called()
+        self.assertEqual(p["defensive_soft_sl"], 100.5)
         self.assertEqual(p["broker_stop_level"], 99.)
 
     def test_addon_then_dple_or_mpd(self):
