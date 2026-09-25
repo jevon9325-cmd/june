@@ -450,6 +450,7 @@ _live_equity_cfd: set = set() # syms whose epic ends .CASH.IP — IG size field 
 _live_fx_instruments: set = set() # syms whose epic matches CS.D.*.CFD.IP — FX pairs (correct sizing: lot_sz/pip_sz)
 _live_ccy:    dict = {}   # sym -> ISO currency code from IG currencies[0].name ("USD", "GBP", …)
 _live_fx_base: dict = {}  # sym -> baseExchangeRate from IG currencies[0]; GBP instrument: ~0.739 (GBP per USD); USD: 1.0
+_live_reversal_exits: dict = {}  # sym -> last reversal exit record; bounded at 20; telemetry only
 _METALS_INSTRUMENTS: frozenset = frozenset({"SILVER", "OIL"})  # CME/COMEX-linked; separate weekend gate from FX
 _CONTINUOUS_INSTRUMENTS: frozenset = frozenset({"BTC", "ETH"})  # 24/7 markets (crypto CFDs) — bypasses FX weekend closure gate
 _IG_EQUITY_COMMISSION_USD = 9.0       # IG charges $9/side = $18 round-trip on equity CFDs
@@ -6540,6 +6541,9 @@ _HTF_CALIB_MIN_SEP     = 0.10    # 10pp aligned vs opposed WR gap required
 _LIVE_TRADE_HIST_KEY   = 'june_live_trade_history_full'
 _LIVE_TRADE_HIST_CAP   = 2000
 _LIVE_TRADE_HIST_TTL   = 86400 * 30
+_LIVE_REENTRY_TEL_KEY  = 'june_reversal_reentry_tel'
+_LIVE_REENTRY_TEL_CAP  = 500
+_LIVE_REENTRY_TEL_TTL  = 86400 * 30
 
 
 def _live_fetch_htf_candles(sym):
@@ -8664,6 +8668,8 @@ def _live_close_position(exit_reason: str, signals: dict) -> None:
             "exit_reason":  exit_reason,
             "conviction":   pos.get("conviction", 0),
             "claudia_pts":  pos.get("claudia_pts", 0.0),
+            "reversal_trigger_source": (pos.get("reversal_trigger_source")
+                                        if exit_reason == "reversal" else None),
         }
         hist = _live.setdefault("trade_history", [])
         hist.append(trade_rec)
@@ -8676,6 +8682,23 @@ def _live_close_position(exit_reason: str, signals: dict) -> None:
             _rh.expire(_LIVE_TRADE_HIST_KEY, _LIVE_TRADE_HIST_TTL)
         except Exception:
             pass
+
+        # Re-entry observation: record this reversal exit for re-entry detection
+        if exit_reason == "reversal":
+            try:
+                _live_reversal_exits[sym] = {
+                    "exit_epoch":    int(time.time()),
+                    "direction":     dirn,
+                    "trigger_source": pos.get("reversal_trigger_source"),
+                    "dollar_pnl":    round(complete_dollar, 4),
+                }
+                if len(_live_reversal_exits) > 20:
+                    _oldest_k = min(
+                        _live_reversal_exits,
+                        key=lambda k: _live_reversal_exits[k]["exit_epoch"])
+                    del _live_reversal_exits[_oldest_k]
+            except Exception:
+                pass
 
         # Update totals
         _live["total_wins"]   = _live.get("total_wins", 0)   + int(won)
@@ -9472,6 +9495,24 @@ def _live_check_exit(signals: dict, regime: str) -> None:
     opposing = (dirn == "long"  and (regime == "bear" or sig_dir == "bear")) or \
                (dirn == "short" and (regime == "bull"  or sig_dir == "bull"))
     if opposing:
+        # Telemetry: classify which input triggered the reversal.
+        # Wrapped in try/except; a bug here must never affect exit decisions.
+        try:
+            if dirn == "long":
+                _rtrig_regime = (regime == "bear")
+                _rtrig_sig    = (sig_dir == "bear")
+            else:
+                _rtrig_regime = (regime == "bull")
+                _rtrig_sig    = (sig_dir == "bull")
+            if _rtrig_regime and _rtrig_sig:
+                _rev_src = "both"
+            elif _rtrig_regime:
+                _rev_src = "regime"
+            else:
+                _rev_src = "sig_dir"
+            _live["open_position"]["reversal_trigger_source"] = _rev_src
+        except Exception:
+            pass
         _brb = _barbie_overrides.get(sym, {}).get("reversal_confirm_secs")
         if _brb is not None:
             _clamped = max(_BARBIE_OVERRIDE_MIN_SECS, min(_BARBIE_OVERRIDE_MAX_SECS, int(_brb)))
@@ -10444,6 +10485,50 @@ def _live_try_entry(signals: dict, regime: str, _notional_skip: set = None) -> N
                     if len(_skip) <= 3:
                         _live_try_entry(signals, regime, _notional_skip=_skip)
                     return
+    # Re-entry observation telemetry: fires when an entry is about to open.
+    # Double try/except; any exception here must never veto the entry.
+    try:
+        _prev_rev = _live_reversal_exits.get(sym)
+        if _prev_rev is not None:
+            _elapsed_s   = time.time() - _prev_rev["exit_epoch"]
+            _same_dir    = (_prev_rev["direction"] == direction)
+            _interval_bk = ("<=5m"  if _elapsed_s <= 300  else
+                            "<=15m" if _elapsed_s <= 900  else
+                            "<=30m" if _elapsed_s <= 1800 else
+                            "<=60m" if _elapsed_s <= 3600 else ">60m")
+            _tel_rec = {
+                "epoch":               int(time.time()),
+                "instrument":          sym,
+                "new_direction":       direction,
+                "prev_direction":      _prev_rev["direction"],
+                "same_direction":      _same_dir,
+                "elapsed_s":           round(_elapsed_s, 1),
+                "interval":            _interval_bk,
+                "prev_trigger_source": _prev_rev.get("trigger_source"),
+                "prev_dollar_pnl":     _prev_rev.get("dollar_pnl"),
+                "conviction":          conv,
+                "regime":              regime,
+                "sig_dir":             sig.get("direction"),
+                "global_mode":         _live.get("global_mode", "normal"),
+            }
+            _live_log(
+                "[REENTRY-TEL] {} {} | prev reversal {} ago ({} dir) | "
+                "src={} prev_pnl=${:+.2f}".format(
+                    sym, direction, _interval_bk,
+                    "same" if _same_dir else "opp",
+                    _prev_rev.get("trigger_source"),
+                    _prev_rev.get("dollar_pnl", 0)
+                )
+            )
+            try:
+                _rh2 = _redis()
+                _rh2.lpush(_LIVE_REENTRY_TEL_KEY, json.dumps(_tel_rec))
+                _rh2.ltrim(_LIVE_REENTRY_TEL_KEY, 0, _LIVE_REENTRY_TEL_CAP - 1)
+                _rh2.expire(_LIVE_REENTRY_TEL_KEY, _LIVE_REENTRY_TEL_TTL)
+            except Exception:
+                pass
+    except Exception:
+        pass
     _live_open_position(sym, direction, _ext, pos_size, lev, conv,
                        stop_mult=0.8 if _compress_sl else 1.0,
                        htf_bias=_htf_b)
