@@ -71,7 +71,8 @@ def test_real_state_roundtrip_preserves_defensive_reference_and_pending_risk():
     execute([function("_live_load_state")], ns)
     assert ns["_live_load_state"]()
     assert ns["_live"]["global_mode_reference"] == 162.27
-    assert ns["_live"]["pyramid_entry_pending"]["risk_decision"]["liquidation_after"] >= 0
+    rd = ns["_live"]["pyramid_entry_pending"]["risk_decision"]
+    assert rd["f50_protected_before"] > 0  # B2: liquidation_after computed post-confirm only
     evaluate(ns)
     ns["_ig_live_post"].assert_called_once()
 
@@ -86,23 +87,23 @@ def test_partial_loss_is_debited_and_profit_is_not_spent():
 
 def test_normal_claimed_protected_floor_obeys_same_economics():
     ns = defensive_harness(mode="normal")
-    assert evaluate(ns)["reason"] == "acknowledged_floor_finances_addon"
+    assert evaluate(ns)["reason"] == "f50_protected_profit_finances_addon"
     ns["_ig_live_post"].assert_called_once()
 
 
-def test_prefinancing_failure_leaves_actual_MPD_exit_available():
+def test_mindeal_blocked_does_not_corrupt_position_state():
+    # Build 2: MINDEAL-blocked F50 rejection leaves position unchanged (no prefinancing side effects).
     ns = defensive_harness()
-    ns["_ig_live_put"].return_value = None
-    assert evaluate(ns)["decision"] == "reject"
-    p = ns["_live"]["open_position"]
-    ns.update(_SIM_MAX_HOLD_SECS=100000, _sim_get_dynamic_stop=lambda _: .01,
-              _sim_get_tp=lambda *a: 1., _MPD_MIN_PROFIT_PIPS=1,
-              _live_close_position=Mock())
-    p.update(entry_time=1000., tp_pct=1.)
-    execute([function("_live_check_exit")], ns)
-    ns["_live_check_exit"]({"GOLD": {"price": p["intended_stop_level"]-.01, "spread_pct": 0.}}, "neutral")
-    ns["_live_close_position"].assert_called_once()
-    assert ns["_live_close_position"].call_args.args[0] == "mpd_floor"
+    p_stop_before = ns["_live"]["open_position"]["broker_stop_level"]
+    ns["_live_min_deal"]["GOLD"] = 200.  # forces MINDEAL-blocked rejection
+    d = evaluate(ns)
+    assert d["decision"] == "reject"
+    assert "f50_mindeal_blocked" in d["reason"]
+    # No broker calls made: neither stop-tightening PUT nor addon POST.
+    ns["_ig_live_put"].assert_not_called()
+    ns["_ig_live_post"].assert_not_called()
+    # Position is unmodified — floor still held by original acknowledged stop.
+    assert ns["_live"]["open_position"]["broker_stop_level"] == p_stop_before
 
 
 def test_crossed_quotes_do_not_qualify_as_execution_evidence():

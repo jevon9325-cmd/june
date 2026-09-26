@@ -10005,19 +10005,58 @@ def _live_add_pyramid_leg(signals: dict, decision=None) -> None:
         (floor := effective(leg, _live.get("pyramid_agg_stop_level"))) is not None
         and sign * (floor - leg["fill_price"]) >= 0 for leg in old_legs)
     protection_required = defensive or claims_protection
+    _f50_active = False
     evidence = None
     if protection_required:
         try:
             evidence = _live_defensive_scaling_evidence(signals)
             decision.update(evidence)
-            if evidence["protection_state"] == "unprotected":
-                raise ValueError("defensive_unprotected_campaign")
+            if evidence["protection_state"] != "profit_protected":
+                raise ValueError(
+                    f"f50_requires_profit_protected: {evidence['protection_state']}")
         except Exception as exc:
             decision["reason"] = str(exc)
             return
+        # F50: size addon from protected economics, not campaign budget.
+        # Funded by existing protected profit; no tightening of existing stops required.
+        try:
+            from defensive_scaling import f50_capacity
+            _f50_stop_pts    = _live_compute_stop_pts(sym, _PYRAMID_AGG_STOP_PCT, mid)
+            _f50_stop_native = _f50_stop_pts * evidence["native_point"]
+            _f50_min_deal    = positive(_live_min_deal.get(sym))
+            _f50_ig, _f50_reason = f50_capacity(evidence, _f50_stop_native, _f50_min_deal)
+            _f50_per_lot     = evidence["multiplier"] * (_f50_stop_native + 2.0 * evidence["slippage"])
+            _f50_raw         = (evidence["liquidation_before"] * 0.5 - evidence["commission"]) / max(_f50_per_lot, 1e-12)
+            _est_addon_loss  = round(_f50_ig * _f50_per_lot + evidence["commission"], 6)
+            decision.update(
+                f50_protected_before    = round(evidence["liquidation_before"], 6),
+                f50_required_floor      = round(evidence["liquidation_before"] * 0.5, 6),
+                f50_expendable          = round(evidence["liquidation_before"] * 0.5, 6),
+                f50_stop_pts            = _f50_stop_pts,
+                f50_stop_distance_native= round(_f50_stop_native, 6),
+                f50_raw_ig              = round(_f50_raw, 6),
+                f50_legal_ig            = _f50_ig,
+                f50_reason              = _f50_reason,
+                f50_min_deal            = _f50_min_deal,
+                estimated_addon_stop_loss = _est_addon_loss,
+                estimated_floor_after   = round(evidence["liquidation_before"] - _est_addon_loss, 6),
+            )
+            if _f50_ig <= 0:
+                decision["reason"] = f"f50_mindeal_blocked: {_f50_reason}"
+                return
+            # F50 overrides budget-based notional. Leg-size decay (policy D, not a risk
+            # invariant) is not applied: F50 is already sized to the protection budget.
+            _f50_active = True
+            notional    = _f50_ig * _live_campaign_unit(sym, mid)
+        except Exception as exc:
+            decision["reason"] = f"f50_computation_error: {exc}"
+            return
     decision["reason"] = "invalid_sizing_metadata"
     try:
-        ig_size = positive(_live_compute_ig_size(sym, notional, mid))
+        if _f50_active:
+            ig_size = positive(_f50_ig)   # already MINDEAL-quantized by f50_capacity
+        else:
+            ig_size = positive(_live_compute_ig_size(sym, notional, mid))
     except (ValueError, TypeError, KeyError, OverflowError) as exc:
         decision["reason_detail"] = str(exc)
         _live_log(f"[PYRAMID] {sym}: invalid sizing metadata -- addon aborted: {exc}")
@@ -10090,7 +10129,10 @@ def _live_add_pyramid_leg(signals: dict, decision=None) -> None:
         _live_log(f"[PYRAMID] established protection unavailable -- {exc}")
         return
 
-    if protection_required:
+    if protection_required and not _f50_active:
+        # Legacy plan()/prefinancing: superseded by F50 for profit_protected campaigns.
+        # Unreachable after Build 2 (profit_protected sets _f50_active=True; others return
+        # early). Retained as safety net for unexpected control paths.
         try:
             from defensive_scaling import plan, confirm_funding
             from campaign_telemetry import executable
@@ -10133,7 +10175,10 @@ def _live_add_pyramid_leg(signals: dict, decision=None) -> None:
         "currencyCode":  _live_ccy.get(sym, "USD") if sym in _live_equity_cfd else "USD",
         "stopDistance":   approx_stop_dist,
     }
-    decision.update(decision="approve", reason="acknowledged_floor_finances_addon" if protection_required else "normal_existing_controls")
+    decision.update(decision="approve", reason=(
+        "f50_protected_profit_finances_addon" if _f50_active else
+        "acknowledged_floor_finances_addon"   if protection_required else
+        "normal_existing_controls"))
     _live["pyramid_entry_pending"] = {
         "primary_deal_id": primary.get("deal_id"), "order": body,
         "intended_notional": notional, "sized_notional": actual_notional,

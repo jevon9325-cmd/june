@@ -92,3 +92,40 @@ def confirm_funding(original, funded, plan):
     if after < max(0., original["liquidation_before"]) - 1e-9:
         raise ValueError("acknowledged_stops_do_not_finance_addon_floor")
     return after
+
+
+def f50_capacity(evidence, stop_distance_native, min_deal, floor_fraction=0.50):
+    """Maximum MINDEAL-quantized addon ig satisfying the F50 nominal-stop invariant.
+
+    F50: estimated campaign liquidation at acknowledged stops after opening the addon
+    must be >= floor_fraction * protected_before.
+
+    stop_distance_native: addon stop distance in native price (pts x native_point).
+    Returns (ig_quantized, reason_string). ig_quantized=0.0 means no capacity.
+
+    Callers must confirm protection_state=="profit_protected" before calling.
+    Returns 0.0 naturally for non-positive protected_before.
+    """
+    protected_before = evidence["liquidation_before"]
+    if protected_before <= 1e-9:
+        return 0.0, "protected_profit_nonpositive"
+    required_floor = floor_fraction * protected_before
+    expendable = protected_before - required_floor          # = 0.5 x protected_before
+    multiplier = float(evidence["multiplier"])
+    slippage   = float(evidence["slippage"])
+    commission = float(evidence["commission"])
+    per_lot_cost = multiplier * (float(stop_distance_native) + 2.0 * max(0.0, slippage))
+    if per_lot_cost <= 0:
+        return 0.0, "per_lot_cost_nonpositive"
+    net_expendable = expendable - commission
+    if net_expendable <= 0:
+        return 0.0, "expendable_consumed_by_commission"
+    ig_raw = net_expendable / per_lot_cost
+    min_deal_f = float(min_deal)
+    if min_deal_f <= 0:
+        return 0.0, "invalid_min_deal"
+    ig_quantized = math.floor(ig_raw / min_deal_f) * min_deal_f
+    if ig_quantized <= 0:
+        return 0.0, "mindeal_blocked"
+    return ig_quantized, "ok"
+

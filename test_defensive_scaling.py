@@ -64,7 +64,7 @@ class FixedDateTime(datetime):
 
 def defensive_harness(stop=101., mode="defensive"):
     ns = harness()
-    ns["_live"].update(global_mode=mode)
+    ns["_live"].update(global_mode=mode, balance_total=10000.)  # large enough for F50 allocation
     p = ns["_live"]["open_position"]
     p.update(broker_stop_level=stop, scaling_history_complete=True, conviction=5,
              entry_time=FixedDateTime.now(timezone.utc).timestamp()-60)
@@ -93,34 +93,49 @@ def evaluate(ns, regime="neutral"):
     return ns["_live_observe"].call_args.args[3]
 
 
-@pytest.mark.parametrize("stop", [100.02, 101.])
-def test_actual_defensive_neutral_protected_order(stop):
-    ns = defensive_harness(stop)
+def test_breakeven_protected_rejected_by_f50():
+    # Build 2: F50 requires profit_protected; breakeven_protected campaigns are rejected.
+    ns = defensive_harness(100.02)
+    d = evaluate(ns)
+    assert d["decision"] == "reject"
+    assert "f50_requires_profit_protected" in d["reason"]
+    ns["_ig_live_post"].assert_not_called()
+
+
+def test_profit_protected_approved_by_f50():
+    # Build 2: profit_protected campaigns use F50 sizing (no prefinancing stop tightening).
+    ns = defensive_harness(101.)
     d = evaluate(ns)
     assert d["decision"] == "approve", d
     ns["_ig_live_post"].assert_called_once()
-    assert d["liquidation_after"] >= d["liquidation_before"] - 1e-9
-    assert ns["_live"]["open_position"]["broker_stop_level"] > stop
-    assert ns["_live"]["pyramid_agg_stop_level"] >= ns["_live"]["open_position"]["broker_stop_level"]
+    # F50 invariant: estimated floor after addon >= 50% of protected_before.
+    assert d["estimated_floor_after"] >= d["f50_required_floor"] - 1e-9
+    # broker_stop_level update depends on distance gate (floating point); use software floor.
+    assert ns["_live"]["open_position"].get("intended_stop_level", 0.) > 101.
+    assert ns["_live"].get("pyramid_agg_stop_level", 0.) > 101.
 
 
 @pytest.mark.parametrize("regime", ["neutral", "bull", "bear"])
 def test_unprotected_cannot_bypass_defensive_by_macro(regime):
     ns = defensive_harness(99.)
     d = evaluate(ns, regime)
-    assert d["reason"] == "defensive_unprotected_campaign"
+    assert d["reason"] == "f50_requires_profit_protected: unprotected"
     ns["_ig_live_post"].assert_not_called()
 
 
-def test_unacknowledged_prefinance_no_addon_and_floor_retained():
+def test_f50_skips_prefinancing_and_approves():
+    # Build 2: F50 does NOT call plan()/PUT for stop tightening before the addon POST.
+    # Setting _ig_live_put to None has no effect — F50 path bypasses prefinancing entirely.
     ns = defensive_harness()
-    ns["_ig_live_put"].return_value = None
+    ns["_ig_live_put"].return_value = None  # would break old plan() path — irrelevant in B2
     d = evaluate(ns)
-    assert d["reason"] == "prefinancing_stop_not_acknowledged"
-    ns["_ig_live_post"].assert_not_called()
-    p = ns["_live"]["open_position"]
-    assert p["broker_stop_level"] == 101.
-    assert p["intended_stop_level"] > 101.
+    # F50 approves directly without prefinancing.
+    assert d["decision"] == "approve"
+    assert d["reason"] == "f50_protected_profit_finances_addon"
+    # F50 invariant verified.
+    assert d["f50_protected_before"] > 0
+    assert d["estimated_floor_after"] >= d["f50_required_floor"] - 1e-9
+    ns["_ig_live_post"].assert_called_once()
 
 
 def test_duplicate_quote_and_restart_no_duplicate_order():
@@ -159,8 +174,8 @@ def test_ambiguous_evidence_refuses_only_addon(changes):
 
 def test_capacity_before_prefinancing_even_with_MINDEAL():
     ns = defensive_harness()
-    ns["_live_min_deal"]["GOLD"] = 2
-    assert evaluate(ns)["reason"] == "rounded_capacity_or_MINDEAL_rejected"
+    ns["_live_min_deal"]["GOLD"] = 10.  # B2: ig_raw≈2.18; MINDEAL=10 forces F50 mindeal_blocked
+    assert evaluate(ns)["reason"] == "f50_mindeal_blocked: mindeal_blocked"
     ns["_ig_live_put"].assert_not_called()
     ns["_ig_live_post"].assert_not_called()
 
