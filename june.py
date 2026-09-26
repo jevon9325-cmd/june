@@ -8996,6 +8996,10 @@ def _live_protect_stop(position, proposed, can_send=True):
 
 def _live_retry_stop_sync(signals):
     # Run only AFTER protective exits. Unknown PUTs cannot stall a due close.
+    # When a pending deal_ref exists, poll broker confirmation regardless of current
+    # price distance — the distance guard is only needed to prevent submitting a
+    # NEW stop amendment that IG would reject as too close. Polling an existing
+    # confirmed deal never submits a new order: protect() reuses the deal_ref.
     for position in [_live.get("open_position"), *_live.get("pyramid_legs", [])]:
         if not position or (position.get("stop_sync") or {}).get("status") == "acknowledged":
             continue
@@ -9003,6 +9007,16 @@ def _live_retry_stop_sync(signals):
         sym = position.get("instrument")
         mid = signals.get(sym, {}).get("price", 0.)
         if not target or mid <= 0:
+            continue
+        sync = position.get("stop_sync") or {}
+        has_pending_ref = (
+            sync.get("status") == "pending"
+            and sync.get("target") == target
+            and sync.get("deal_ref")
+        )
+        if has_pending_ref:
+            # protect() will reuse existing deal_ref (no new PUT) and poll confirm()
+            _live_protect_stop(position, target)
             continue
         distance = mid - target if position["direction"] == "long" else target - mid
         minimum = (_live_min_stop_pts.get(sym, 4) + 1) * _live_pip_sizes.get(sym, _LIVE_FX_PIP)
@@ -10905,9 +10919,11 @@ def _run_live_step_observed(signals: dict) -> None:
         if _live.get("open_position"):
             # Primary still open -- exit checks then the evidence-unlocked leg cap.
             _live_check_pyramid_exits(signals)
+            # Poll pending stop confirmations before pyramid evaluation so that a
+            # broker acknowledgement received this cycle is visible to the addon gate.
+            _live_retry_stop_sync(signals)
             if _live.get("open_position") and _defensive_ready:
                 _live_check_pyramid_entry(signals, regime)
-            _live_retry_stop_sync(signals)
             return    # still holding — skip entry logic
 
     # A failed addon close is unresolved exposure, never disposable stale state.
