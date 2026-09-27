@@ -6814,7 +6814,11 @@ def _live_load_state() -> bool:
             _live_capture_active("before_state_load")
             _live.update(json.loads(raw))
             _live_capture_active("state_loaded")
-            _live_validate_rolling_state_on_load()
+            try:
+                _live_validate_rolling_state_on_load()
+            except Exception as _ve:
+                import logging
+                logging.warning("rolling_state_validation_error: %s", _ve)
             return True
     except Exception:
         pass
