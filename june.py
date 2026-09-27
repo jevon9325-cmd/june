@@ -9076,6 +9076,71 @@ def _live_close_position(exit_reason: str, signals: dict) -> None:
 
 
 # ── Partial TP exit (live mirror of _sim_partial_tp_exit) ──────────────────────
+def _live_refresh_liq_before() -> None:
+    """Compute and store current broker-acknowledged protection value (liq_before).
+
+    NF1 FIX: Called after each stop-sync cycle so that b4a_build_ledgers() has a
+    current value for Ledger B rather than relying on the stale bootstrap snapshot.
+
+    Rules:
+      A. Stop acknowledged -> recompute liq_before from acknowledged stop.
+      B. Better stop acknowledged -> recompute again (same path).
+      C. Stop amendment pending -> do NOT credit pending stop; existing liq_before remains.
+      D. Stop amendment rejected -> same: use last actually acknowledged stop.
+      E. No acknowledged protection -> do not overwrite existing valid value.
+      F. Primary absent -> clear liq_before (b4a_build_ledgers also checks primary_open).
+      G. Campaign changes -> previous campaign's liq_before must not carry forward.
+      H. Restart -> treat persisted liq_before as valid ONLY if campaign_id matches.
+    """
+    pos = _live.get("open_position")
+    if not pos:
+        _live.pop("liq_before", None)
+        _live.pop("liq_before_provenance", None)
+        return
+
+    sym       = pos.get("instrument", "")
+    fill_px   = pos.get("fill_price")
+    ig_size   = pos.get("ig_size")
+    direction = pos.get("direction", "long")
+    campaign_id = _live.get("rolling_campaign_id")
+
+    # Rule G/H: campaign mismatch -> clear stale value before computing new one
+    prov = _live.get("liq_before_provenance") or {}
+    if prov.get("campaign_id") and prov.get("campaign_id") != campaign_id:
+        _live.pop("liq_before", None)
+        _live.pop("liq_before_provenance", None)
+
+    # Use ONLY broker-acknowledged stop (NOT intended, NOT pending, NOT rejected).
+    # acknowledged_stop_level is set by winner_protection.protect() on ACCEPTED confirm.
+    ack_stop = pos.get("acknowledged_stop_level") or pos.get("broker_stop_level")
+    if ack_stop is None or fill_px is None or ig_size is None or fill_px <= 0:
+        # Rule C/D/E: no confirmed stop -> do not overwrite existing valid value
+        return
+
+    # Get instrument multiplier (lot_size for commodities, lot/pip for FX, pu/fx for equity)
+    try:
+        multiplier = _live_campaign_unit(sym, fill_px) / fill_px
+    except Exception:
+        multiplier = float(_live_lot_sizes.get(sym, 1.0))
+
+    # Compute gross protection value at acknowledged stop (no slippage reserve here;
+    # this is the "current snapshot" approximation, not a certified defensive-scaling value)
+    sign = 1.0 if direction == "long" else -1.0
+    current_liq = sign * (float(ack_stop) - float(fill_px)) * float(ig_size) * float(multiplier)
+
+    _live["liq_before"] = current_liq
+    _live["liq_before_provenance"] = {
+        "value":                   current_liq,
+        "acknowledged_stop_level": float(ack_stop),
+        "fill_price":              float(fill_px),
+        "ig_size":                 float(ig_size),
+        "multiplier":              float(multiplier),
+        "direction":               direction,
+        "source":                  "broker_acknowledged_stop",
+        "campaign_id":             campaign_id,
+        "epoch":                   time.time(),
+    }
+
 
 def _live_protect_stop(position, proposed, can_send=True):
     from winner_protection import protect
@@ -9749,11 +9814,14 @@ def _live_record_rolling_harvest(leg: dict, signals: dict) -> None:
     )
     realized_pnl_estimate = pnl_pct * ig_size * confirmed_exit
 
-    # F14 FIX: generate deterministic rolling_harvest_id from broker identifiers
+    # NF3 FIX: stable harvest identity -- deterministic from immutable broker fields only.
+    # time.time() removed: same broker close event must produce same id across restarts.
+    # Components: campaign_id + deal_id (broker immutable) + fill_px + ig_size.
+    # If deal_id alone were sufficient for dedup, it is the strongest discriminator here.
     import hashlib as _hashlib
     _epoch_now = time.time()
     _campaign_id = _live.get("rolling_campaign_id", "unknown")
-    _harvest_id_src = f"{_campaign_id}:{deal_id}:{_epoch_now:.2f}"
+    _harvest_id_src = f"{_campaign_id}:{deal_id}:{fill_px}:{ig_size}"
     _rolling_harvest_id = _hashlib.sha256(_harvest_id_src.encode()).hexdigest()[:16]
 
     harvest_record = {
@@ -11407,6 +11475,8 @@ def _run_live_step_observed(signals: dict) -> None:
             # Poll pending stop confirmations before pyramid evaluation so that a
             # broker acknowledgement received this cycle is visible to the addon gate.
             _live_retry_stop_sync(signals)
+            # NF1: refresh current liq_before from acknowledged stop so Ledger B is current.
+            _live_refresh_liq_before()
             if _live.get("open_position") and _defensive_ready:
                 _live_check_pyramid_entry(signals, regime)
             return    # still holding — skip entry logic

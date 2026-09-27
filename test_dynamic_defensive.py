@@ -30,7 +30,7 @@ def step_harness():
     for name in ("_live_poll_balance", "_live_poll_pnl", "_live_check_skim",
                  "_live_publish_eligible_instruments", "_sim_apply_pos_adjust",
                  "_live_check_exit", "_live_check_pyramid_exits", "_live_check_pyramid_entry",
-                 "_live_retry_stop_sync", "_live_check_circuit_breaker", "_live_save_state",
+                 "_live_retry_stop_sync", "_live_refresh_liq_before", "_live_check_circuit_breaker", "_live_save_state",
                  "_live_observe", "_live_log", "_live_try_entry", "_live_shadow_evaluate_blocked"):
         ns[name] = Mock()
     execute([function(n) for n in ("_live_update_defensive_mode", "_run_live_step_observed")], ns)

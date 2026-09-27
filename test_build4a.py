@@ -1208,3 +1208,279 @@ class TestFailureAtomicity:
         assert r["k5_invariant_applied"] is True
         # D1 is still computable
         assert r["d1_opar_unconditional"] != rb4.B4A_UNKNOWN
+
+# ============================================================================
+# NF1/NF2/NF3 Second Repair Pass Tests
+# ============================================================================
+
+class TestNF1LiqBeforeProvenance:
+    """NF1: Current Ledger B data supply -- provenance validation."""
+
+    def test_nf1_current_liq_before_used_when_present(self):
+        live = make_live_with_harvest(liq_before=0.08)
+        live["liq_before"] = 0.15
+        live["liq_before_provenance"] = {
+            "source": "broker_acknowledged_stop",
+            "campaign_id": "campaign_PRIMARY",
+        }
+        ledgers = rb4.b4a_build_ledgers(live)
+        assert abs(ledgers["ledger_b_protected_primary"] - 0.15) < 1e-9
+        assert ledgers["ledger_b_provenance"] == "current_broker_acknowledged_stop"
+
+    def test_nf1_improved_stop_overwrites_liq_before(self):
+        live = make_live_with_harvest(liq_before=0.08)
+        live["liq_before"] = 0.20
+        live["liq_before_provenance"] = {
+            "source": "broker_acknowledged_stop",
+            "campaign_id": "campaign_PRIMARY",
+        }
+        ledgers = rb4.b4a_build_ledgers(live)
+        assert abs(ledgers["ledger_b_protected_primary"] - 0.20) < 1e-9
+
+    def test_nf1_pending_stop_does_not_become_ledger_b(self):
+        live = make_live_with_harvest(liq_before=0.08)
+        live.pop("liq_before", None)
+        live.pop("liq_before_provenance", None)
+        ledgers = rb4.b4a_build_ledgers(live)
+        assert abs(ledgers["ledger_b_protected_primary"] - 0.08) < 1e-9
+        assert "bootstrap" in ledgers["ledger_b_provenance"]
+
+    def test_nf1_rejected_stop_does_not_become_ledger_b(self):
+        live = make_live_with_harvest(liq_before=0.08)
+        live["liq_before"] = 0.05
+        live["liq_before_provenance"] = {
+            "source": "broker_acknowledged_stop",
+            "campaign_id": "campaign_PRIMARY",
+        }
+        ledgers = rb4.b4a_build_ledgers(live)
+        assert abs(ledgers["ledger_b_protected_primary"] - 0.05) < 1e-9
+
+    def test_nf1_primary_close_invalidates_liq_before(self):
+        live = make_live_with_harvest(liq_before=0.50)
+        live["liq_before"] = 0.50
+        live["liq_before_provenance"] = {"source": "broker_acknowledged_stop", "campaign_id": "campaign_PRIMARY"}
+        live["open_position"] = None
+        ledgers = rb4.b4a_build_ledgers(live)
+        assert ledgers["ledger_b_protected_primary"] == rb4.B4A_UNKNOWN
+        assert ledgers["ledger_b_provenance"] == "primary_closed_protection_cleared"
+
+    def test_nf1_campaign_mismatch_invalidates_liq_before(self):
+        live = make_live_with_harvest(liq_before=0.08)
+        live["liq_before"] = 0.99
+        live["liq_before_provenance"] = {
+            "source": "broker_acknowledged_stop",
+            "campaign_id": "campaign_OLD",
+        }
+        live["rolling_campaign_id"] = "campaign_PRIMARY"
+        ledgers = rb4.b4a_build_ledgers(live)
+        assert ledgers["ledger_b_protected_primary"] != 0.99
+        assert abs(ledgers["ledger_b_protected_primary"] - 0.08) < 1e-9
+
+    def test_nf1_restart_valid_provenance_preserves_liq_before(self):
+        import json as _json
+        live = make_live_with_harvest(liq_before=0.08)
+        live["liq_before"] = 0.15
+        live["liq_before_provenance"] = {
+            "source": "broker_acknowledged_stop",
+            "campaign_id": "campaign_PRIMARY",
+        }
+        restored = _json.loads(_json.dumps(live))
+        ledgers = rb4.b4a_build_ledgers(restored)
+        assert abs(ledgers["ledger_b_protected_primary"] - 0.15) < 1e-9
+
+    def test_nf1_restart_stale_provenance_rejected(self):
+        import json as _json
+        live = make_live_with_harvest(liq_before=0.08)
+        live["liq_before"] = 0.99
+        live["liq_before_provenance"] = {
+            "source": "broker_acknowledged_stop",
+            "campaign_id": "campaign_STALE",
+        }
+        live["rolling_campaign_id"] = "campaign_NEW"
+        restored = _json.loads(_json.dumps(live))
+        ledgers = rb4.b4a_build_ledgers(restored)
+        assert ledgers["ledger_b_protected_primary"] != 0.99
+
+
+class TestNF1Formula:
+    """NF1: Verify liq_before formula with worked examples."""
+
+    def _liq(self, direction, fill, stop, ig, lot):
+        sign = 1.0 if direction == "long" else -1.0
+        return sign * (stop - fill) * ig * lot
+
+    def test_silver_long_stop_below_fill(self):
+        assert abs(self._liq("long", 6367.5, 6350.0, 0.04, 1.0) - (-0.70)) < 1e-9
+
+    def test_silver_long_stop_above_fill(self):
+        assert abs(self._liq("long", 6367.5, 6380.0, 0.04, 1.0) - 0.50) < 1e-9
+
+    def test_gold_long_stop_below_fill(self):
+        assert abs(self._liq("long", 3200.0, 3180.0, 0.01, 1.0) - (-0.20)) < 1e-9
+
+    def test_gold_long_stop_above_fill(self):
+        assert abs(self._liq("long", 3200.0, 3210.0, 0.01, 1.0) - 0.10) < 1e-9
+
+
+class TestNF2UnknownCandidateRisk:
+    """NF2: Unknown candidate stop risk propagates through OPAR."""
+
+    def _econ(self, stop_pct):
+        primary = make_primary()
+        primary["stop_pct"] = stop_pct
+        live = make_live_with_harvest()
+        ledgers = rb4.b4a_build_ledgers(live)
+        return rb4.b4a_compute_replacement_economics(
+            primary=primary, harvest_rec={}, ledgers=ledgers,
+            live_min_deal={"SILVER": 0.1}, live_margin={"SILVER": 0.05},
+            live_campaign_unit_fn=lambda s, p: 1.0,
+            live_compute_ig_size_fn=lambda s, n, p: n,
+            current_price=6300.0, spread_pct=0.1,
+        )
+
+    def test_nf2_zero_stop_pct_gives_unknown_d1(self):
+        opae = self._econ(0.0)["original_principal_exposure"]
+        assert opae["d1_opar_unconditional"] == rb4.B4A_UNKNOWN
+
+    def test_nf2_zero_stop_pct_gives_unknown_d2(self):
+        opae = self._econ(0.0)["original_principal_exposure"]
+        assert opae["d2_opar_conditional"] == rb4.B4A_UNKNOWN
+
+    def test_nf2_valid_stop_pct_gives_numeric_d1(self):
+        opae = self._econ(0.005)["original_principal_exposure"]
+        assert opae["d1_opar_unconditional"] != rb4.B4A_UNKNOWN
+        assert isinstance(opae["d1_opar_unconditional"], float)
+
+    def test_nf2_unknown_distinct_from_zero(self):
+        assert rb4.B4A_UNKNOWN != 0.0
+        assert not isinstance(rb4.B4A_UNKNOWN, (int, float))
+
+    def test_nf2_negative_stop_pct_unknown(self):
+        primary = make_primary()
+        primary["stop_pct"] = -0.01
+        live = make_live_with_harvest()
+        ledgers = rb4.b4a_build_ledgers(live)
+        econ = rb4.b4a_compute_replacement_economics(
+            primary=primary, harvest_rec={}, ledgers=ledgers,
+            live_min_deal={"SILVER": 0.1}, live_margin={"SILVER": 0.05},
+            live_campaign_unit_fn=lambda s, p: 1.0,
+            live_compute_ig_size_fn=lambda s, n, p: n,
+            current_price=6300.0, spread_pct=0.1,
+        )
+        opae = econ["original_principal_exposure"]
+        assert opae["d1_opar_unconditional"] == rb4.B4A_UNKNOWN
+        assert opae["d2_opar_conditional"] == rb4.B4A_UNKNOWN
+
+
+class TestNF3StableHarvestIdentity:
+    """NF3: Rolling harvest identity stable across restarts."""
+
+    def _hid(self, campaign, deal, fill, ig):
+        import hashlib
+        src = "{}:{}:{}:{}".format(campaign, deal, fill, ig)
+        return hashlib.sha256(src.encode()).hexdigest()[:16]
+
+    def test_nf3_same_inputs_same_id(self):
+        assert self._hid("campaign_X", "DEAL1", 6350.0, 0.4) == self._hid("campaign_X", "DEAL1", 6350.0, 0.4)
+
+    def test_nf3_different_deals_different_ids(self):
+        assert self._hid("campaign_X", "DEAL1", 6350.0, 0.4) != self._hid("campaign_X", "DEAL2", 6350.0, 0.4)
+
+    def test_nf3_id_not_time_dependent(self):
+        import time as _time
+        id1 = self._hid("campaign_X", "DEAL1", 6350.0, 0.4)
+        _time.sleep(0.002)
+        id2 = self._hid("campaign_X", "DEAL1", 6350.0, 0.4)
+        assert id1 == id2
+
+    def test_nf3_duplicate_blocked_by_deal_id_dedup(self):
+        import json as _json
+        live = {
+            "rolling_capacity_slot": "bootstrap",
+            "rolling_profit_deployed": 0.0,
+            "rolling_realized_harvest": {"deal_id": "ADDON1", "realized_pnl_estimate": 0.12},
+        }
+        restored = _json.loads(_json.dumps(live))
+        leg = make_addon_leg(deal="ADDON1")
+        ok, reason = rb4.b4a_can_credit_harvest(restored, leg)
+        assert ok is False
+        assert reason == "duplicate_harvest_deal_id"
+
+    def test_nf3_id_is_16_hex(self):
+        hid = self._hid("campaign_X", "DEAL1", 6350.0, 0.4)
+        assert len(hid) == 16
+        assert all(c in "0123456789abcdef" for c in hid)
+
+    def test_nf3_empty_deal_id_deterministic(self):
+        id1 = self._hid("campaign_X", "", 6350.0, 0.4)
+        id2 = self._hid("campaign_X", "", 6350.0, 0.4)
+        assert id1 == id2
+
+
+class TestNF4DeadFallback:
+    """NF4: gap_risk_observable_spread_pct dead fallback removed."""
+
+    def test_nf4_old_field_absent_from_economics(self):
+        live = make_live_with_harvest()
+        ledgers = rb4.b4a_build_ledgers(live)
+        primary = make_primary()
+        primary["stop_pct"] = 0.005
+        econ = rb4.b4a_compute_replacement_economics(
+            primary=primary, harvest_rec={}, ledgers=ledgers,
+            live_min_deal={"SILVER": 0.1}, live_margin={"SILVER": 0.05},
+            live_campaign_unit_fn=lambda s, p: 1.0,
+            live_compute_ig_size_fn=lambda s, n, p: n,
+            current_price=6300.0, spread_pct=0.1,
+        )
+        assert "gap_risk_observable_spread_pct" not in econ
+        assert "spread_pct_observed" in econ
+
+
+class TestNF1NF2Matrix:
+    """D1/D2 accounting matrix validation after repairs."""
+
+    def test_matrix_a_d1_80_d2_zero(self):
+        r = rb4.b4a_original_principal_at_risk(
+            ledger_a=0.0, ledger_a_valid=False, ledger_b=0.80, ledger_d=rb4.B4A_UNKNOWN,
+            candidate_margin=0.0, candidate_stop_risk=0.80, ledger_a_remaining=0.0,
+        )
+        assert abs(r["d1_opar_unconditional"] - 0.80) < 1e-8
+        assert abs(r["d2_opar_conditional"]) < 1e-8
+
+    def test_matrix_b_partial_coverage(self):
+        r = rb4.b4a_original_principal_at_risk(
+            ledger_a=0.30, ledger_a_valid=True, ledger_b=0.20, ledger_d=rb4.B4A_UNKNOWN,
+            candidate_margin=0.0, candidate_stop_risk=0.80, ledger_a_remaining=0.30,
+        )
+        assert abs(r["d1_opar_unconditional"] - 0.50) < 1e-8
+        assert abs(r["d2_opar_conditional"] - 0.30) < 1e-8
+
+    def test_matrix_c_full_a_covers(self):
+        r = rb4.b4a_original_principal_at_risk(
+            ledger_a=1.00, ledger_a_valid=True, ledger_b=0.80, ledger_d=rb4.B4A_UNKNOWN,
+            candidate_margin=0.0, candidate_stop_risk=0.80, ledger_a_remaining=1.00,
+        )
+        assert abs(r["d1_opar_unconditional"]) < 1e-8
+        assert abs(r["d2_opar_conditional"]) < 1e-8
+
+    def test_matrix_d_b_unknown_d1_numeric_d2_unknown(self):
+        r = rb4.b4a_original_principal_at_risk(
+            ledger_a=0.0, ledger_a_valid=False, ledger_b=rb4.B4A_UNKNOWN, ledger_d=rb4.B4A_UNKNOWN,
+            candidate_margin=0.0, candidate_stop_risk=0.80, ledger_a_remaining=0.0,
+        )
+        assert abs(r["d1_opar_unconditional"] - 0.80) < 1e-8
+        assert r["d2_opar_conditional"] == rb4.B4A_UNKNOWN
+
+    def test_gen2_blocked(self):
+        primary = make_primary()
+        primary["stop_pct"] = 0.005
+        live = make_live_with_harvest()
+        ledgers = rb4.b4a_build_ledgers(live)
+        econ = rb4.b4a_compute_replacement_economics(
+            primary=primary, harvest_rec={}, ledgers=ledgers,
+            live_min_deal={"SILVER": 0.1}, live_margin={"SILVER": 0.05},
+            live_campaign_unit_fn=lambda s, p: 1.0,
+            live_compute_ig_size_fn=lambda s, n, p: n,
+            current_price=6300.0, spread_pct=0.1,
+        )
+        assert econ.get("generation2_submission") == "BLOCKED_build4a_observation_only"

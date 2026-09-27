@@ -81,17 +81,35 @@ def b4a_build_ledgers(live: dict) -> dict:
 
     # LEDGER B: acknowledged protected primary floor (NOT cash, NOT profit)
     # F3 FIX: prefer live current liq_before over stale bootstrap snapshot.
+    # NF1 FIX: validate liq_before_provenance campaign_id before trusting current value.
     # When primary is closed, protection no longer applies -> UNKNOWN.
     primary_open  = live.get("open_position") is not None
     current_liq   = live.get("liq_before")                      # fresh each cycle if available
     bootstrap_liq = live.get("rolling_bootstrap_liq_before")    # snapshot at addon open
+
+    # NF1: campaign provenance check -- previous campaign's liq_before must not carry forward
+    liq_prov       = live.get("liq_before_provenance") or {}
+    current_campaign = live.get("rolling_campaign_id")
+    _prov_campaign  = liq_prov.get("campaign_id")
+    _campaign_valid = (
+        current_liq is None  # no current value -- nothing to invalidate
+        or _prov_campaign is None  # no provenance (legacy / bootstrap-only state)
+        or _prov_campaign == current_campaign  # same campaign -- valid
+    )
+    if not _campaign_valid:
+        # Campaign mismatch: previous campaign's protection value must not survive
+        current_liq = None
 
     if not primary_open:
         liq_before          = None
         ledger_b_provenance = "primary_closed_protection_cleared"
     elif current_liq is not None:
         liq_before          = current_liq
-        ledger_b_provenance = "current_liq_before"
+        ledger_b_provenance = (
+            "current_broker_acknowledged_stop"
+            if liq_prov.get("source") == "broker_acknowledged_stop"
+            else "current_liq_before"
+        )
     elif bootstrap_liq is not None:
         liq_before          = bootstrap_liq
         ledger_b_provenance = "bootstrap_snapshot_stale"
@@ -330,21 +348,36 @@ def b4a_compute_replacement_economics(
         candidate_stop_risk       = B4A_UNKNOWN
         candidate_stop_provenance = "price_or_ig_size_unavailable"
 
-    # OPAR: pass remaining (not total) for D1; candidate_stop_risk may be UNKNOWN
-    _stop_for_opar = (
-        float(candidate_stop_risk)
-        if isinstance(candidate_stop_risk, (int, float)) and candidate_stop_risk > 0
-        else 0.0
-    )
-    opae_result = b4a_original_principal_at_risk(
-        ledger_a=ledger_a,
-        ledger_a_valid=ledgers.get("ledger_a_valid", False),
-        ledger_b=ledger_b,
-        ledger_d=ledger_d,
-        candidate_margin=margin_req if isinstance(margin_req, float) else 0.0,
-        candidate_stop_risk=_stop_for_opar,
-        ledger_a_remaining=float(ledger_a_r) if isinstance(ledger_a_r, (int, float)) else 0.0,
-    )
+    # OPAR: pass remaining (not total) for D1; candidate_stop_risk may be UNKNOWN.
+    # NF2 FIX: UNKNOWN candidate risk must propagate -- never coerce to 0.0.
+    if candidate_stop_risk is B4A_UNKNOWN or not isinstance(candidate_stop_risk, (int, float)):
+        opae_result = {
+            "original_principal_at_risk":   B4A_UNKNOWN,
+            "d1_opar_unconditional":        B4A_UNKNOWN,
+            "d2_opar_conditional":          B4A_UNKNOWN,
+            "d2_condition":                 "requires_primary_to_realize_at_or_above_protection_floor",
+            "realized_profit_coverage":     B4A_UNKNOWN,
+            "protection_coverage":          B4A_UNKNOWN,
+            "principal_residual":           B4A_UNKNOWN,
+            "candidate_stop_risk":          B4A_UNKNOWN,
+            "formula_d1":                   "unknown_candidate_stop_risk_propagated",
+            "k5_invariant_applied":         False,
+            "b_entered_profit_ledger":      False,
+            "c_entered_profit_ledger":      False,
+            "d1_provenance":                "candidate_stop_risk_unknown_propagated",
+            "d2_provenance":                "d1_unknown_propagated",
+        }
+    else:
+        _stop_for_opar = float(candidate_stop_risk) if candidate_stop_risk > 0 else 0.0
+        opae_result = b4a_original_principal_at_risk(
+            ledger_a=ledger_a,
+            ledger_a_valid=ledgers.get("ledger_a_valid", False),
+            ledger_b=ledger_b,
+            ledger_d=ledger_d,
+            candidate_margin=margin_req if isinstance(margin_req, float) else 0.0,
+            candidate_stop_risk=_stop_for_opar,
+            ledger_a_remaining=float(ledger_a_r) if isinstance(ledger_a_r, (int, float)) else 0.0,
+        )
 
     # F9 FIX: rename misleading field; add explicit loss-note telemetry
     spread_pct_obs = spread_pct / 100.0 if spread_pct > 0 else B4A_UNKNOWN
@@ -516,7 +549,7 @@ def b4a_leverage_observability(
 
     nom_lev  = (notional / pos_size) if pos_size > 0 else leverage
     stop_exp = notional * stop_pct if notional and stop_pct else B4A_UNKNOWN
-    gap_obs  = economics.get("spread_pct_observed", economics.get("gap_risk_observable_spread_pct", B4A_UNKNOWN))
+    gap_obs  = economics.get("spread_pct_observed", B4A_UNKNOWN)  # NF4: removed stale gap_risk_observable_spread_pct fallback (field never produced)
 
     ledger_a   = ledgers.get("ledger_a_realized_profit", 0.0)
     ledger_a_v = ledgers.get("ledger_a_valid", False)
