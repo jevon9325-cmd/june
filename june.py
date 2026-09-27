@@ -9584,6 +9584,180 @@ def _live_select_instrument(signals: dict, regime: str) -> list:
 
 # == Pyramid management (no-decay 2-leg cap) =================================
 
+def _live_rolling_harvest_eligibility(leg: dict) -> "tuple[bool, str]":
+    """Determine whether a closed leg qualifies as a confirmed rolling harvest.
+
+    Returns (eligible, reason). Reason is logged and emitted.
+    Does NOT check generation cap -- that is the replacement evaluation step.
+    """
+    gen = leg.get("leg_generation", 1)
+    deal_id = leg.get("deal_id", "?")
+    # Duplicate-delivery guard: already recorded for this deal.
+    existing = _live.get("rolling_realized_harvest") or {}
+    if existing.get("deal_id") == deal_id:
+        return False, "duplicate_harvest_delivery"
+    # Only gen-1 bootstrap addons produce rolling harvest proceeds.
+    if gen != 1:
+        return False, f"generation_{gen}_not_harvest_eligible"
+    # Capacity slot must be "bootstrap" (set when the addon was opened).
+    slot = _live.get("rolling_capacity_slot")
+    if slot != "bootstrap":
+        return False, f"capacity_slot_unexpected:{slot}"
+    return True, "eligible"
+
+
+def _live_record_rolling_harvest(leg: dict, signals: dict) -> None:
+    """Record confirmed rolling harvest proceeds and release the capacity slot.
+
+    Called only after broker-confirmed addon close (leg removed from pyramid_legs).
+    Failure-atomic: capacity released only after state persistence.
+    """
+    deal_id  = leg.get("deal_id", "?")
+    sym      = leg.get("instrument", "")
+    fill_px  = leg.get("fill_price", 0.0)
+    dirn     = leg.get("direction", "long")
+    ig_size  = leg.get("ig_size", 0.0)
+    gen      = leg.get("leg_generation", 1)
+    sig      = signals.get(sym, {}) if signals else {}
+    mid      = sig.get("price", fill_px)
+
+    eligible, reason = _live_rolling_harvest_eligibility(leg)
+    if not eligible:
+        _live_log(f"[HARVEST] skipping record: {reason} | deal={deal_id}")
+        _live_observe("rolling_harvest_skipped", signals, leg, {"reason": reason})
+        return
+
+    pnl_pct = ((mid - fill_px) / fill_px if dirn == "long" else (fill_px - mid) / fill_px)
+    realized_pnl_estimate = pnl_pct * ig_size * mid
+
+    harvest_record = {
+        "deal_id":                deal_id,
+        "instrument":             sym,
+        "direction":              dirn,
+        "leg_generation":         gen,
+        "fill_price":             fill_px,
+        "exit_mid_estimate":      mid,
+        "pnl_pct":                pnl_pct,
+        "realized_pnl_estimate":  realized_pnl_estimate,
+        "ig_size":                ig_size,
+        "epoch":                  time.time(),
+        "rolling_bootstrap_liq_before": _live.get("rolling_bootstrap_liq_before"),
+    }
+    _live["rolling_realized_harvest"] = harvest_record
+    _live["rolling_capacity_slot"]    = "available"
+    _live_save_state()
+    _live_log(
+        f"\U0001F33E ROLLING HARVEST RECORDED: deal={deal_id} gen={gen} "
+        f"pnl~{pnl_pct*100:+.3f}% (~${realized_pnl_estimate:+.4f}) "
+        f"capacity_slot=available"
+    )
+    _live_observe("rolling_harvest_confirmed", signals, leg, harvest_record)
+    _live_evaluate_rolling_replacement(signals)
+
+
+def _live_evaluate_rolling_replacement(signals: dict) -> None:
+    """Evaluate whether a gen-2 replacement addon would be eligible.
+
+    BUILD 3: evaluates and reports only. NEVER submits an order.
+    _ROLLING_MAX_GENERATIONS = 1 blocks gen-2 submission.
+    Telemetry distinguishes economically_ineligible from generation_cap_disabled_in_build_3
+    so Build 4 can unlock replacement without re-auditing economics.
+    """
+    primary = _live.get("open_position")
+    if not primary:
+        _live_observe("rolling_replacement_eval", signals, None,
+                      {"decision": "block", "reason": "no_primary_position"})
+        return
+
+    eval_result = {
+        "primary_deal_id":              primary.get("deal_id"),
+        "instrument":                   primary.get("instrument"),
+        "direction":                    primary.get("direction"),
+        "rolling_bootstrap_liq_before": _live.get("rolling_bootstrap_liq_before"),
+        "rolling_realized_harvest":     _live.get("rolling_realized_harvest"),
+        "decision":                     "block",
+        "reason":                       "evaluation_incomplete",
+    }
+
+    # ── K5: liq_before must be a real value, not a default ─────────────────
+    liq_before = _live.get("rolling_bootstrap_liq_before")
+    if liq_before is None:
+        eval_result["reason"] = "protection_economics_unavailable"
+        eval_result["k5_verdict"] = (
+            "bootstrap_used_normal_existing_controls_path;"
+            "no_acknowledged_floor_on_record;"
+            "replacement_blocked_per_K5_resolution"
+        )
+        _live_log("[ROLLING] replacement blocked: protection_economics_unavailable (K5)")
+        _live_observe("rolling_replacement_eval", signals, primary, eval_result)
+        _live["rolling_replacement_eval"] = eval_result
+        _live_save_state()
+        return
+
+    # ── Three-ledger accounting ─────────────────────────────────────────────
+    harvest = _live.get("rolling_realized_harvest") or {}
+    realized_harvest_pnl = harvest.get("realized_pnl_estimate", 0.0)
+
+    # Ledger A: realized pyramid profit (confirmed closed addon P&L)
+    # Ledger B: released margin (NOT profit; not added to Ledger A)
+    # Ledger C: original-principal-risk (exposure at acknowledged stop floor)
+    original_principal_risk = max(0.0, -liq_before)
+
+    # Economic floor: harvest must offset any principal loss exposure.
+    # Formula: realized_harvest_pnl + liq_before >= 0
+    # (liq_before positive = floor above breakeven, reduces required harvest)
+    economic_floor    = -liq_before
+    economically_ok   = realized_harvest_pnl > 0.0 and realized_harvest_pnl >= economic_floor
+
+    eval_result.update({
+        "ledger_a_realized_harvest_pnl":    realized_harvest_pnl,
+        "ledger_b_released_margin":         "not_counted_as_profit",
+        "ledger_c_original_principal_risk": original_principal_risk,
+        "bootstrap_liq_before":             liq_before,
+        "economic_floor_required":          economic_floor,
+        "economic_margin":                  realized_harvest_pnl - economic_floor,
+        "economically_eligible":            economically_ok,
+    })
+
+    if not economically_ok:
+        eval_result["reason"] = "economically_ineligible"
+        _live_log(
+            f"[ROLLING] replacement economically ineligible: "
+            f"realized={realized_harvest_pnl:.4f} floor={economic_floor:.4f}"
+        )
+        _live_observe("rolling_replacement_eval", signals, primary, eval_result)
+        _live["rolling_replacement_eval"] = eval_result
+        _live_save_state()
+        return
+
+    # ── Generation cap ──────────────────────────────────────────────────────
+    replacement_gen = 2
+    if replacement_gen > _ROLLING_MAX_GENERATIONS:
+        eval_result["reason"] = "generation_cap_disabled_in_build_3"
+        eval_result["would_be_generation"]    = replacement_gen
+        eval_result["rolling_max_generations"] = _ROLLING_MAX_GENERATIONS
+        eval_result["note"] = (
+            f"gen-{replacement_gen} economically eligible but blocked: "
+            f"_ROLLING_MAX_GENERATIONS={_ROLLING_MAX_GENERATIONS}; "
+            f"enable in Build 4 after independent audit"
+        )
+        _live_log(
+            f"[ROLLING] gen-{replacement_gen} eligible but BLOCKED "
+            f"(_ROLLING_MAX_GENERATIONS={_ROLLING_MAX_GENERATIONS}, Build 3)"
+        )
+        _live_observe("rolling_replacement_eval", signals, primary, eval_result)
+        _live["rolling_replacement_eval"] = eval_result
+        _live_save_state()
+        return
+
+    # Build 3 invariant: this branch must never be reached.
+    eval_result["reason"] = "build3_invariant_violation_gen2_would_submit"
+    _live_log("\U0001F6A8 BUILD 3 INVARIANT VIOLATION: gen-2 reached submission gate -- BLOCKED")
+    _live_observe("rolling_replacement_eval", signals, primary, eval_result)
+    _live["rolling_replacement_eval"] = eval_result
+    _live_save_state()
+
+
 def _live_close_addon_leg(leg: dict, exit_reason: str, signals: dict) -> None:
     # Closed-leg net economics are not yet certified for future defensive adds.
     if _live.get("open_position"):
@@ -9760,11 +9934,30 @@ def _live_check_pyramid_exits(signals: dict) -> None:
             return
 
         if tp_pct > 0 and leg_pnl_pct >= tp_pct:
-            _live_log(
-                f"✅ PYRAMID LEG TP: leg {leg_idx} | pnl {leg_pnl_pct*100:.3f}% "
-                f">= {tp_pct*100:.3f}% -- closing addon only, primary continues"
-            )
-            _live_close_addon_leg(leg, "pyramid_leg_tp", signals)
+            _leg_gen = leg.get("leg_generation", 1)
+            _is_harvest = (_leg_gen == 1 and leg_pnl_pct >= _ROLLING_HARVEST_THRESHOLD_PCT)
+            if _is_harvest:
+                _live_log(
+                    f"🌾 ROLLING HARVEST: leg {leg_idx} gen-{_leg_gen} | "
+                    f"pnl {leg_pnl_pct*100:.3f}% >= harvest threshold "
+                    f"{_ROLLING_HARVEST_THRESHOLD_PCT*100:.2f}% -- closing addon"
+                )
+                _live_observe("rolling_harvest_proposed", signals, leg,
+                              {"leg_generation": _leg_gen, "harvest_pnl_pct": leg_pnl_pct,
+                               "harvest_threshold": _ROLLING_HARVEST_THRESHOLD_PCT,
+                               "rolling_bootstrap_liq_before": _live.get("rolling_bootstrap_liq_before")})
+                _live_close_addon_leg(leg, "rolling_harvest", signals)
+                # Confirm close: leg removed from pyramid_legs means broker confirmed.
+                if not any(l.get("deal_id") == deal_id for l in _live.get("pyramid_legs", [])):
+                    _live_record_rolling_harvest(leg, signals)
+                else:
+                    _live_log(f"[HARVEST] {leg_idx}: close not confirmed -- capacity slot retained")
+            else:
+                _live_log(
+                    f"✅ PYRAMID LEG TP: leg {leg_idx} | pnl {leg_pnl_pct*100:.3f}% "
+                    f">= {tp_pct*100:.3f}% -- closing addon only, primary continues"
+                )
+                _live_close_addon_leg(leg, "pyramid_leg_tp", signals)
             return
 
 
