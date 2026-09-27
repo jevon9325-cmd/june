@@ -9692,8 +9692,19 @@ def _live_record_rolling_harvest(leg: dict, signals: dict) -> None:
         _live_observe("rolling_harvest_skipped", signals, leg, {"reason": reason})
         return
 
-    pnl_pct = ((mid - fill_px) / fill_px if dirn == "long" else (fill_px - mid) / fill_px)
-    realized_pnl_estimate = pnl_pct * ig_size * mid
+    # Use broker-confirmed exit price when available (stored by _live_close_addon_leg).
+    # Fall back to signal mid only when broker did not supply a level.
+    confirmed_exit    = leg.get("confirmed_exit_price")
+    exit_price_source = leg.get("exit_price_source", "mid_estimate_fallback")
+    if confirmed_exit is None:
+        confirmed_exit    = mid
+        exit_price_source = "mid_estimate_fallback"
+
+    pnl_pct = (
+        (confirmed_exit - fill_px) / fill_px if dirn == "long"
+        else (fill_px - confirmed_exit) / fill_px
+    )
+    realized_pnl_estimate = pnl_pct * ig_size * confirmed_exit
 
     harvest_record = {
         "deal_id":                deal_id,
@@ -9701,6 +9712,8 @@ def _live_record_rolling_harvest(leg: dict, signals: dict) -> None:
         "direction":              dirn,
         "leg_generation":         gen,
         "fill_price":             fill_px,
+        "confirmed_exit_price":   confirmed_exit,
+        "exit_price_source":      exit_price_source,
         "exit_mid_estimate":      mid,
         "pnl_pct":                pnl_pct,
         "realized_pnl_estimate":  realized_pnl_estimate,
@@ -9894,10 +9907,15 @@ def _live_close_addon_leg(leg: dict, exit_reason: str, signals: dict) -> None:
             _live_log(f"{sym}: close accepted but disappearance unconfirmed; tracking preserved")
             _live_save_state()
             return
-        real_exit  = float(confirm.get("level", mid))
+        _level_val = confirm.get("level")
+        real_exit  = float(_level_val) if _level_val is not None else mid
+        _exit_src  = "broker_confirmed" if _level_val is not None else "mid_estimate_fallback"
+        leg["confirmed_exit_price"] = real_exit
+        leg["exit_price_source"]    = _exit_src
         real_pnl_p = (real_exit - fill_px) / fill_px if dirn == "long" else (fill_px - real_exit) / fill_px
         _live_observe("leg_closed", signals, leg,
                       {"reason": exit_reason, "exit_price": real_exit,
+                       "exit_price_source": _exit_src,
                        "pnl_basis": "addon_confirmed_fill_gross_estimate"})
         _live_log(
             f"✅ PYRAMID LEG CLOSED: {sym} @ {real_exit:.5f} "
