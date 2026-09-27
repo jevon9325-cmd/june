@@ -6814,10 +6814,71 @@ def _live_load_state() -> bool:
             _live_capture_active("before_state_load")
             _live.update(json.loads(raw))
             _live_capture_active("state_loaded")
+            _live_validate_rolling_state_on_load()
             return True
     except Exception:
         pass
     return False
+
+
+def _live_validate_rolling_state_on_load() -> None:
+    """Validate rolling harvest state consistency after loading from Redis.
+
+    Conservative: on any inconsistency, log and leave state intact.
+    Never grants a free capacity slot or duplicate harvest credit.
+    Restart invariants:
+    - rolling_capacity_slot="bootstrap" ↔ at least one gen-1 leg in pyramid_legs
+    - rolling_capacity_slot="available" ↔ rolling_realized_harvest is not None
+    - legacy legs (no leg_generation) default conservatively to gen=1
+    """
+    import logging
+    slot        = _live.get("rolling_capacity_slot")
+    realized    = _live.get("rolling_realized_harvest")
+    legs        = _live.get("pyramid_legs", [])
+    gen1_legs   = [l for l in legs if l.get("leg_generation", 1) == 1]
+
+    # Stamp legacy legs without generation metadata.
+    for leg in legs:
+        if "leg_generation" not in leg:
+            leg["leg_generation"] = 1  # conservative backward-compat default
+
+    if slot == "bootstrap" and not gen1_legs:
+        # Slot says bootstrap but no gen-1 leg present -- possible restart after
+        # broker confirmed close but before local persistence of harvest record.
+        # Do NOT release slot; do NOT manufacture harvest credit.
+        # Leave slot as "bootstrap" so the next cycle can re-evaluate.
+        logging.warning(
+            "ROLLING STATE: capacity_slot=bootstrap but no gen-1 legs found on load; "
+            "possible mid-close restart. Slot retained. Broker truth will resolve."
+        )
+
+    if slot == "available" and realized is None:
+        # Slot says available but no harvest record -- possible persistence failure
+        # after slot release. Reset to bootstrap if a gen-1 leg is still tracked.
+        if gen1_legs:
+            logging.warning(
+                "ROLLING STATE: capacity_slot=available but no harvest record and "
+                "gen-1 leg still tracked. Reverting slot to bootstrap."
+            )
+            _live["rolling_capacity_slot"] = "bootstrap"
+        else:
+            logging.warning(
+                "ROLLING STATE: capacity_slot=available, no harvest record, "
+                "no gen-1 legs. State is consistent post-harvest (primary still open)."
+            )
+
+    if realized is not None:
+        # Harvest record present -- ensure no duplicate capacity grant.
+        recorded_deal = realized.get("deal_id")
+        still_open = any(l.get("deal_id") == recorded_deal for l in legs)
+        if still_open:
+            # Leg still in pyramid_legs despite harvest record -- duplicate or stale.
+            # Do NOT grant another harvest. Log for investigation.
+            logging.warning(
+                f"ROLLING STATE: harvest recorded for {recorded_deal} but leg still "
+                f"in pyramid_legs. Possible duplicate close event. No action taken; "
+                f"broker truth authoritative."
+            )
 
 
 def _live_update_defensive_mode() -> None:
