@@ -6355,6 +6355,9 @@ _PYRAMID_3LEG_THRESHOLD  = 10     # completions needed to unlock leg 3
 _PYRAMID_4LEG_THRESHOLD  = 20     # completions needed to unlock leg 4
 _PYRAMID_3LEG_SIZE_DECAY = 0.75   # leg 3 notional = leg2_notional * 0.75
 _PYRAMID_4LEG_SIZE_DECAY = 0.50   # leg 4 notional = leg2_notional * 0.50
+# ── Build 3: Rolling Harvest / Capacity Recycling ────────────────────────────
+_ROLLING_MAX_GENERATIONS       = 1       # gen-2 replacement blocked until Build 4
+_ROLLING_HARVEST_THRESHOLD_PCT = 0.0025  # 0.25% addon profit floor for harvest
 _RECON_ORPHAN_ESCALATION_THRESHOLD = 4  # consecutive 404+deposit>0 cycles before escalating
 # 4 cycles ~2-4 min: past any plausible IG API settling window for OTC positions.
 # /positions (DMA) confirmed NOT to list OTC positions on this account. No alternate list
@@ -10267,6 +10270,7 @@ def _live_add_pyramid_leg(signals: dict, decision=None) -> None:
         "tp_pct":     tp_pct,
         "entry_time": time.time(),
         "leg_index":  leg_index,
+        "leg_generation": 1,  # gen-1 = bootstrap addon in rolling model
     }
     from winner_protection import campaign_stop
     agg_stop_level = campaign_stop(
@@ -10277,6 +10281,14 @@ def _live_add_pyramid_leg(signals: dict, decision=None) -> None:
         {"entry_time": leg["entry_time"], "leg_index": leg_index, "parent_deal_id": primary.get("deal_id")})
     _live_capture_evidence(leg, "accepted_opening")
     _live.setdefault("pyramid_legs", []).append(leg)
+    # Build-3 rolling harvest: record bootstrap capacity slot and protection economics.
+    # Done immediately after append so any persistence failure can be detected at restart.
+    if leg.get("leg_generation", 1) == 1 and _live.get("rolling_capacity_slot") != "bootstrap":
+        _live["rolling_capacity_slot"]       = "bootstrap"
+        _live["rolling_bootstrap_liq_before"] = (
+            evidence.get("liquidation_before")
+            if protection_required and evidence is not None else None
+        )
     _live_observe("addon_accepted", signals, leg)
     _live_observe("addon_opened", signals, leg)
     _live.pop("pyramid_entry_pending", None)
