@@ -63,9 +63,10 @@ def b4a_build_ledgers(live: dict) -> dict:
     K5: missing protection = UNKNOWN, never 0.0.
     Released margin NEVER enters Ledger A.
     Protected primary NEVER treated as cash.
+    F3 FIX: prefer current liq_before over bootstrap snapshot; label staleness.
+    Primary closed => Ledger B cleared to UNKNOWN (protection no longer applies).
     """
-    harvest_rec     = live.get("rolling_realized_harvest") or {}
-    liq_before      = live.get("rolling_bootstrap_liq_before")
+    harvest_rec = live.get("rolling_realized_harvest") or {}
 
     # LEDGER A: realized rolling profit (confirmed harvested addon P&L only)
     ledger_a_raw    = harvest_rec.get("realized_pnl_estimate")
@@ -79,12 +80,29 @@ def b4a_build_ledgers(live: dict) -> dict:
     ledger_a_remaining = round(ledger_a - ledger_a_deployed, 8) if ledger_a_valid else 0.0
 
     # LEDGER B: acknowledged protected primary floor (NOT cash, NOT profit)
-    if liq_before is None:
-        ledger_b            = B4A_UNKNOWN
-        ledger_b_provenance = "not_recorded_normal_controls_path"
+    # F3 FIX: prefer live current liq_before over stale bootstrap snapshot.
+    # When primary is closed, protection no longer applies -> UNKNOWN.
+    primary_open  = live.get("open_position") is not None
+    current_liq   = live.get("liq_before")                      # fresh each cycle if available
+    bootstrap_liq = live.get("rolling_bootstrap_liq_before")    # snapshot at addon open
+
+    if not primary_open:
+        liq_before          = None
+        ledger_b_provenance = "primary_closed_protection_cleared"
+    elif current_liq is not None:
+        liq_before          = current_liq
+        ledger_b_provenance = "current_liq_before"
+    elif bootstrap_liq is not None:
+        liq_before          = bootstrap_liq
+        ledger_b_provenance = "bootstrap_snapshot_stale"
     else:
-        ledger_b            = float(liq_before)
-        ledger_b_provenance = "recorded_at_bootstrap_open"
+        liq_before          = None
+        ledger_b_provenance = "not_recorded_normal_controls_path"
+
+    if liq_before is None:
+        ledger_b = B4A_UNKNOWN
+    else:
+        ledger_b = float(liq_before)
 
     # LEDGER C: released margin when addon closed (informational, NOT profit)
     addon_ig   = harvest_rec.get("ig_size", 0.0)
@@ -114,6 +132,7 @@ def b4a_build_ledgers(live: dict) -> dict:
         "ledger_a_remaining":                 round(ledger_a_remaining, 8),
         "ledger_b_protected_primary":         ledger_b,
         "ledger_b_provenance":                ledger_b_provenance,
+        "bootstrap_liq_before_historical":    bootstrap_liq,   # preserved for provenance (F3)
         "ledger_c_released_margin":           ledger_c,
         "ledger_d_principal_at_risk":         ledger_d,
         "ledger_d_formula":                   ledger_d_formula,
@@ -131,50 +150,67 @@ def b4a_original_principal_at_risk(
     ledger_d,
     candidate_margin: float,
     candidate_stop_risk: float,
+    ledger_a_remaining: float = None,
 ) -> dict:
-    """Policy-neutral calculation of original_principal_at_risk.
+    """D1/D2 split: unconditional and conditional original principal exposure.
 
-    FORMULA (when all inputs known):
-      opar = max(0, candidate_stop_risk - realized_coverage - protection_coverage)
+    F2 FIX: B (protection) is NOT subtracted in D1. Only A (realized remaining) covers D1.
+    F5 FIX: uses ledger_a_remaining (not total) for coverage.
+    F6 FIX: floors realized_remaining at 0; negative A never inflates D1 beyond stop_risk.
 
-    PROVENANCE:
-      realized_profit_coverage  = min(ledger_a, stop_risk) if profit > 0
-      protection_coverage       = max(0, liq_before) if above breakeven
-      principal_residual        = stop_risk - both coverages, floored at 0
+    D1 UNCONDITIONAL OPAR:
+      realized_available = max(0, ledger_a_remaining)   [floor negative at 0]
+      realized_coverage  = min(realized_available, candidate_stop_risk)
+      D1 = max(0, candidate_stop_risk - realized_coverage)
 
-    K5: if ledger_b = UNKNOWN -> result = UNKNOWN.
+    D2 CONDITIONAL CAMPAIGN EXPOSURE:
+      IF ledger_b = UNKNOWN -> D2 = UNKNOWN  (K5 invariant on D2 only)
+      ELSE protection_coverage = max(0, liq_before)
+           D2 = max(0, D1 - protection_coverage)
+      D2 is CONDITIONAL: requires primary to realize at or above protection floor.
+
+    B NEVER enters the realized-profit ledger.
+    C NEVER enters the realized-profit ledger.
     """
-    realized_coverage = (
-        min(ledger_a, max(0.0, candidate_stop_risk))
-        if ledger_a_valid else 0.0
-    )
+    # F5: use remaining (not total) for D1 coverage
+    a_rem = ledger_a_remaining if ledger_a_remaining is not None else ledger_a
 
+    # F6: floor negative realized at 0 so negative A cannot inflate D1
+    realized_available = max(0.0, a_rem) if ledger_a_valid else 0.0
+    realized_coverage  = min(realized_available, max(0.0, candidate_stop_risk))
+    d1 = round(max(0.0, candidate_stop_risk - realized_coverage), 8)
+
+    # D2: conditional on known primary protection (K5 applies here, not to D1)
     if ledger_b == B4A_UNKNOWN:
-        return {
-            "original_principal_at_risk": B4A_UNKNOWN,
-            "realized_profit_coverage":   realized_coverage,
-            "protection_coverage":        B4A_UNKNOWN,
-            "principal_residual":         B4A_UNKNOWN,
-            "formula":                    "UNKNOWN_ledger_b_missing",
-            "k5_invariant_applied":       True,
-        }
-
-    liq_b               = float(ledger_b)
-    protection_coverage = max(0.0, liq_b) if liq_b >= 0 else 0.0
-    total_covered       = realized_coverage + protection_coverage
-    principal_residual  = max(0.0, candidate_stop_risk - total_covered)
+        d2             = B4A_UNKNOWN
+        prot_coverage  = B4A_UNKNOWN
+        k5_applied     = True
+    else:
+        liq_b         = float(ledger_b)
+        prot_coverage = round(max(0.0, liq_b), 8)
+        d2            = round(max(0.0, d1 - prot_coverage), 8)
+        k5_applied    = False
 
     return {
-        "original_principal_at_risk": round(principal_residual, 8),
-        "realized_profit_coverage":   round(realized_coverage, 8),
-        "protection_coverage":        round(protection_coverage, 8),
-        "principal_residual":         round(principal_residual, 8),
-        "candidate_stop_risk":        round(candidate_stop_risk, 8),
-        "formula": (
-            f"max(0, {candidate_stop_risk:.6f} - {realized_coverage:.6f}"
-            f" - {protection_coverage:.6f}) = {principal_residual:.6f}"
+        # D1: unconditional (primary accounting value)
+        "original_principal_at_risk":         d1,   # = D1 (backward-compat key)
+        "d1_opar_unconditional":              d1,
+        # D2: conditional on primary protection being realized
+        "d2_opar_conditional":                d2,
+        "d2_condition":                       "requires_primary_to_realize_at_or_above_protection_floor",
+        # Coverage detail
+        "realized_profit_coverage":           round(realized_coverage, 8),
+        "protection_coverage":                prot_coverage,
+        "principal_residual":                 d1,   # = D1
+        "candidate_stop_risk":                round(candidate_stop_risk, 8),
+        "formula_d1": (
+            f"max(0, {candidate_stop_risk:.6f}"
+            f" - min(max(0,{a_rem:.6f}),{candidate_stop_risk:.6f}))"
+            f" = {d1:.6f}"
         ),
-        "k5_invariant_applied": False,
+        "k5_invariant_applied":               k5_applied,
+        "b_entered_profit_ledger":            False,
+        "c_entered_profit_ledger":            False,
     }
 
 
@@ -190,7 +226,7 @@ def b4a_can_credit_harvest(live: dict, leg: dict) -> tuple:
     slot     = live.get("rolling_capacity_slot")
     existing = live.get("rolling_realized_harvest") or {}
 
-    if existing.get("deal_id") == deal_id and deal_id:
+    if existing.get("deal_id") == deal_id:
         return False, "duplicate_harvest_deal_id"
     if gen != 1:
         return False, f"generation_{gen}_not_harvest_eligible"
@@ -273,22 +309,62 @@ def b4a_compute_replacement_economics(
     ledger_c   = ledgers.get("ledger_c_released_margin", {})
     ledger_d   = ledgers.get("ledger_d_principal_at_risk", B4A_UNKNOWN)
 
-    realized_coverage = (
+    realized_remaining = (
         max(0.0, float(ledger_a_r))
         if isinstance(ledger_a_r, (int, float)) else 0.0
     )
 
+    # F1 FIX: derive candidate stop risk from primary stop geometry (not hardcoded 0.0)
+    primary_stop_pct = primary.get("stop_pct", 0.0)
+    try:
+        _unit = live_campaign_unit_fn(sym, current_price)
+    except Exception:
+        _unit = None
+    if primary_stop_pct > 0 and current_price > 0 and legal_ig > 0 and _unit is not None:
+        candidate_stop_risk      = round(legal_ig * _unit * current_price * primary_stop_pct, 8)
+        candidate_stop_provenance = "derived_from_primary_stop_pct_same_instrument"
+    elif primary_stop_pct <= 0:
+        candidate_stop_risk       = B4A_UNKNOWN
+        candidate_stop_provenance = "stop_pct_unavailable"
+    else:
+        candidate_stop_risk       = B4A_UNKNOWN
+        candidate_stop_provenance = "price_or_ig_size_unavailable"
+
+    # OPAR: pass remaining (not total) for D1; candidate_stop_risk may be UNKNOWN
+    _stop_for_opar = (
+        float(candidate_stop_risk)
+        if isinstance(candidate_stop_risk, (int, float)) and candidate_stop_risk > 0
+        else 0.0
+    )
     opae_result = b4a_original_principal_at_risk(
         ledger_a=ledger_a,
         ledger_a_valid=ledgers.get("ledger_a_valid", False),
         ledger_b=ledger_b,
         ledger_d=ledger_d,
         candidate_margin=margin_req if isinstance(margin_req, float) else 0.0,
-        candidate_stop_risk=0.0,
+        candidate_stop_risk=_stop_for_opar,
+        ledger_a_remaining=float(ledger_a_r) if isinstance(ledger_a_r, (int, float)) else 0.0,
     )
 
-    gap_risk_pct = spread_pct / 100.0 if spread_pct > 0 else B4A_UNKNOWN
-    nom_leverage = primary.get("leverage", B4A_UNKNOWN)
+    # F9 FIX: rename misleading field; add explicit loss-note telemetry
+    spread_pct_obs = spread_pct / 100.0 if spread_pct > 0 else B4A_UNKNOWN
+    nom_leverage   = primary.get("leverage", B4A_UNKNOWN)
+
+    # F12: R_primary provenance -- expose original and note DPLE may have moved stop
+    _stop_dist  = primary.get("stop_dist", 0.0)
+    _ig_sz      = primary.get("ig_size", 0.0)
+    r_prim_orig = round(_stop_dist * _ig_sz, 8) if (_stop_dist and _ig_sz) else B4A_UNKNOWN
+    r_prim_orig_src = (
+        "entry_stop_dist_stored_at_open"
+        if r_prim_orig != B4A_UNKNOWN else "stop_dist_or_ig_size_unavailable"
+    )
+    # Current R derived from protection floor if known
+    if ledger_b != B4A_UNKNOWN and float(ledger_b) < 0:
+        r_prim_current = round(abs(float(ledger_b)), 8)
+        r_prim_curr_src = "current_liq_before_implicit"
+    else:
+        r_prim_current = B4A_UNKNOWN
+        r_prim_curr_src = "not_derivable_from_available_state_dple_may_have_moved_stop"
 
     return {
         "status":                             "evaluation_complete",
@@ -304,8 +380,15 @@ def b4a_compute_replacement_economics(
         "margin_rate":                        margin_rate,
         "margin_requirement_1x":              margin_req,
         "nominal_leverage":                   nom_leverage,
-        "gap_risk_observable_spread_pct":     gap_risk_pct,
-        "realized_profit_pool":               realized_coverage,
+        # F9: renamed from gap_risk_observable_spread_pct
+        "spread_pct_observed":                spread_pct_obs,
+        "bid_ask_spread_pct_observed":        spread_pct_obs,
+        "orderly_stop_risk":                  candidate_stop_risk,
+        "orderly_stop_risk_provenance":       candidate_stop_provenance,
+        "gap_exposure_beyond_stop":           "not_modeled_unknown",
+        "total_possible_loss_note":           "orderly_stop_risk_is_NOT_maximum_loss_gap_not_estimated",
+        # F5: realized pool uses remaining
+        "realized_profit_pool":               realized_remaining,
         "realized_profit_source":             ledgers.get("ledger_a_source", "no_harvest"),
         "ledger_a_realized_profit":           ledger_a,
         "ledger_b_protected_primary":         ledger_b,
@@ -314,6 +397,11 @@ def b4a_compute_replacement_economics(
         "original_principal_exposure":        opae_result,
         "candidate_sizes_mindeal_multiples":  candidate_sizes,
         "mindeal_oversize_max":               mindeal_oversize_max,
+        # F12: R_primary provenance
+        "r_primary_original":                 r_prim_orig,
+        "r_primary_original_source":          r_prim_orig_src,
+        "r_primary_current_from_dple":        r_prim_current,
+        "r_primary_current_source":           r_prim_curr_src,
         "generation2_submission":             "BLOCKED_build4a_observation_only",
         "note": (
             "All economics observational. No IG API call made. "
@@ -344,14 +432,33 @@ def b4a_policy_counterfactuals(
 
     counterfactuals = {}
 
-    # Architecture A: pure self-funding
+    # Architecture A: pure self-funding (F10 FIX: evaluate mechanically when data available)
+    _remaining_a    = ledgers.get("ledger_a_remaining", 0.0)
+    _cand_stop      = economics.get("orderly_stop_risk", B4A_UNKNOWN)
+    _remaining_real = float(_remaining_a) if isinstance(_remaining_a, (int, float)) else B4A_UNKNOWN
+    if _remaining_real == B4A_UNKNOWN or _cand_stop == B4A_UNKNOWN:
+        psf_outcome = B4A_UNKNOWN
+        psf_reason  = "unknown_inputs"
+    elif not ledger_a_v:
+        psf_outcome = B4A_UNKNOWN
+        psf_reason  = "no_realized_profit_recorded"
+    elif not isinstance(_cand_stop, (int, float)) or _cand_stop <= 0:
+        psf_outcome = B4A_UNKNOWN
+        psf_reason  = "candidate_stop_risk_not_computed"
+    else:
+        _eligible   = (_remaining_real >= float(_cand_stop))
+        psf_outcome = "eligible" if _eligible else "insufficient_realized_profit"
+        psf_reason  = (
+            f"remaining={_remaining_real:.6f}_vs_stop={float(_cand_stop):.6f}"
+        )
     counterfactuals["pure_self_funding"] = {
         "policy":      "pure_self_funding",
-        "condition":   "H_realized >= R_candidate_stop_risk",
-        "H_realized":  round(ledger_a, 8) if ledger_a_v else B4A_UNKNOWN,
-        "R_candidate": B4A_UNKNOWN,
-        "outcome":     B4A_UNKNOWN,
-        "note":        "candidate_stop_risk_not_computed_in_build4a",
+        "condition":   "remaining_realized >= candidate_stop_risk",
+        "H_realized":  round(float(_remaining_a), 8) if isinstance(_remaining_a, (int, float)) and ledger_a_v else B4A_UNKNOWN,
+        "R_candidate": _cand_stop,
+        "outcome":     psf_outcome,
+        "reason":      psf_reason,
+        "note":        "evaluated_mechanically_when_data_available",
     }
 
     # Architecture B variants
@@ -409,7 +516,7 @@ def b4a_leverage_observability(
 
     nom_lev  = (notional / pos_size) if pos_size > 0 else leverage
     stop_exp = notional * stop_pct if notional and stop_pct else B4A_UNKNOWN
-    gap_obs  = economics.get("gap_risk_observable_spread_pct", B4A_UNKNOWN)
+    gap_obs  = economics.get("spread_pct_observed", economics.get("gap_risk_observable_spread_pct", B4A_UNKNOWN))
 
     ledger_a   = ledgers.get("ledger_a_realized_profit", 0.0)
     ledger_a_v = ledgers.get("ledger_a_valid", False)

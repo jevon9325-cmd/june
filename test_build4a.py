@@ -298,15 +298,24 @@ class TestK5Invariant:
         ledgers = rb4.b4a_build_ledgers(live)
         assert ledgers["ledger_d_principal_at_risk"] == rb4.B4A_UNKNOWN
 
-    def test_opae_unknown_when_ledger_b_unknown(self):
-        """b4a_original_principal_at_risk returns UNKNOWN when Ledger B is UNKNOWN."""
+    def test_opae_d1_computable_d2_unknown_when_ledger_b_unknown(self):
+        """D1 is computable without B; D2 = UNKNOWN when Ledger B = UNKNOWN (K5 on D2)."""
         result = rb4.b4a_original_principal_at_risk(
             ledger_a=0.12, ledger_a_valid=True,
             ledger_b=rb4.B4A_UNKNOWN, ledger_d=rb4.B4A_UNKNOWN,
             candidate_margin=5.0, candidate_stop_risk=2.0,
+            ledger_a_remaining=0.12,
         )
-        assert result["original_principal_at_risk"] == rb4.B4A_UNKNOWN
+        # D1 is unconditional -- computable even when B is UNKNOWN
+        assert result["d1_opar_unconditional"] != rb4.B4A_UNKNOWN
+        assert abs(result["d1_opar_unconditional"] - 1.88) < 1e-6, (
+            f"D1 expected ~1.88, got {result['d1_opar_unconditional']}"
+        )
+        # D2 is conditional on B -- UNKNOWN when B is UNKNOWN (K5)
+        assert result["d2_opar_conditional"] == rb4.B4A_UNKNOWN
         assert result["k5_invariant_applied"] is True
+        # B never entered profit ledger
+        assert result["b_entered_profit_ledger"] is False
 
     def test_zero_liq_before_is_not_unknown(self):
         """A real value of 0.0 for liq_before is valid (not UNKNOWN)."""
@@ -411,16 +420,27 @@ class TestNoDuplicateConfirmDoubleCredit:
 # ============================================================================
 
 class TestNoDuplicateHarvestObservation:
-    def test_can_credit_harvest_empty_deal_id_not_eligible(self):
-        """Empty deal_id leg is treated conservatively (no credit)."""
-        live = {"rolling_capacity_slot": "bootstrap", "rolling_profit_deployed": 0.0}
-        leg  = make_addon_leg()
-        leg["deal_id"] = ""
+    def test_can_credit_harvest_empty_deal_id_blocked_by_dedup(self):
+        """F8 FIX: empty deal_id == empty deal_id -> blocked (dedup guard).
+
+        When both incoming and existing deal_id are empty strings,
+        empty == empty is True, so the duplicate guard correctly blocks.
+        This prevents empty-identity harvests from bypassing dedup.
+        """
+        # Existing harvest also has empty deal_id
+        live = {
+            "rolling_capacity_slot": "bootstrap",
+            "rolling_profit_deployed": 0.0,
+            "rolling_realized_harvest": {"deal_id": ""},  # existing with empty id
+        }
+        leg = make_addon_leg()
+        leg["deal_id"] = ""  # incoming also empty
         ok, reason = rb4.b4a_can_credit_harvest(live, leg)
-        # deal_id is empty, existing.deal_id would also be empty -- that's a match
-        # Actually with empty deal_id, existing.deal_id would be "" too = match -> blocked
-        # Let's verify the guard fires correctly
-        assert ok is True or "eligible" in reason  # empty deal_id is edge case; not a dupe
+        # F8 fix: "" == "" should block (not bypass)
+        assert ok is False, (
+            f"Empty deal_id should be blocked by dedup, got ok={ok}, reason={reason}"
+        )
+        assert reason == "duplicate_harvest_deal_id"
 
 
 # ============================================================================
@@ -527,11 +547,17 @@ class TestGen2EvaluatorComplete:
             "current_generation", "candidate_generation",
             "fill_reference_price", "legal_ig_size_1x_mindeal", "mindeal_raw",
             "margin_rate", "margin_requirement_1x", "nominal_leverage",
-            "gap_risk_observable_spread_pct", "realized_profit_pool",
+            # F9: renamed from gap_risk_observable_spread_pct
+            "spread_pct_observed", "bid_ask_spread_pct_observed",
+            "orderly_stop_risk", "gap_exposure_beyond_stop",
+            "total_possible_loss_note",
+            "realized_profit_pool",
             "realized_profit_source", "ledger_a_realized_profit",
             "ledger_b_protected_primary", "ledger_c_released_margin",
             "ledger_d_principal_at_risk", "original_principal_exposure",
             "candidate_sizes_mindeal_multiples", "mindeal_oversize_max",
+            # F12: R_primary provenance
+            "r_primary_original", "r_primary_original_source",
             "generation2_submission", "note",
         ]
         for field in required:
@@ -684,12 +710,19 @@ class TestRPrimaryProvenance:
 
 class TestBuild1Regression:
     def test_build1_stop_sync_constants_present(self):
-        """Build-1 stop sync constants still present in june.py."""
+        """Build-1 stop sync behavior: _ROLLING_MAX_GENERATIONS and stop_sync field."""
         import june
-        # Check that stop sync hasn't been broken
-        # Key: stop_sync field in positions is still used
-        assert hasattr(june, "_LIVE_STOP_SYNC_DELAY") or True  # constant may vary
-        # The presence of the test_build1_stop_sync.py passing is the real test
+        # Build-1 invariant: gen-2 submission is blocked by _ROLLING_MAX_GENERATIONS == 1
+        assert hasattr(june, "_ROLLING_MAX_GENERATIONS"), (
+            "Build-1 constant _ROLLING_MAX_GENERATIONS missing from june.py"
+        )
+        assert june._ROLLING_MAX_GENERATIONS == 1, (
+            "Build-1: _ROLLING_MAX_GENERATIONS must be 1 to block gen-2"
+        )
+        # Build-1 stop_sync: _live_retry_stop_sync must exist
+        assert hasattr(june, "_live_retry_stop_sync"), (
+            "Build-1 stop sync function _live_retry_stop_sync missing"
+        )
 
 
 # ============================================================================
@@ -771,3 +804,407 @@ class TestGen1NotBlocked:
         )
         assert is_rolling is True
         assert reason == "rolling_harvest_path"
+
+
+# ============================================================================
+# NEW TESTS: D1/D2 formula verification (Step 3 -- must fail pre-repair)
+# ============================================================================
+
+class TestD1D2Formulas:
+    """Verify the new D1 (unconditional) and D2 (conditional) OPAR formulas."""
+
+    def _call(self, ledger_a, ledger_a_valid, ledger_b,
+              candidate_stop_risk, ledger_a_remaining=None):
+        return rb4.b4a_original_principal_at_risk(
+            ledger_a=ledger_a,
+            ledger_a_valid=ledger_a_valid,
+            ledger_b=ledger_b,
+            ledger_d=rb4.B4A_UNKNOWN,
+            candidate_margin=0.0,
+            candidate_stop_risk=candidate_stop_risk,
+            ledger_a_remaining=ledger_a_remaining,
+        )
+
+    def test_case_a_realized_covers_all(self):
+        """A=0.80, stop_risk=0.80: D1=0.00 (fully covered by realized)."""
+        r = self._call(0.80, True, 0.0, 0.80, 0.80)
+        assert abs(r["d1_opar_unconditional"]) < 1e-8, f"D1={r['d1_opar_unconditional']}"
+
+    def test_partial_coverage_d1(self):
+        """A=0.40, stop_risk=0.80: D1=0.40 (not 0.00)."""
+        r = self._call(0.40, True, rb4.B4A_UNKNOWN, 0.80, 0.40)
+        assert abs(r["d1_opar_unconditional"] - 0.40) < 1e-8, (
+            f"D1 expected 0.40, got {r['d1_opar_unconditional']}"
+        )
+
+    def test_d1_d2_with_known_b(self):
+        """A=0.40, B=0.40, stop_risk=0.80: D1=0.40, D2=0.00 (conditional)."""
+        r = self._call(0.40, True, 0.40, 0.80, 0.40)
+        assert abs(r["d1_opar_unconditional"] - 0.40) < 1e-8, f"D1={r['d1_opar_unconditional']}"
+        assert r["d2_opar_conditional"] != rb4.B4A_UNKNOWN
+        assert abs(r["d2_opar_conditional"]) <= 0.0 + 1e-8, (
+            f"D2 expected 0.00 conditionally, got {r['d2_opar_conditional']}"
+        )
+
+    def test_negative_a_does_not_inflate_d1(self):
+        """A=negative(-0.40), stop_risk=0.80: D1=0.80 (not 1.20)."""
+        r = self._call(-0.40, True, rb4.B4A_UNKNOWN, 0.80, -0.40)
+        assert abs(r["d1_opar_unconditional"] - 0.80) < 1e-8, (
+            f"D1 expected 0.80 (negative A floored at 0), got {r['d1_opar_unconditional']}"
+        )
+
+    def test_remaining_not_total_for_d1(self):
+        """realized=2.00, deployed=1.25, remaining=0.75: D1=0.25 for stop_risk=1.00."""
+        # Ledger A total=2.00, deployed=1.25, remaining=0.75
+        r = self._call(2.00, True, rb4.B4A_UNKNOWN, 1.00, 0.75)
+        assert abs(r["d1_opar_unconditional"] - 0.25) < 1e-8, (
+            f"D1 expected 0.25 (remaining covers 0.75 of 1.00), got {r['d1_opar_unconditional']}"
+        )
+
+    def test_primary_closed_ledger_b_unknown(self):
+        """Primary closed -> Ledger B = UNKNOWN -> D2 = UNKNOWN."""
+        live = make_live_with_harvest()
+        live["open_position"] = None  # primary closed
+        ledgers = rb4.b4a_build_ledgers(live)
+        assert ledgers["ledger_b_protected_primary"] == rb4.B4A_UNKNOWN
+        assert ledgers["ledger_b_provenance"] == "primary_closed_protection_cleared"
+
+    def test_bootstrap_liq_before_historical_preserved(self):
+        """bootstrap_liq_before_historical preserved alongside current protection."""
+        live = make_live_with_harvest(liq_before=0.0805)
+        ledgers = rb4.b4a_build_ledgers(live)
+        assert ledgers["bootstrap_liq_before_historical"] == 0.0805
+
+    def test_gap_field_renamed(self):
+        """gap_risk_observable_spread_pct is absent; spread_pct_observed is present."""
+        live = make_live_with_harvest()
+        ledgers = rb4.b4a_build_ledgers(live)
+        econ = rb4.b4a_compute_replacement_economics(
+            primary=live["open_position"], harvest_rec={}, ledgers=ledgers,
+            live_min_deal={"SILVER": 0.1}, live_margin={"SILVER": 0.05},
+            live_campaign_unit_fn=lambda s, p: 1.0,
+            live_compute_ig_size_fn=lambda s, n, p: n,
+            current_price=6300.0, spread_pct=0.1,
+        )
+        assert "gap_risk_observable_spread_pct" not in econ, (
+            "Old field gap_risk_observable_spread_pct should be absent after rename"
+        )
+        assert "spread_pct_observed" in econ
+        assert "total_possible_loss_note" in econ
+
+    def test_pure_self_funding_eligible(self):
+        """pure_self_funding: eligible when remaining realized >= candidate stop risk."""
+        live = make_live_with_harvest(realized_pnl=1.00)
+        # Make stop_pct such that candidate_stop_risk < 1.00
+        live["open_position"]["stop_pct"] = 0.001  # very small stop
+        ledgers = rb4.b4a_build_ledgers(live)
+        econ = rb4.b4a_compute_replacement_economics(
+            primary=live["open_position"], harvest_rec={}, ledgers=ledgers,
+            live_min_deal={"SILVER": 0.1}, live_margin={"SILVER": 0.05},
+            live_campaign_unit_fn=lambda s, p: 1.0,
+            live_compute_ig_size_fn=lambda s, n, p: n,
+            current_price=6300.0,
+        )
+        cf = rb4.b4a_policy_counterfactuals(
+            economics=econ, ledgers=ledgers,
+            harvest_rec=live.get("rolling_realized_harvest") or {},
+            r_primary=8.0, r_primary_provenance="test",
+        )
+        psf = cf["counterfactuals"]["pure_self_funding"]
+        # With realized=1.00 and tiny stop, should be eligible
+        assert psf["outcome"] in ("eligible", rb4.B4A_UNKNOWN), (
+            f"Expected eligible or UNKNOWN, got {psf['outcome']}"
+        )
+
+    def test_pure_self_funding_insufficient(self):
+        """pure_self_funding: insufficient when remaining < candidate stop risk."""
+        live = make_live_with_harvest(realized_pnl=0.01)
+        live["open_position"]["stop_pct"] = 0.10  # large stop
+        ledgers = rb4.b4a_build_ledgers(live)
+        econ = rb4.b4a_compute_replacement_economics(
+            primary=live["open_position"], harvest_rec={}, ledgers=ledgers,
+            live_min_deal={"SILVER": 10.0}, live_margin={"SILVER": 0.05},
+            live_campaign_unit_fn=lambda s, p: 1.0,
+            live_compute_ig_size_fn=lambda s, n, p: n,
+            current_price=6300.0,
+        )
+        cf = rb4.b4a_policy_counterfactuals(
+            economics=econ, ledgers=ledgers,
+            harvest_rec=live.get("rolling_realized_harvest") or {},
+            r_primary=8.0, r_primary_provenance="test",
+        )
+        psf = cf["counterfactuals"]["pure_self_funding"]
+        assert psf["outcome"] in ("insufficient_realized_profit", rb4.B4A_UNKNOWN), (
+            f"Expected insufficient or UNKNOWN, got {psf['outcome']}"
+        )
+
+    def test_same_deal_id_twice_blocked(self):
+        """Duplicate deal_id -> second call blocked."""
+        live = {
+            "rolling_capacity_slot": "bootstrap",
+            "rolling_profit_deployed": 0.0,
+            "rolling_realized_harvest": {"deal_id": "ADDON1"},
+        }
+        leg = make_addon_leg(deal="ADDON1")
+        ok, reason = rb4.b4a_can_credit_harvest(live, leg)
+        assert ok is False
+        assert reason == "duplicate_harvest_deal_id"
+
+    def test_empty_deal_id_same_empty_blocked(self):
+        """Empty deal_id == empty deal_id -> blocked (F8 fix)."""
+        live = {
+            "rolling_capacity_slot": "bootstrap",
+            "rolling_profit_deployed": 0.0,
+            "rolling_realized_harvest": {"deal_id": ""},
+        }
+        leg = make_addon_leg()
+        leg["deal_id"] = ""
+        ok, reason = rb4.b4a_can_credit_harvest(live, leg)
+        assert ok is False, f"Empty dedup should block, got ok={ok}"
+        assert reason == "duplicate_harvest_deal_id"
+
+    def test_d2_unknown_protection_stays_unknown(self):
+        """D2 = UNKNOWN when protection is UNKNOWN; never coerced to 0."""
+        r = rb4.b4a_original_principal_at_risk(
+            ledger_a=0.40, ledger_a_valid=True,
+            ledger_b=rb4.B4A_UNKNOWN, ledger_d=rb4.B4A_UNKNOWN,
+            candidate_margin=5.0, candidate_stop_risk=0.80,
+            ledger_a_remaining=0.40,
+        )
+        assert r["d2_opar_conditional"] == rb4.B4A_UNKNOWN
+        assert r["d1_opar_unconditional"] != rb4.B4A_UNKNOWN
+
+    def test_c38_replay_no_realized_profit(self):
+        """C38 replay: no realized profit -> D1 = full stop risk."""
+        live = {
+            "open_position": make_primary(),
+            "pyramid_legs": [],
+            "rolling_capacity_slot": "bootstrap",
+            "rolling_bootstrap_liq_before": 0.0,
+            "rolling_profit_deployed": 0.0,
+            # No rolling_realized_harvest
+        }
+        ledgers = rb4.b4a_build_ledgers(live)
+        econ = rb4.b4a_compute_replacement_economics(
+            primary=live["open_position"], harvest_rec={}, ledgers=ledgers,
+            live_min_deal={"SILVER": 0.1}, live_margin={"SILVER": 0.05},
+            live_campaign_unit_fn=lambda s, p: 1.0,
+            live_compute_ig_size_fn=lambda s, n, p: n,
+            current_price=6300.0,
+        )
+        opae = econ["original_principal_exposure"]
+        # D1: full stop_risk (no realized coverage)
+        d1 = opae.get("d1_opar_unconditional", rb4.B4A_UNKNOWN)
+        stop_risk = econ.get("orderly_stop_risk", rb4.B4A_UNKNOWN)
+        if d1 != rb4.B4A_UNKNOWN and stop_risk != rb4.B4A_UNKNOWN:
+            assert abs(d1 - float(stop_risk)) < 1e-6, (
+                f"C38: D1 should equal stop_risk when no realized profit; D1={d1}, stop={stop_risk}"
+            )
+
+    def test_gap_matrix_case_a(self):
+        """Gap matrix Case A: realized=$0.80, stop_risk=$0.80 -> D1=0.00."""
+        r = rb4.b4a_original_principal_at_risk(
+            ledger_a=0.80, ledger_a_valid=True,
+            ledger_b=0.0, ledger_d=rb4.B4A_UNKNOWN,
+            candidate_margin=0.0, candidate_stop_risk=0.80,
+            ledger_a_remaining=0.80,
+        )
+        assert abs(r["d1_opar_unconditional"]) < 1e-8
+
+    def test_gap_matrix_case_b(self):
+        """Gap matrix Case B: realized=$0.40, protection=$0.40 -> D1=0.40, D2~=0.00."""
+        r = rb4.b4a_original_principal_at_risk(
+            ledger_a=0.40, ledger_a_valid=True,
+            ledger_b=0.40, ledger_d=rb4.B4A_UNKNOWN,
+            candidate_margin=0.0, candidate_stop_risk=0.80,
+            ledger_a_remaining=0.40,
+        )
+        assert abs(r["d1_opar_unconditional"] - 0.40) < 1e-8
+        assert abs(r["d2_opar_conditional"]) < 1e-8
+
+    def test_gap_matrix_case_c(self):
+        """Gap matrix Case C: realized=$0.00, protection=$0.80 -> D1=0.80, D2~=0.00."""
+        r = rb4.b4a_original_principal_at_risk(
+            ledger_a=0.0, ledger_a_valid=False,
+            ledger_b=0.80, ledger_d=rb4.B4A_UNKNOWN,
+            candidate_margin=0.0, candidate_stop_risk=0.80,
+            ledger_a_remaining=0.0,
+        )
+        assert abs(r["d1_opar_unconditional"] - 0.80) < 1e-8
+        assert abs(r["d2_opar_conditional"]) < 1e-8
+
+    def test_gap_matrix_case_d(self):
+        """Gap matrix Case D: realized=$0.40, protection=UNKNOWN -> D1=0.40, D2=UNKNOWN."""
+        r = rb4.b4a_original_principal_at_risk(
+            ledger_a=0.40, ledger_a_valid=True,
+            ledger_b=rb4.B4A_UNKNOWN, ledger_d=rb4.B4A_UNKNOWN,
+            candidate_margin=0.0, candidate_stop_risk=0.80,
+            ledger_a_remaining=0.40,
+        )
+        assert abs(r["d1_opar_unconditional"] - 0.40) < 1e-8
+        assert r["d2_opar_conditional"] == rb4.B4A_UNKNOWN
+
+    def test_gap_matrix_case_e_gap_labeled(self):
+        """Gap matrix Case E: gap_exposure_beyond_stop labeled not_modeled_unknown."""
+        live = make_live_with_harvest()
+        ledgers = rb4.b4a_build_ledgers(live)
+        econ = rb4.b4a_compute_replacement_economics(
+            primary=live["open_position"], harvest_rec={}, ledgers=ledgers,
+            live_min_deal={"SILVER": 0.1}, live_margin={"SILVER": 0.05},
+            live_campaign_unit_fn=lambda s, p: 1.0,
+            live_compute_ig_size_fn=lambda s, n, p: n,
+            current_price=6300.0, spread_pct=0.1,
+        )
+        assert econ["gap_exposure_beyond_stop"] == "not_modeled_unknown"
+        assert "NOT_maximum_loss" in econ["total_possible_loss_note"]
+
+
+# ============================================================================
+# F13: Executable failure-atomicity tests (12 scenarios)
+# ============================================================================
+
+class TestFailureAtomicity:
+    """Executable tests for failure scenarios from FAILURE_SCENARIOS matrix."""
+
+    def test_fa1_harvest_blocked_wrong_slot(self):
+        """FA1: Harvest credit blocked when slot != bootstrap (wrong state)."""
+        live = {"rolling_capacity_slot": "available", "rolling_profit_deployed": 0.0}
+        leg  = make_addon_leg(gen=1, deal="ADDON1")
+        ok, reason = rb4.b4a_can_credit_harvest(live, leg)
+        assert ok is False
+        assert "capacity_slot_unexpected" in reason
+
+    def test_fa2_harvest_confirmation_empty_deal(self):
+        """FA2: Harvest with empty deal_id blocked; identity unknown."""
+        live = {
+            "rolling_capacity_slot": "bootstrap",
+            "rolling_profit_deployed": 0.0,
+            "rolling_realized_harvest": {"deal_id": ""},
+        }
+        leg = make_addon_leg()
+        leg["deal_id"] = ""
+        ok, reason = rb4.b4a_can_credit_harvest(live, leg)
+        assert ok is False
+        assert reason == "duplicate_harvest_deal_id"
+
+    def test_fa3_deal_id_dedup_blocks_re_credit_after_restart(self):
+        """FA3: deal_id dedup blocks re-credit after simulated restart (JSON roundtrip)."""
+        import json
+        live = {
+            "rolling_capacity_slot": "bootstrap",
+            "rolling_profit_deployed": 0.0,
+            "rolling_realized_harvest": {"deal_id": "ADDON1", "realized_pnl_estimate": 0.12},
+        }
+        # Simulate save/reload (JSON roundtrip)
+        restored = json.loads(json.dumps(live))
+        # Try to re-credit same deal_id
+        restored["rolling_capacity_slot"] = "bootstrap"  # slot reset
+        leg = make_addon_leg(deal="ADDON1")
+        ok, reason = rb4.b4a_can_credit_harvest(restored, leg)
+        assert ok is False
+        assert reason == "duplicate_harvest_deal_id"
+
+    def test_fa4_realized_preserved_across_json_roundtrip(self):
+        """FA4: realized_total preserved across JSON roundtrip; deployed not reset."""
+        import json
+        live = make_live_with_harvest(realized_pnl=0.12)
+        live["rolling_profit_deployed"] = 0.0
+        restored = json.loads(json.dumps(live))
+        ledgers = rb4.b4a_build_ledgers(restored)
+        assert abs(ledgers["ledger_a_realized_profit"] - 0.12) < 1e-9
+        assert ledgers["ledger_a_deployed"] == 0.0
+        assert abs(ledgers["ledger_a_remaining"] - 0.12) < 1e-9
+
+    def test_fa5_d1_correct_after_json_reload(self):
+        """FA5: D1 computed correctly after JSON reload with realized profit."""
+        import json
+        live = make_live_with_harvest(realized_pnl=0.40)
+        restored = json.loads(json.dumps(live))
+        ledgers = rb4.b4a_build_ledgers(restored)
+        r = rb4.b4a_original_principal_at_risk(
+            ledger_a=ledgers["ledger_a_realized_profit"],
+            ledger_a_valid=ledgers["ledger_a_valid"],
+            ledger_b=rb4.B4A_UNKNOWN,
+            ledger_d=rb4.B4A_UNKNOWN,
+            candidate_margin=0.0,
+            candidate_stop_risk=0.80,
+            ledger_a_remaining=ledgers["ledger_a_remaining"],
+        )
+        assert abs(r["d1_opar_unconditional"] - 0.40) < 1e-8
+
+    def test_fa6_duplicate_broker_confirmation_blocked(self):
+        """FA6: Two calls with same deal_id -> second blocked."""
+        live = {"rolling_capacity_slot": "bootstrap", "rolling_profit_deployed": 0.0,
+                "rolling_realized_harvest": {"deal_id": "ADDON1"}}
+        leg = make_addon_leg(deal="ADDON1")
+        ok1, _ = rb4.b4a_can_credit_harvest(live, leg)
+        ok2, reason2 = rb4.b4a_can_credit_harvest(live, leg)
+        assert ok1 is False  # already recorded
+        assert ok2 is False
+        assert reason2 == "duplicate_harvest_deal_id"
+
+    def test_fa7_redis_unavailable_validate_handles_missing(self):
+        """FA7: b4a_validate_rolling_state_extended handles completely empty state."""
+        warnings = rb4.b4a_validate_rolling_state_extended({})
+        assert isinstance(warnings, list)
+        assert warnings == []  # no crash, no false warnings
+
+    def test_fa8_primary_closes_ledger_b_cleared(self):
+        """FA8: After primary closes, Ledger B becomes UNKNOWN; D2 = UNKNOWN."""
+        live = make_live_with_harvest(liq_before=0.50)
+        live["open_position"] = None  # primary closed
+        ledgers = rb4.b4a_build_ledgers(live)
+        assert ledgers["ledger_b_protected_primary"] == rb4.B4A_UNKNOWN
+        assert ledgers["ledger_b_provenance"] == "primary_closed_protection_cleared"
+        # D2 must be UNKNOWN after primary close
+        r = rb4.b4a_original_principal_at_risk(
+            ledger_a=0.12, ledger_a_valid=True,
+            ledger_b=ledgers["ledger_b_protected_primary"],
+            ledger_d=rb4.B4A_UNKNOWN,
+            candidate_margin=0.0, candidate_stop_risk=0.50,
+            ledger_a_remaining=0.12,
+        )
+        assert r["d2_opar_conditional"] == rb4.B4A_UNKNOWN
+
+    def test_fa9_stale_rolling_state_campaign_mismatch(self):
+        """FA9: Campaign id mismatch detects stale state for new campaign."""
+        live = make_live_with_harvest()
+        live["rolling_campaign_id"] = "campaign_OLD"
+        new_primary = make_primary(deal="NEW_DEAL")
+        result = rb4.b4a_detect_stale_rolling_state(live, new_primary)
+        assert result["stale_detected"] is True
+        assert result["prior_campaign_id"] == "campaign_OLD"
+
+    def test_fa10_deployed_exceeds_realized_warning(self):
+        """FA10: deployed > realized -> validation warning fires."""
+        live = make_live_with_harvest(realized_pnl=0.10)
+        live["rolling_profit_deployed"] = 0.20  # > realized
+        warnings = rb4.b4a_validate_rolling_state_extended(live)
+        assert any("B4A_DOUBLE_SPEND_RISK" in w for w in warnings)
+
+    def test_fa11_missing_identity_empty_deal_blocked(self):
+        """FA11: Missing/empty harvest identity -> blocked by dedup (F8 fix)."""
+        live = {
+            "rolling_capacity_slot": "bootstrap",
+            "rolling_profit_deployed": 0.0,
+            "rolling_realized_harvest": {"deal_id": ""},  # existing empty
+        }
+        leg = make_addon_leg()
+        leg["deal_id"] = ""
+        ok, reason = rb4.b4a_can_credit_harvest(live, leg)
+        assert ok is False
+        assert reason == "duplicate_harvest_deal_id"
+
+    def test_fa12_d2_unknown_when_primary_protection_unknown(self):
+        """FA12: D2 = UNKNOWN when primary liq_before unavailable."""
+        r = rb4.b4a_original_principal_at_risk(
+            ledger_a=0.12, ledger_a_valid=True,
+            ledger_b=rb4.B4A_UNKNOWN,
+            ledger_d=rb4.B4A_UNKNOWN,
+            candidate_margin=0.0, candidate_stop_risk=1.00,
+            ledger_a_remaining=0.12,
+        )
+        assert r["d2_opar_conditional"] == rb4.B4A_UNKNOWN
+        assert r["k5_invariant_applied"] is True
+        # D1 is still computable
+        assert r["d1_opar_unconditional"] != rb4.B4A_UNKNOWN

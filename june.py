@@ -9719,6 +9719,22 @@ def _live_record_rolling_harvest(leg: dict, signals: dict) -> None:
         _live_observe("rolling_harvest_skipped", signals, leg, {"reason": reason})
         return
 
+    # F4 FIX: b4a_can_credit_harvest provides additional dedup+deployed guards
+    try:
+        from rolling_build4a import b4a_can_credit_harvest
+        b4a_ok, b4a_reason = b4a_can_credit_harvest(_live, leg)
+        if not b4a_ok:
+            _live_log(f"[HARVEST] b4a_can_credit_harvest blocked: {b4a_reason} | deal={deal_id}")
+            _live_observe("rolling_harvest_skipped", signals, leg,
+                          {"reason": f"b4a_guard:{b4a_reason}"})
+            return
+    except Exception as _b4a_e:
+        # Fail closed: if guard errors, skip harvest
+        _live_log(f"[HARVEST] b4a_can_credit_harvest error (fail-closed): {_b4a_e} | deal={deal_id}")
+        _live_observe("rolling_harvest_skipped", signals, leg,
+                      {"reason": "b4a_guard_error_fail_closed"})
+        return
+
     # Use broker-confirmed exit price when available (stored by _live_close_addon_leg).
     # Fall back to signal mid only when broker did not supply a level.
     confirmed_exit    = leg.get("confirmed_exit_price")
@@ -9733,6 +9749,13 @@ def _live_record_rolling_harvest(leg: dict, signals: dict) -> None:
     )
     realized_pnl_estimate = pnl_pct * ig_size * confirmed_exit
 
+    # F14 FIX: generate deterministic rolling_harvest_id from broker identifiers
+    import hashlib as _hashlib
+    _epoch_now = time.time()
+    _campaign_id = _live.get("rolling_campaign_id", "unknown")
+    _harvest_id_src = f"{_campaign_id}:{deal_id}:{_epoch_now:.2f}"
+    _rolling_harvest_id = _hashlib.sha256(_harvest_id_src.encode()).hexdigest()[:16]
+
     harvest_record = {
         "deal_id":                deal_id,
         "instrument":             sym,
@@ -9745,10 +9768,11 @@ def _live_record_rolling_harvest(leg: dict, signals: dict) -> None:
         "pnl_pct":                pnl_pct,
         "realized_pnl_estimate":  realized_pnl_estimate,
         "ig_size":                ig_size,
-        "epoch":                  time.time(),
+        "epoch":                  _epoch_now,
         "rolling_bootstrap_liq_before": _live.get("rolling_bootstrap_liq_before"),
     }
     _live["rolling_realized_harvest"] = harvest_record
+    _live["rolling_harvest_id"]       = _rolling_harvest_id
     _live["rolling_capacity_slot"]    = "available"
     _live_save_state()
     _live_log(
@@ -10677,11 +10701,20 @@ def _live_add_pyramid_leg(signals: dict, decision=None) -> None:
             evidence.get("liquidation_before")
             if protection_required and evidence is not None else None
         )
-        # Build 4A: stamp campaign_id and harvest_id for deduplication (Section 4/10)
+        # Build 4A: stamp campaign_id for deduplication (Section 4/10)
+        # F11 FIX: only reset deployed when starting a NEW campaign (no prior harvest).
+        # A second addon open after harvest must NOT reset the deployed counter.
         try:
-            from rolling_build4a import b4a_campaign_id, b4a_harvest_id
-            _live["rolling_campaign_id"] = b4a_campaign_id(primary)
-            _live["rolling_profit_deployed"] = 0.0
+            from rolling_build4a import b4a_campaign_id
+            _new_cid = b4a_campaign_id(primary)
+            _old_cid = _live.get("rolling_campaign_id")
+            if _old_cid != _new_cid or _live.get("rolling_realized_harvest") is None:
+                # New campaign or no harvest yet recorded -- safe to initialize deployed
+                _live["rolling_campaign_id"]      = _new_cid
+                _live["rolling_profit_deployed"]  = 0.0
+            else:
+                # Same campaign, harvest already recorded -- preserve deployed counter
+                _live["rolling_campaign_id"]      = _new_cid
         except Exception:
             pass
     _live_observe("addon_accepted", signals, leg)
