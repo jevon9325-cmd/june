@@ -6819,6 +6819,14 @@ def _live_load_state() -> bool:
             except Exception as _ve:
                 import logging
                 logging.warning("rolling_state_validation_error: %s", _ve)
+            # Build 4A: extended validation supplement
+            try:
+                from rolling_build4a import b4a_validate_rolling_state_extended
+                _b4a_warns = b4a_validate_rolling_state_extended(_live)
+                for _bw in _b4a_warns:
+                    logging.warning("B4A rolling state: %s", _bw)
+            except Exception as _b4a_ve:
+                logging.warning("B4A extended validation error (non-fatal): %s", _b4a_ve)
             return True
     except Exception:
         pass
@@ -9051,6 +9059,19 @@ def _live_close_position(exit_reason: str, signals: dict) -> None:
     if _close_valid and not _close_rows:
         _live.pop("manual_review_required", None)
         _live.pop("orphan_suspected", None)
+    # Build 4A: Campaign cleanup -- clear rolling state so new campaign starts clean.
+    # Section 11: rolling state must not leak into a later campaign for same instrument.
+    try:
+        from rolling_build4a import b4a_clear_campaign_rolling_state
+        _b4a_cleared = b4a_clear_campaign_rolling_state(_live, reason=exit_reason)
+        if _b4a_cleared:
+            _live_log(
+                f"[B4A] Campaign rolling state cleared on {exit_reason}: "
+                f"{list(_b4a_cleared.keys())}"
+            )
+    except Exception as _b4a_ce:
+        import logging
+        logging.warning("B4A campaign cleanup error (non-fatal): %s", _b4a_ce)
     _live_save_state()
 
 
@@ -9248,6 +9269,12 @@ def _live_partial_tp_exit(signals: dict) -> None:
                                    broker_positions_response=_ptp_post)
             _live_capture_active("before_primary_clear")
             _live["open_position"] = None
+            # Build 4A: campaign cleanup on partial TP position absence
+            try:
+                from rolling_build4a import b4a_clear_campaign_rolling_state as _b4a_clr
+                _b4a_clr(_live, reason="position_absence_on_partial_tp")
+            except Exception:
+                pass
             _live_save_state()
             return
         _expected_remaining = round(ig_sz - half_sz, 4)
@@ -9809,28 +9836,113 @@ def _live_evaluate_rolling_replacement(signals: dict) -> None:
         return
 
     # ── Generation cap ──────────────────────────────────────────────────────
+    # -- Generation cap + Build 4A second invariant (Section 13) --
     replacement_gen = 2
+    # First invariant: _ROLLING_MAX_GENERATIONS (Build 3 retained)
     if replacement_gen > _ROLLING_MAX_GENERATIONS:
-        eval_result["reason"] = "generation_cap_disabled_in_build_3"
-        eval_result["would_be_generation"]    = replacement_gen
+        eval_result["reason"] = "generation_cap_disabled_build_3_and_4a"
+        eval_result["would_be_generation"]     = replacement_gen
         eval_result["rolling_max_generations"] = _ROLLING_MAX_GENERATIONS
-        eval_result["note"] = (
-            f"gen-{replacement_gen} economically eligible but blocked: "
-            f"_ROLLING_MAX_GENERATIONS={_ROLLING_MAX_GENERATIONS}; "
-            f"enable in Build 4 after independent audit"
-        )
+
+        # Build 4A Sections 8/14/15: compute full replacement economics for telemetry.
+        # Gen-2 economics are OBSERVED ONLY. No submission. Second guard enforced below.
+        _b4a_ledgers = {}
+        _b4a_econ    = {}
+        _b4a_cf      = {}
+        _b4a_lev     = {}
+        try:
+            from rolling_build4a import (
+                b4a_build_ledgers, b4a_compute_replacement_economics,
+                b4a_policy_counterfactuals, b4a_leverage_observability,
+                b4a_gen2_submission_guard, B4A_UNKNOWN,
+            )
+            sym_e = primary.get("instrument", "")
+            sig_e = (signals or {}).get(sym_e, {})
+            px_e  = sig_e.get("price", 0.0)
+            sp_e  = sig_e.get("spread_pct", 0.0)
+            _b4a_ledgers = b4a_build_ledgers(_live)
+            _b4a_econ = b4a_compute_replacement_economics(
+                primary=primary,
+                harvest_rec=_live.get("rolling_realized_harvest") or {},
+                ledgers=_b4a_ledgers,
+                live_min_deal=_live_min_deal,
+                live_margin=_live_margin,
+                live_campaign_unit_fn=_live_campaign_unit,
+                live_compute_ig_size_fn=_live_compute_ig_size,
+                mindeal_oversize_max=_MINDEAL_OVERSIZE_MAX,
+                current_price=px_e,
+                spread_pct=sp_e,
+            )
+            _stop_dist = primary.get("stop_dist", 0.0)
+            _ig_sz     = primary.get("ig_size", 0.0)
+            _r_prim    = _stop_dist * _ig_sz if (_stop_dist and _ig_sz) else B4A_UNKNOWN
+            _r_prov    = (
+                "stop_dist_x_ig_size_approximation"
+                if _r_prim != B4A_UNKNOWN else "unknown_stop_dist_not_available"
+            )
+            _b4a_cf = b4a_policy_counterfactuals(
+                economics=_b4a_econ, ledgers=_b4a_ledgers,
+                harvest_rec=_live.get("rolling_realized_harvest") or {},
+                r_primary=_r_prim, r_primary_provenance=_r_prov,
+            )
+            _b4a_lev = b4a_leverage_observability(
+                primary=primary, harvest_rec=_live.get("rolling_realized_harvest") or {},
+                ledgers=_b4a_ledgers, economics=_b4a_econ, r_primary=_r_prim,
+            )
+            # Second invariant: submission boundary guard (Section 13)
+            _b4a_blocked, _b4a_block_reason = b4a_gen2_submission_guard(
+                replacement_gen, _ROLLING_MAX_GENERATIONS,
+                "_live_evaluate_rolling_replacement",
+            )
+            eval_result["b4a_submission_guard"] = {
+                "blocked":          _b4a_blocked,
+                "reason":           _b4a_block_reason,
+                "second_invariant": True,
+            }
+        except Exception as _b4a_err:
+            import logging
+            logging.warning("B4A economics computation error (non-fatal): %s", _b4a_err)
+
+        eval_result.update({
+            "b4a_ledgers":          _b4a_ledgers,
+            "b4a_replacement_econ": _b4a_econ,
+            "b4a_counterfactuals":  _b4a_cf,
+            "b4a_leverage_obs":     _b4a_lev,
+            "note": (
+                "gen-%d economically eligible but blocked: "
+                "_ROLLING_MAX_GENERATIONS=%d; "
+                "Build 4A observation-only; enable in Build 4B after policy selection"
+            ) % (replacement_gen, _ROLLING_MAX_GENERATIONS),
+        })
         _live_log(
-            f"[ROLLING] gen-{replacement_gen} eligible but BLOCKED "
-            f"(_ROLLING_MAX_GENERATIONS={_ROLLING_MAX_GENERATIONS}, Build 3)"
+            "[B4A] gen-%d eligible but BLOCKED "
+            "(_ROLLING_MAX_GENERATIONS=%d, Build 4A)" % (
+                replacement_gen, _ROLLING_MAX_GENERATIONS)
         )
-        _live_observe("rolling_replacement_eval", signals, primary, eval_result)
+        _live_observe("rolling_replacement_eval_b4a", signals, primary, eval_result)
         _live["rolling_replacement_eval"] = eval_result
+        _live["rolling_b4a_telemetry"] = {
+            "epoch": time.time(), "ledgers": _b4a_ledgers,
+            "replacement_econ": _b4a_econ, "counterfactuals": _b4a_cf,
+            "leverage_obs": _b4a_lev,
+        }
         _live_save_state()
         return
 
-    # Build 3 invariant: this branch must never be reached.
-    eval_result["reason"] = "build3_invariant_violation_gen2_would_submit"
-    _live_log("\U0001F6A8 BUILD 3 INVARIANT VIOLATION: gen-2 reached submission gate -- BLOCKED")
+    # Build 3 + Build 4A invariant: this branch must never be reached.
+    # Both _ROLLING_MAX_GENERATIONS and b4a_gen2_submission_guard block above.
+    eval_result["reason"] = "build3_build4a_invariant_violation_gen2_would_submit"
+    _live_log("\U0001F6A8 BUILD 4A INVARIANT VIOLATION: gen-2 reached submission gate -- BLOCKED")
+    try:
+        from rolling_build4a import b4a_gen2_submission_guard as _b4a_guard
+        _viol_blocked, _viol_reason = _b4a_guard(
+            replacement_gen, _ROLLING_MAX_GENERATIONS, "invariant_violation_path"
+        )
+        eval_result["b4a_violation_guard"] = {
+            "blocked": _viol_blocked, "reason": _viol_reason
+        }
+    except Exception:
+        pass
     _live_observe("rolling_replacement_eval", signals, primary, eval_result)
     _live["rolling_replacement_eval"] = eval_result
     _live_save_state()
@@ -10565,6 +10677,13 @@ def _live_add_pyramid_leg(signals: dict, decision=None) -> None:
             evidence.get("liquidation_before")
             if protection_required and evidence is not None else None
         )
+        # Build 4A: stamp campaign_id and harvest_id for deduplication (Section 4/10)
+        try:
+            from rolling_build4a import b4a_campaign_id, b4a_harvest_id
+            _live["rolling_campaign_id"] = b4a_campaign_id(primary)
+            _live["rolling_profit_deployed"] = 0.0
+        except Exception:
+            pass
     _live_observe("addon_accepted", signals, leg)
     _live_observe("addon_opened", signals, leg)
     _live.pop("pyramid_entry_pending", None)
@@ -11612,6 +11731,11 @@ def _live_reconcile_positions() -> None:
         _live_log("=" * 58)
         _live_capture_active("before_primary_clear")
         _live["open_position"] = None
+        try:
+            from rolling_build4a import b4a_clear_campaign_rolling_state as _b4a_clr
+            _b4a_clr(_live, reason="stale_state_cleared_at_startup")
+        except Exception:
+            pass
         _live.pop("manual_review_required", None)  # cascade fully resolved — unblock closes
 
 
