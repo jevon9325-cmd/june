@@ -312,7 +312,7 @@ class RuntimeTests(CaptureTests):
         ns['_current_cycle_signals_snap'] = {}
         for name in ('_live_poll_balance', '_live_poll_pnl', '_live_check_skim',
                      '_live_publish_eligible_instruments', '_live_check_circuit_breaker',
-                     '_live_update_defensive_mode', '_live_close_all_addon_legs'):
+                     '_live_update_defensive_mode', '_live_close_all_addon_legs', '_live_settle_primary_exit', '_live_mark_settled', '_ls_confirmed_pnl'):
             ns[name] = Mock()
         ns['_redis']().get.return_value = None
         ns['run_live_step']({'GOLD': {'price': 100}})

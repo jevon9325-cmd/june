@@ -440,6 +440,7 @@ _ls_account:         dict   = {}             # latest ACCOUNT subscription field
 _ls_account_lock            = threading.Lock()
 _ls_connected:       bool   = False          # True when LS status starts with CONNECTED
 _ls_confirms_closed: set    = set()          # deal_ids confirmed FULLY_CLOSED via TRADE stream
+_ls_confirms_pnl:    dict   = {}             # B4CA2: deal_id -> {profit, epic} broker-confirmed close P&L
 _ls_confirms_lock           = threading.Lock()
 _june_live_trading_enabled: bool = False  # kill switch: must be True via Redis to place live orders
 _live_lot_sizes: dict = {}   # sym -> IG lotSize from LIVE API (populated in _live_startup)
@@ -8561,6 +8562,17 @@ def _ls_init_session(endpoint: str, cst: str, xst: str, account_id: str) -> None
                         if closed_id:
                             with _ls_confirms_lock:
                                 _ls_confirms_closed.add(closed_id)
+                                # B4CA2: retain broker-confirmed close P&L for settlement.
+                                _pf = payload.get('profit')
+                                if _pf is not None:
+                                    try:
+                                        _ls_confirms_pnl[closed_id] = {
+                                            'profit': float(_pf),
+                                            'epic': payload.get('epic'),
+                                            'level': deal.get('level'),
+                                        }
+                                    except (TypeError, ValueError):
+                                        pass
                             print(
                                 f"[{_ts()}] [LS TRADE] CONFIRMS FULLY_CLOSED: {closed_id}"
                                 f" epic={payload.get('epic')} profit={payload.get('profit')}",
@@ -8615,6 +8627,13 @@ def _ls_deal_closed(deal_id: str) -> bool:
     """True if LS TRADE stream confirmed deal_id as FULLY_CLOSED."""
     with _ls_confirms_lock:
         return deal_id in _ls_confirms_closed
+def _ls_confirmed_pnl(deal_id: str):
+    """B4CA2: broker-confirmed realized P&L for a FULLY_CLOSED deal, or None.
+    Returns a dict {profit, epic, level} exactly as delivered by the LS TRADE
+    stream, or None if no confirmed P&L is available. NEVER fabricates a value."""
+    with _ls_confirms_lock:
+        rec = _ls_confirms_pnl.get(deal_id)
+        return dict(rec) if rec else None
 
 
 def _ls_position_guard_check(sym: str, deal_id: str) -> tuple:
@@ -8634,6 +8653,141 @@ def _ls_position_guard_check(sym: str, deal_id: str) -> tuple:
         return (None, "unavailable")
     return (any(row["position"]["dealId"] == deal_id for row in rows), "REST-deal")
 
+
+# ── Build 4C-A2: canonical primary-exit settlement contract ──────────────────
+def _live_settlement_key(pos: dict) -> str:
+    """Stable idempotency identity for a primary settlement.
+    Prefers broker deal_id; falls back to a deterministic composite so a
+    deal-less position still settles at most once."""
+    did = (pos or {}).get("deal_id") or ""
+    if did:
+        return f"deal:{did}"
+    return "compos:%s:%s:%s" % (
+        (pos or {}).get("instrument", "?"),
+        (pos or {}).get("fill_price", "?"),
+        int((pos or {}).get("entry_time", 0) or 0),
+    )
+
+def _live_already_settled(pos: dict) -> bool:
+    key = _live_settlement_key(pos)
+    return key in set(_live.get("settled_primary_keys", []) or [])
+
+def _live_mark_settled(pos: dict) -> None:
+    key = _live_settlement_key(pos)
+    ss = list(_live.get("settled_primary_keys", []) or [])
+    if key not in ss:
+        ss.append(key)
+        _live["settled_primary_keys"] = ss[-200:]  # bounded
+
+def _live_settle_primary_exit(pos: dict, exit_reason: str, source: str,
+                              *, confirmed_pnl=None, confirmed_exit_price=None,
+                              signals: dict = None) -> None:
+    """THE canonical primary-exit recorder for exits NOT already recorded by the
+    June-managed DELETE path. Idempotent (at most one economic record per exit).
+
+    Provenance rules (UNKNOWN MUST NEVER SILENTLY BECOME ZERO):
+      - confirmed_pnl is a real number  -> CONFIRMED (broker realized P&L, e.g. LS 'profit')
+      - else confirmed_exit_price known -> CONFIRMED (fill-estimate from entry/exit/notional)
+      - else                            -> PROVISIONAL: dollar_pnl/pnl_pct = None (UNKNOWN),
+                                           recorded for later reconciliation, NOT fed to
+                                           adaptive consumers (win-rate/observer) until reconciled.
+    Released margin is NOT profit; estimated mid is NOT broker-confirmed.
+    """
+    if not pos:
+        return
+    # Idempotency: at most one settlement per broker exit.
+    if _live_already_settled(pos):
+        return
+    sym  = pos.get("instrument", "?")
+    dirn = pos.get("direction", "?")
+    fill_px = pos.get("fill_price", 0.0)
+    deal_id = pos.get("deal_id", "")
+    entry_t = pos.get("entry_time", time.time())
+    hold_min = (time.time() - entry_t) / 60.0
+    lot_sz_c = _live_lot_sizes.get(sym, _LIVE_LOT_SIZE_FX)
+    _mid = (signals or {}).get(sym, {}).get("price", fill_px)
+    notional = pos.get("original_notional", pos.get("notional",
+                        pos.get("ig_size", 1) * lot_sz_c * (_mid or fill_px)))
+    commission = _IG_EQUITY_COMMISSION_USD * 2 if sym in _live_equity_cfd else 0.0
+    partial_pnl = pos.get("partial_dollar_pnl", 0.0)
+
+    # Determine provenance.
+    settlement_state = "PROVISIONAL"
+    pnl_provenance   = "unknown_pending_reconciliation"
+    exit_price = None
+    dollar_pnl = None
+    pnl_pct    = None
+    if isinstance(confirmed_pnl, (int, float)):
+        settlement_state = "CONFIRMED"
+        pnl_provenance   = "broker_confirmed_realized_pnl"
+        dollar_pnl = float(confirmed_pnl) + partial_pnl
+        if confirmed_exit_price is not None:
+            exit_price = float(confirmed_exit_price)
+        if notional and notional > 0:
+            pnl_pct = round(dollar_pnl / notional, 6)
+    elif isinstance(confirmed_exit_price, (int, float)) and fill_px:
+        settlement_state = "CONFIRMED"
+        pnl_provenance   = "broker_confirmed_exit_price_fill_estimate"
+        exit_price = float(confirmed_exit_price)
+        _p = (exit_price - fill_px) / fill_px if dirn == "long" else (fill_px - exit_price) / fill_px
+        gross = notional * _p
+        dollar_pnl = round(gross - commission + partial_pnl, 4)
+        pnl_pct = round((gross + partial_pnl) / notional, 6) if notional > 0 else None
+    # else: PROVISIONAL — dollar_pnl/pnl_pct stay None (UNKNOWN, never 0).
+
+    rec = {
+        "instrument":  sym,
+        "direction":   dirn,
+        "deal_id":     deal_id,
+        "entry_price": fill_px,
+        "exit_price":  exit_price,                 # None when UNKNOWN
+        "ig_size":     pos.get("original_ig_size", pos.get("ig_size", 0)),
+        "notional":    round(notional, 2) if notional else None,
+        "pnl_pct":     pnl_pct,                    # None when UNKNOWN
+        "dollar_pnl":  (round(dollar_pnl, 4) if dollar_pnl is not None else None),
+        "partial_dollar_pnl": round(partial_pnl, 4),
+        "commission":  round(commission, 2),
+        "pnl_source":  pnl_provenance,
+        "settlement_state": settlement_state,
+        "settlement_source": source,               # e.g. ls_fully_closed / reconciliation.flat / close_guard_absent
+        "hold_min":    round(hold_min, 1),
+        "exit_epoch":  int(time.time()),
+        "exit_reason": exit_reason,
+        "conviction":  pos.get("conviction", 0),
+        "reconciled":  settlement_state == "CONFIRMED",
+        "B4CA2":       True,
+    }
+    # Append to live history + durable Redis list exactly once.
+    hist = _live.setdefault("trade_history", [])
+    hist.append(rec)
+    if len(hist) > 50:
+        _live["trade_history"] = hist[-50:]
+    try:
+        _rh = _redis()
+        _rh.lpush(_LIVE_TRADE_HIST_KEY, json.dumps(rec))
+        _rh.ltrim(_LIVE_TRADE_HIST_KEY, 0, _LIVE_TRADE_HIST_CAP - 1)
+        _rh.expire(_LIVE_TRADE_HIST_KEY, _LIVE_TRADE_HIST_TTL)
+    except Exception:
+        pass
+    _live_mark_settled(pos)
+    # Feed adaptive consumers ONCE, and ONLY on CONFIRMED P&L (never train on UNKNOWN).
+    if settlement_state == "CONFIRMED" and dollar_pnl is not None:
+        _sar = (signals or {}).get(sym, {}).get("spread_atr_ratio")
+        try:
+            _live_perf_record(sym, dollar_pnl > 0, _sar, pnl_dollar=dollar_pnl,
+                              entry_sar=pos.get("entry_sar"),
+                              persistence_confirmed=pos.get("persistence_confirmed"))
+        except Exception as _pexc:
+            _live_log(f"[SETTLE] perf_record failed (non-fatal): {_pexc}")
+    _live_observe("primary_settled", signals, pos, {
+        "settlement_state": settlement_state, "settlement_source": source,
+        "pnl_provenance": pnl_provenance, "dollar_pnl": dollar_pnl,
+        "exit_reason": exit_reason, "B4CA2": True})
+    _live_log(
+        f"[SETTLE] {sym} {dirn} {settlement_state} via {source} | "
+        + (f"P&L ${dollar_pnl:+.4f}" if dollar_pnl is not None else "P&L UNKNOWN (provisional)")
+        + f" | {exit_reason} | deal={deal_id or 'n/a'}"
+    )
 
 def _live_close_position(exit_reason: str, signals: dict) -> None:
     """Close the current live position with a deal-specific IG DELETE.
@@ -8686,6 +8840,13 @@ def _live_close_position(exit_reason: str, signals: dict) -> None:
             _live_log(f"{sym}: inventory unavailable; attempting protective deal-specific DELETE")
         if _guard_open is False:
             _live_capture_evidence(pos, "position_absence_observed", observation_source=_guard_src, expected_exit_reason=exit_reason)
+            # B4CA2_WIRED: settle this broker-side exit before reconciling/clearing.
+            _b4ca2_lspnl = _ls_confirmed_pnl(deal_id) if deal_id else None
+            _live_settle_primary_exit(
+                pos, exit_reason, source=f"close_guard_absent:{_guard_src}",
+                confirmed_pnl=(_b4ca2_lspnl.get('profit') if _b4ca2_lspnl else None),
+                confirmed_exit_price=(_b4ca2_lspnl.get('level') if _b4ca2_lspnl else None),
+                signals=signals)
             _live_log(
                 f"⚠️  {sym}: position already gone [{_guard_src}] — "
                 f"suppressed. Reconciling."
@@ -8813,10 +8974,14 @@ def _live_close_position(exit_reason: str, signals: dict) -> None:
             "reversal_exit_trigger_source": (pos.get("reversal_exit_trigger_source")
                                              if exit_reason == "reversal" else None),
         }
+        trade_rec["deal_id"] = deal_id  # B4CA2: identity for cross-path dedup
+        trade_rec["settlement_state"] = "CONFIRMED"
+        trade_rec["settlement_source"] = "june_managed_close"
         hist = _live.setdefault("trade_history", [])
         hist.append(trade_rec)
         if len(hist) > 50:
             _live["trade_history"] = hist[-50:]
+        _live_mark_settled(pos)  # B4CA2: prevent later reconcile double-record
         try:
             _rh = _redis()
             _rh.lpush(_LIVE_TRADE_HIST_KEY, json.dumps(trade_rec))
@@ -9495,6 +9660,13 @@ def _live_check_exit(signals: dict, regime: str) -> None:
             f"[LS] {sym}: TRADE stream confirmed FULLY_CLOSED deal={_ls_chk_id} "
             f"— reconciling state (broker stop/TP detected proactively)"
         )
+        # B4CA2_WIRED: settle the LS-confirmed broker exit before reconcile clears it.
+        _b4ca2_lspnl = _ls_confirmed_pnl(_ls_chk_id)
+        _live_settle_primary_exit(
+            pos, "broker_ls_fully_closed", source="ls_fully_closed",
+            confirmed_pnl=(_b4ca2_lspnl.get('profit') if _b4ca2_lspnl else None),
+            confirmed_exit_price=(_b4ca2_lspnl.get('level') if _b4ca2_lspnl else None),
+            signals=signals)
         _live_reconcile_positions()
         _live_save_state()
         return
@@ -12254,6 +12426,13 @@ def _live_reconcile_positions() -> None:
         _live_capture_evidence(june_pos, "position_absence_observed", observation_source="reconciliation.flat_check", broker_positions_response=_evidence_positions_response)
         sym     = june_pos.get("instrument", "?")
         deal_id = june_pos.get("deal_id", "?")
+        # B4CA2_WIRED: settle the disappeared primary before clearing state.
+        _b4ca2_lspnl = _ls_confirmed_pnl(deal_id) if deal_id and deal_id != '?' else None
+        _live_settle_primary_exit(
+            june_pos, "broker_side_disappearance", source="reconciliation.flat_check",
+            confirmed_pnl=(_b4ca2_lspnl.get('profit') if _b4ca2_lspnl else None),
+            confirmed_exit_price=(_b4ca2_lspnl.get('level') if _b4ca2_lspnl else None),
+            signals=None)
         _live_log("=" * 58)
         _live_log("** STALE STATE CLEARED **")
         _live_log(f"   June state: {sym} {june_pos.get('direction','?').upper()} deal={deal_id}")
