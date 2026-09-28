@@ -36,6 +36,7 @@ from __future__ import annotations
 # Reservation lifecycle states
 AVAILABLE   = "AVAILABLE"
 RESERVED    = "RESERVED"
+ATTEMPTED   = "ATTEMPTED"   # broker POST about to be / was sent; exposure UNKNOWN
 SUBMITTED   = "SUBMITTED"
 OPEN        = "OPEN"
 HARVESTED   = "HARVESTED"
@@ -74,7 +75,7 @@ def a_remaining(live: dict) -> float:
     total = _num(total_raw)
     res = live.get(RESERVATION_KEY) or {}
     committed = 0.0
-    if res.get("state") in (RESERVED, SUBMITTED, OPEN):
+    if res.get("state") in (RESERVED, ATTEMPTED, SUBMITTED, OPEN):
         committed = _num(res.get("amount", 0.0))
     deployed = _num(live.get("rolling_profit_deployed", 0.0) or 0.0)
     return round(total - committed - deployed, 8)
@@ -86,7 +87,7 @@ def reconcile_invariant(live: dict) -> None:
     total = _num(harvest.get("realized_pnl_estimate", 0.0) or 0.0)
     deployed = _num(live.get("rolling_profit_deployed", 0.0) or 0.0)
     res = live.get(RESERVATION_KEY) or {}
-    committed = _num(res.get("amount", 0.0)) if res.get("state") in (RESERVED, SUBMITTED, OPEN) else 0.0
+    committed = _num(res.get("amount", 0.0)) if res.get("state") in (RESERVED, ATTEMPTED, SUBMITTED, OPEN) else 0.0
     rem = a_remaining(live)
     if round(total - deployed - committed - rem, 8) != 0.0:
         raise FuelError(
@@ -109,7 +110,7 @@ def can_reserve(live: dict, amount, campaign_id: str, deal_id_expected=None) -> 
     if not campaign_id:
         return False, "campaign_id_missing"
     res = live.get(RESERVATION_KEY) or {}
-    if res.get("state") in (RESERVED, SUBMITTED, OPEN):
+    if res.get("state") in (RESERVED, ATTEMPTED, SUBMITTED, OPEN):
         return False, f"reservation_active:{res.get('state')}"
     if res.get("campaign_id") and res.get("campaign_id") != campaign_id and res.get("state") not in _TERMINAL and res.get("state") is not None:
         return False, "reservation_campaign_mismatch"
@@ -153,6 +154,25 @@ def reserve(live: dict, amount, campaign_id: str, reservation_id: str, *, save) 
     return dict(record)
 
 
+def mark_attempted(live: dict, reservation_id: str, *, save) -> dict:
+    """RESERVED -> ATTEMPTED, persisted BEFORE the broker POST is issued.
+
+    After this transition, the system must treat the gen-2 order as POSSIBLY
+    EXISTING at the broker. Fuel stays committed. A lost/timed-out POST can no
+    longer be mistaken for "never sent": reconciliation will not release an
+    ATTEMPTED reservation without positive broker evidence of absence.
+    """
+    res = live.get(RESERVATION_KEY) or {}
+    if res.get("reservation_id") != reservation_id:
+        raise FuelError("reservation_id mismatch on attempt")
+    if res.get("state") not in (RESERVED, ATTEMPTED):
+        raise FuelError(f"cannot mark_attempted from state {res.get('state')}")
+    res["state"] = ATTEMPTED
+    live[RESERVATION_KEY] = res
+    save()
+    return dict(res)
+
+
 def mark_submitted(live: dict, reservation_id: str, deal_ref, *, save) -> dict:
     """Record the broker dealReference immediately after POST returns.
 
@@ -161,7 +181,7 @@ def mark_submitted(live: dict, reservation_id: str, deal_ref, *, save) -> dict:
     res = live.get(RESERVATION_KEY) or {}
     if res.get("reservation_id") != reservation_id:
         raise FuelError("reservation_id mismatch on submit")
-    if res.get("state") not in (RESERVED, SUBMITTED):
+    if res.get("state") not in (RESERVED, ATTEMPTED, SUBMITTED):
         raise FuelError(f"cannot submit from state {res.get('state')}")
     res["state"] = SUBMITTED
     res["deal_ref"] = deal_ref
@@ -195,8 +215,9 @@ def release(live: dict, reservation_id: str, reason: str, *, save) -> dict:
     res = live.get(RESERVATION_KEY) or {}
     if res.get("reservation_id") != reservation_id:
         raise FuelError("reservation_id mismatch on release")
-    if res.get("state") not in (RESERVED, SUBMITTED):
-        raise FuelError(f"cannot release from state {res.get('state')} (would strand a real order)")
+    if res.get("state") != RESERVED:
+        raise FuelError(f"cannot release from state {res.get('state')} "
+                        f"(post-attempt release requires proven broker absence)")
     res["state"] = RELEASED
     res["release_reason"] = reason
     live[RESERVATION_KEY] = res
@@ -251,9 +272,43 @@ def settle_loss(live: dict, reservation_id: str, *, save) -> dict:
 def active_reservation(live: dict):
     """Return the active (non-terminal) reservation dict, or None."""
     res = live.get(RESERVATION_KEY) or {}
-    if res.get("state") in (RESERVED, SUBMITTED, OPEN):
+    if res.get("state") in (RESERVED, ATTEMPTED, SUBMITTED, OPEN):
         return dict(res)
     return None
+
+
+def release_proven_absent(live: dict, reservation_id: str, reason: str, *, save) -> dict:
+    """Release an ATTEMPTED/SUBMITTED reservation ONLY when the caller has
+    POSITIVELY established (via broker truth) that the intended deal does not
+    exist -- e.g. a broker-confirmed REJECTED status for a known dealReference.
+    This is the ONLY sanctioned way to reverse a post-attempt reservation."""
+    res = live.get(RESERVATION_KEY) or {}
+    if res.get("reservation_id") != reservation_id:
+        raise FuelError("reservation_id mismatch on proven-absent release")
+    if res.get("state") not in (ATTEMPTED, SUBMITTED):
+        raise FuelError(f"proven-absent release invalid from state {res.get('state')}")
+    res["state"] = RELEASED
+    res["release_reason"] = reason
+    live[RESERVATION_KEY] = res
+    save()
+    reconcile_invariant(live)
+    return dict(res)
+
+
+def mark_ambiguous(live: dict, reservation_id: str, reason: str, *, save) -> dict:
+    """Annotate an ATTEMPTED reservation whose broker outcome cannot be resolved
+    from available identifiers. State stays ATTEMPTED (fuel locked, no new gen-2);
+    we only add operator-visible telemetry. Never releases fuel."""
+    res = live.get(RESERVATION_KEY) or {}
+    if res.get("reservation_id") != reservation_id:
+        raise FuelError("reservation_id mismatch on mark_ambiguous")
+    if res.get("state") not in (ATTEMPTED, SUBMITTED):
+        raise FuelError(f"mark_ambiguous invalid from state {res.get('state')}")
+    res["ambiguous"] = True
+    res["ambiguous_reason"] = reason
+    live[RESERVATION_KEY] = res
+    save()
+    return dict(res)
 
 
 def reconcile_on_load(live: dict, *, broker_deal_ids, save) -> dict:
@@ -275,29 +330,38 @@ def reconcile_on_load(live: dict, *, broker_deal_ids, save) -> dict:
     """
     res = live.get(RESERVATION_KEY) or {}
     state = res.get("state")
-    if state not in (RESERVED, SUBMITTED, OPEN):
+    if state not in (RESERVED, ATTEMPTED, SUBMITTED, OPEN):
         return {"action": "none", "state": state}
     rid = res.get("reservation_id")
     deal_id = res.get("deal_id")
     if state == RESERVED:
-        # No broker call happened yet (reserve persists before POST). Safe to release.
-        release(live, rid, "restart_reserved_no_submission", save=save)
+        # RESERVED means the durable ATTEMPTED transition never happened, so the
+        # broker POST was NEVER issued (mark_attempted persists strictly before POST).
+        # Safe to release and restore fuel.
+        release(live, rid, "restart_reserved_no_submission_attempted", save=save)
         return {"action": "released", "from": RESERVED}
-    if state == SUBMITTED:
+    if state in (ATTEMPTED, SUBMITTED):
+        # A broker POST MAY have reached IG. We must not treat "no response" as
+        # "no order". Resolve ONLY with positive broker evidence.
         if broker_deal_ids is None:
-            return {"action": "retained_unknown_inventory", "state": SUBMITTED}
+            # Unknown inventory -> fail closed, keep committed, block new gen-2.
+            return {"action": "retained_unknown_inventory", "state": state}
         if deal_id and deal_id in broker_deal_ids:
             mark_open(live, rid, deal_id, save=save)
             return {"action": "opened", "deal_id": deal_id}
-        if not deal_id and any(True for _ in ()):  # no deal_id path
-            pass
-        # deal_id unknown or not present in a VERIFIED inventory: the order did
-        # not open under a known id. Only release when inventory is verified
-        # (empty set or populated set that lacks our ref-derived id).
-        # We cannot map deal_ref->deal_id here, so require a known deal_id to keep
-        # an order; absent that, verified inventory means release is safe.
-        release(live, rid, "restart_submitted_absent_in_verified_inventory", save=save)
-        return {"action": "released", "from": SUBMITTED}
+        if deal_id and deal_id not in broker_deal_ids:
+            # We KNOW this deal id and it is provably absent from a verified
+            # inventory -> the order did not open (or already closed pre-open).
+            release_proven_absent(live, rid, "verified_absent_known_deal_id", save=save)
+            return {"action": "released_known_absent", "from": state}
+        # No dealId known (lost POST response). A verified inventory that does not
+        # contain a matchable id does NOT prove our order is absent, because an
+        # async fill could appear after the read. Fail closed: stay locked,
+        # annotate ambiguous, require operator/broker-history resolution.
+        mark_ambiguous(live, rid,
+                       "lost_post_response_no_deal_id_unresolvable_from_inventory", save=save)
+        return {"action": "ambiguous_locked", "state": state,
+                "reason": "lost_post_no_dealid"}
     # OPEN: leave for the normal close/harvest path.
     return {"action": "open_retained", "deal_id": deal_id}
 
@@ -306,4 +370,4 @@ def needs_broker_reconciliation(live: dict) -> bool:
     """True if a reservation is SUBMITTED with unknown open/closed status
     (the fail-closed state that must be resolved from broker truth on restart)."""
     res = live.get(RESERVATION_KEY) or {}
-    return res.get("state") == SUBMITTED
+    return res.get("state") in (ATTEMPTED, SUBMITTED)
