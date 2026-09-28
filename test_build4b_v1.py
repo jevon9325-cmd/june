@@ -149,9 +149,10 @@ class TestReconcileOnLoad:
         assert rf.active_reservation(live)["state"] == rf.OPEN
 
     def test_submitted_released_when_verified_absent(self):
+        # Known dealId provably absent from a verified inventory -> proven-absence release.
         live = live_with_reservation(rf.SUBMITTED, deal_id="deal-XYZ")
         act = rf.reconcile_on_load(live, broker_deal_ids={"other-deal"}, save=Saver())
-        assert act["action"] == "released"
+        assert act["action"] == "released_known_absent"
         assert rf.active_reservation(live) is None
 
     def test_submitted_retained_on_unknown_inventory(self):
@@ -216,3 +217,213 @@ class TestFuelReconciliation:
         rf.settle_harvest(live, "res1", 2.0, save=s)
         # after harvest settle, reservation is terminal -> fuel un-committed
         assert rf.a_remaining(live) == pytest.approx(5.0)
+
+
+# ── D-1 REPAIR: ATTEMPTED state + lost-POST fail-closed ──────────────────────
+class TestD1LostPost:
+    def _s(self):
+        class S:
+            def __init__(s): s.n = 0
+            def __call__(s): s.n += 1
+        return S()
+
+    def _live_reserved(self, realized=5.0):
+        return {"rolling_realized_harvest": {"deal_id": "GEN1", "realized_pnl_estimate": realized,
+                                             "exit_price_source": "broker_confirmed"},
+                "rolling_profit_deployed": 0.0, "rolling_campaign_id": "campaign_P1"}
+
+    def test_attempted_state_exists(self):
+        assert hasattr(rf, "ATTEMPTED")
+
+    def test_mark_attempted_before_post(self):
+        live = self._live_reserved(); s = self._s()
+        rf.reserve(live, 1.27, "campaign_P1", "r1", save=s)
+        rf.mark_attempted(live, "r1", save=s)
+        assert live[rf.RESERVATION_KEY]["state"] == rf.ATTEMPTED
+        assert rf.a_remaining(live) == pytest.approx(5.0 - 1.27)  # still committed
+
+    def test_reserved_release_ok_but_attempted_cannot_plain_release(self):
+        live = self._live_reserved(); s = self._s()
+        rf.reserve(live, 1.27, "campaign_P1", "r1", save=s)
+        rf.mark_attempted(live, "r1", save=s)
+        with pytest.raises(rf.FuelError):
+            rf.release(live, "r1", "should_fail", save=s)  # plain release forbidden post-attempt
+
+    def test_lost_post_attempted_no_dealid_stays_locked(self):
+        """T5/T6: ATTEMPTED, no dealId, verified inventory -> ambiguous_locked, NOT released."""
+        live = self._live_reserved(); s = self._s()
+        rf.reserve(live, 1.27, "campaign_P1", "r1", save=s)
+        rf.mark_attempted(live, "r1", save=s)  # POST about to happen; response lost
+        act = rf.reconcile_on_load(live, broker_deal_ids={"unrelated"}, save=s)
+        assert act["action"] == "ambiguous_locked"
+        assert rf.active_reservation(live)["state"] == rf.ATTEMPTED  # still committed/locked
+        assert rf.a_remaining(live) == pytest.approx(5.0 - 1.27)  # fuel NOT restored
+
+    def test_lost_post_attempted_unknown_inventory_retained(self):
+        live = self._live_reserved(); s = self._s()
+        rf.reserve(live, 1.27, "campaign_P1", "r1", save=s)
+        rf.mark_attempted(live, "r1", save=s)
+        act = rf.reconcile_on_load(live, broker_deal_ids=None, save=s)
+        assert act["action"] == "retained_unknown_inventory"
+        assert rf.active_reservation(live)["state"] == rf.ATTEMPTED
+
+    def test_attempted_known_deal_present_opens(self):
+        live = self._live_reserved(); s = self._s()
+        rf.reserve(live, 1.27, "campaign_P1", "r1", save=s)
+        rf.mark_attempted(live, "r1", save=s)
+        rf.mark_submitted(live, "r1", "ref1", save=s)
+        # broker truth: we learned the dealId and it is present at broker
+        live[rf.RESERVATION_KEY]["deal_id"] = "deal-1"
+        act = rf.reconcile_on_load(live, broker_deal_ids={"deal-1"}, save=s)
+        assert act["action"] == "opened"
+
+    def test_needs_reconciliation_covers_attempted(self):
+        live = self._live_reserved(); s = self._s()
+        rf.reserve(live, 1.27, "campaign_P1", "r1", save=s)
+        rf.mark_attempted(live, "r1", save=s)
+        assert rf.needs_broker_reconciliation(live) is True
+
+
+# ── D-2 REPAIR: gen-2 terminal settlement live-wired ─────────────────────────
+class TestD2Settlement:
+    def test_settle_harvest_reachable_and_uncommits(self):
+        live = {"rolling_realized_harvest": {"deal_id": "GEN1", "realized_pnl_estimate": 5.0,
+                                             "exit_price_source": "broker_confirmed"},
+                "rolling_profit_deployed": 0.0, "rolling_campaign_id": "campaign_P1"}
+        s = type("S", (), {"__call__": lambda self: None})()
+        rf.reserve(live, 1.27, "campaign_P1", "r1", save=s)
+        rf.mark_attempted(live, "r1", save=s)
+        rf.mark_submitted(live, "r1", "ref1", save=s)
+        rf.mark_open(live, "r1", "deal1", save=s)
+        rf.settle_harvest(live, "r1", 2.0, save=s)
+        assert live[rf.RESERVATION_KEY]["state"] == rf.SETTLED
+        assert rf.a_remaining(live) == pytest.approx(5.0)  # fuel un-committed
+
+    def test_settle_loss_consumes_once(self):
+        live = {"rolling_realized_harvest": {"deal_id": "GEN1", "realized_pnl_estimate": 5.0,
+                                             "exit_price_source": "broker_confirmed"},
+                "rolling_profit_deployed": 0.0, "rolling_campaign_id": "campaign_P1"}
+        s = type("S", (), {"__call__": lambda self: None})()
+        rf.reserve(live, 1.27, "campaign_P1", "r1", save=s)
+        rf.mark_attempted(live, "r1", save=s)
+        rf.mark_submitted(live, "r1", "ref1", save=s)
+        rf.mark_open(live, "r1", "deal1", save=s)
+        rf.settle_loss(live, "r1", save=s)
+        assert live["rolling_profit_deployed"] == pytest.approx(1.27)
+        with pytest.raises(rf.FuelError):
+            rf.settle_loss(live, "r1", save=s)  # cannot settle twice
+
+    def test_production_settle_helper_exists(self):
+        import june
+        assert hasattr(june, "_live_settle_gen2_reservation")
+
+    def test_settle_functions_wired_in_production(self):
+        import pathlib
+        src = pathlib.Path(june_path()).read_text(encoding="utf-8")
+        assert "settle_harvest(" in src and "settle_loss(" in src
+        assert src.count("_live_settle_gen2_reservation(leg") >= 3  # 3 close paths
+
+
+# ── D-1 REPAIR: ATTEMPTED state + lost-POST fail-closed ──────────────────────
+class TestD1LostPost:
+    def _s(self):
+        class S:
+            def __init__(s): s.n = 0
+            def __call__(s): s.n += 1
+        return S()
+
+    def _live_reserved(self, realized=5.0):
+        return {"rolling_realized_harvest": {"deal_id": "GEN1", "realized_pnl_estimate": realized,
+                                             "exit_price_source": "broker_confirmed"},
+                "rolling_profit_deployed": 0.0, "rolling_campaign_id": "campaign_P1"}
+
+    def test_attempted_state_exists(self):
+        assert hasattr(rf, "ATTEMPTED")
+
+    def test_mark_attempted_before_post(self):
+        live = self._live_reserved(); s = self._s()
+        rf.reserve(live, 1.27, "campaign_P1", "r1", save=s)
+        rf.mark_attempted(live, "r1", save=s)
+        assert live[rf.RESERVATION_KEY]["state"] == rf.ATTEMPTED
+        assert rf.a_remaining(live) == pytest.approx(5.0 - 1.27)  # still committed
+
+    def test_reserved_release_ok_but_attempted_cannot_plain_release(self):
+        live = self._live_reserved(); s = self._s()
+        rf.reserve(live, 1.27, "campaign_P1", "r1", save=s)
+        rf.mark_attempted(live, "r1", save=s)
+        with pytest.raises(rf.FuelError):
+            rf.release(live, "r1", "should_fail", save=s)  # plain release forbidden post-attempt
+
+    def test_lost_post_attempted_no_dealid_stays_locked(self):
+        """T5/T6: ATTEMPTED, no dealId, verified inventory -> ambiguous_locked, NOT released."""
+        live = self._live_reserved(); s = self._s()
+        rf.reserve(live, 1.27, "campaign_P1", "r1", save=s)
+        rf.mark_attempted(live, "r1", save=s)  # POST about to happen; response lost
+        act = rf.reconcile_on_load(live, broker_deal_ids={"unrelated"}, save=s)
+        assert act["action"] == "ambiguous_locked"
+        assert rf.active_reservation(live)["state"] == rf.ATTEMPTED  # still committed/locked
+        assert rf.a_remaining(live) == pytest.approx(5.0 - 1.27)  # fuel NOT restored
+
+    def test_lost_post_attempted_unknown_inventory_retained(self):
+        live = self._live_reserved(); s = self._s()
+        rf.reserve(live, 1.27, "campaign_P1", "r1", save=s)
+        rf.mark_attempted(live, "r1", save=s)
+        act = rf.reconcile_on_load(live, broker_deal_ids=None, save=s)
+        assert act["action"] == "retained_unknown_inventory"
+        assert rf.active_reservation(live)["state"] == rf.ATTEMPTED
+
+    def test_attempted_known_deal_present_opens(self):
+        live = self._live_reserved(); s = self._s()
+        rf.reserve(live, 1.27, "campaign_P1", "r1", save=s)
+        rf.mark_attempted(live, "r1", save=s)
+        rf.mark_submitted(live, "r1", "ref1", save=s)
+        # broker truth: we learned the dealId and it is present at broker
+        live[rf.RESERVATION_KEY]["deal_id"] = "deal-1"
+        act = rf.reconcile_on_load(live, broker_deal_ids={"deal-1"}, save=s)
+        assert act["action"] == "opened"
+
+    def test_needs_reconciliation_covers_attempted(self):
+        live = self._live_reserved(); s = self._s()
+        rf.reserve(live, 1.27, "campaign_P1", "r1", save=s)
+        rf.mark_attempted(live, "r1", save=s)
+        assert rf.needs_broker_reconciliation(live) is True
+
+
+# ── D-2 REPAIR: gen-2 terminal settlement live-wired ─────────────────────────
+class TestD2Settlement:
+    def test_settle_harvest_reachable_and_uncommits(self):
+        live = {"rolling_realized_harvest": {"deal_id": "GEN1", "realized_pnl_estimate": 5.0,
+                                             "exit_price_source": "broker_confirmed"},
+                "rolling_profit_deployed": 0.0, "rolling_campaign_id": "campaign_P1"}
+        s = type("S", (), {"__call__": lambda self: None})()
+        rf.reserve(live, 1.27, "campaign_P1", "r1", save=s)
+        rf.mark_attempted(live, "r1", save=s)
+        rf.mark_submitted(live, "r1", "ref1", save=s)
+        rf.mark_open(live, "r1", "deal1", save=s)
+        rf.settle_harvest(live, "r1", 2.0, save=s)
+        assert live[rf.RESERVATION_KEY]["state"] == rf.SETTLED
+        assert rf.a_remaining(live) == pytest.approx(5.0)  # fuel un-committed
+
+    def test_settle_loss_consumes_once(self):
+        live = {"rolling_realized_harvest": {"deal_id": "GEN1", "realized_pnl_estimate": 5.0,
+                                             "exit_price_source": "broker_confirmed"},
+                "rolling_profit_deployed": 0.0, "rolling_campaign_id": "campaign_P1"}
+        s = type("S", (), {"__call__": lambda self: None})()
+        rf.reserve(live, 1.27, "campaign_P1", "r1", save=s)
+        rf.mark_attempted(live, "r1", save=s)
+        rf.mark_submitted(live, "r1", "ref1", save=s)
+        rf.mark_open(live, "r1", "deal1", save=s)
+        rf.settle_loss(live, "r1", save=s)
+        assert live["rolling_profit_deployed"] == pytest.approx(1.27)
+        with pytest.raises(rf.FuelError):
+            rf.settle_loss(live, "r1", save=s)  # cannot settle twice
+
+    def test_production_settle_helper_exists(self):
+        import june
+        assert hasattr(june, "_live_settle_gen2_reservation")
+
+    def test_settle_functions_wired_in_production(self):
+        import pathlib
+        src = pathlib.Path(june_path()).read_text(encoding="utf-8")
+        assert "settle_harvest(" in src and "settle_loss(" in src
+        assert src.count("_live_settle_gen2_reservation(leg") >= 3  # 3 close paths

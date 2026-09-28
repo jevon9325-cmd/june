@@ -43,7 +43,8 @@ def close_harness(direction="long", symbol="GOLD"):
     for name in ("_live_observe", "_live_log", "_live_save_state", "_live_reconcile_positions",
                  "_live_capture_evidence", "_live_capture_active",
                  "_live_update_streak", "_live_write_htf_event", "_live_perf_record",
-                 "_sim_15m_record", "_live_check_phase"):
+                 "_sim_15m_record", "_live_check_phase",
+                 "_live_settle_gen2_reservation"):
         ns[name] = Mock()
     exec(compile(ast.Module(body=functions, type_ignores=[]), "extracted_june_closes", "exec"), ns)
     return ns
