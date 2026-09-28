@@ -10256,7 +10256,8 @@ def _live_v1_submit_gen2_replacement(signals: dict, primary: dict) -> None:
     try:
         _redis().set(_LIVE_REDIS_KEY, json.dumps(_live), ex=_LIVE_REDIS_TTL)
     except Exception as exc:
-        # Persist failed after reservation: release reservation (no order sent yet).
+        # Persist failed BEFORE the durable attempt marker and BEFORE any POST:
+        # no order was sent, safe to release (reservation still RESERVED).
         _live_log(f"[V1] gen-2 aborted: pending-intent persist failed; releasing reservation: {exc}")
         try:
             _rf.release(_live, reservation_id, "pending_intent_persist_failed", save=_live_save_state)
@@ -10265,12 +10266,32 @@ def _live_v1_submit_gen2_replacement(signals: dict, primary: dict) -> None:
         _live.pop("pyramid_entry_pending", None)
         return
 
+    # D-1: persist ATTEMPTED durably BEFORE the POST. After this point a lost/timed-out
+    # response can NEVER be mistaken for "order never sent"; fuel stays committed and
+    # reconciliation will not release without positive broker evidence of absence.
+    try:
+        _rf.mark_attempted(_live, reservation_id, save=_live_save_state)
+    except Exception as exc:
+        # Could not durably record the attempt -> do NOT POST (no order sent yet).
+        _live_log(f"[V1] gen-2 aborted: attempt-state persist failed; no order sent: {exc}")
+        try:
+            _rf.release(_live, reservation_id, "attempt_state_persist_failed", save=_live_save_state)
+        except Exception:
+            pass
+        _live.pop("pyramid_entry_pending", None)
+        return
     resp = _ig_live_post("/positions/otc", body, version="1")
     if not resp:
-        # POST returned nothing: outcome UNKNOWN. Do NOT release blindly (order may
-        # exist). Leave reservation RESERVED and pending-intent for reconciliation.
+        # POST returned nothing: broker outcome UNKNOWN and the order MAY exist.
+        # D-1: reservation is ATTEMPTED (committed); mark it ambiguous so it stays
+        # locked (fail closed, no further gen-2) until broker truth resolves it.
+        try:
+            _rf.mark_ambiguous(_live, reservation_id,
+                               "lost_post_response_outcome_unknown", save=_live_save_state)
+        except Exception:
+            pass
         _live_log("[V1] gen-2 POST returned no response -- outcome UNKNOWN, "
-                  "reservation retained for reconciliation")
+                  "reservation ATTEMPTED+ambiguous, fuel locked for reconciliation")
         return
     deal_ref = resp.get("dealReference", "")
     try:
@@ -10285,9 +10306,10 @@ def _live_v1_submit_gen2_replacement(signals: dict, primary: dict) -> None:
         return
     status = confirm.get("dealStatus")
     if status == "REJECTED":
-        # Proven the order did not open -> release reservation, restore fuel.
+        # Broker positively confirmed the order did NOT open (REJECTED for our ref).
+        # This is proven absence -> release via the proof-carrying path.
         try:
-            _rf.release(_live, reservation_id, "broker_rejected", save=_live_save_state)
+            _rf.release_proven_absent(_live, reservation_id, "broker_rejected", save=_live_save_state)
         except Exception:
             pass
         _live.pop("pyramid_entry_pending", None)
@@ -10330,6 +10352,54 @@ def _live_v1_submit_gen2_replacement(signals: dict, primary: dict) -> None:
     _live_observe("v1_gen2_opened", signals, primary, leg)
 
 
+def _live_settle_gen2_reservation(leg: dict, confirmed_exit_price=None,
+                                  exit_price_source: str = "unknown") -> None:
+    """D-2: settle a gen-2 leg's fuel reservation exactly once on terminal close.
+
+    Idempotent: only acts when there is an OPEN reservation whose reservation_id
+    matches this leg. Uses broker-confirmed exit price when available to decide
+    harvest (P&L >= 0) vs loss (P&L < 0); a mid-fallback is explicitly labeled.
+
+    Gen-2 profit is recorded as realized (settle_harvest un-commits the reserved
+    fuel) but is NON-REDEPLOYABLE in V1: the generation cap (2) and the single-
+    reservation guard prevent it from ever financing another gen-2 or a gen-3.
+    """
+    import rolling_fuel as _rf
+    if leg.get("leg_generation") != 2:
+        return
+    rid = leg.get("reservation_id")
+    if not rid:
+        return
+    res = _live.get(_rf.RESERVATION_KEY) or {}
+    if res.get("state") != _rf.OPEN or res.get("reservation_id") != rid:
+        return  # not open / different reservation -> nothing to settle (idempotent)
+    fill_px = leg.get("fill_price", 0.0)
+    dirn    = leg.get("direction", "long")
+    if confirmed_exit_price is None:
+        confirmed_exit_price = leg.get("confirmed_exit_price")
+        exit_price_source    = leg.get("exit_price_source", exit_price_source)
+    try:
+        if confirmed_exit_price is not None and fill_px:
+            pnl_pct = ((confirmed_exit_price - fill_px) / fill_px if dirn == "long"
+                       else (fill_px - confirmed_exit_price) / fill_px)
+            realized = pnl_pct * leg.get("ig_size", 0.0) * confirmed_exit_price
+        else:
+            # No broker-confirmed exit -> cannot compute a trustworthy P&L.
+            # Fail closed to LOSS settlement (fuel consumed), never invent profit.
+            realized = None
+        if realized is not None and realized >= 0:
+            _rf.settle_harvest(_live, rid, realized, save=_live_save_state)
+            _live_log(f"[V1] gen-2 reservation SETTLED harvest ~${realized:+.4f} "
+                      f"(src={exit_price_source}) -- non-redeployable in V1")
+        else:
+            _rf.settle_loss(_live, rid, save=_live_save_state)
+            _live_log(f"[V1] gen-2 reservation SETTLED loss (fuel consumed) "
+                      f"(src={exit_price_source})")
+    except Exception as _exc:
+        import logging
+        logging.warning("D-2 gen-2 settlement error (reservation retained): %s", _exc)
+
+
 def _live_close_addon_leg(leg: dict, exit_reason: str, signals: dict) -> None:
     # Closed-leg net economics are not yet certified for future defensive adds.
     if _live.get("open_position"):
@@ -10360,6 +10430,9 @@ def _live_close_addon_leg(leg: dict, exit_reason: str, signals: dict) -> None:
         if _g_open is False:
             _live_capture_evidence(leg, "position_absence_observed", observation_source=_g_src, expected_exit_reason=exit_reason)
             _live_log(f"[PYRAMID] {sym}: addon already gone [{_g_src}] -- clearing tracking")
+            # D-2: gen-2 leg gone without a broker exit price -> fail-closed loss settle.
+            _live_settle_gen2_reservation(leg, confirmed_exit_price=None,
+                                          exit_price_source="position_absence_no_price")
             _live_capture_active("before_addon_tracking_replace")
             _live["pyramid_legs"] = [l for l in _live.get("pyramid_legs", [])
                                      if l.get("deal_id") != deal_id]
@@ -10415,6 +10488,9 @@ def _live_close_addon_leg(leg: dict, exit_reason: str, signals: dict) -> None:
             f"✅ PYRAMID LEG CLOSED: {sym} @ {real_exit:.5f} "
             f"({real_pnl_p*100:+.3f}%) | {exit_reason}"
         )
+        # D-2: settle a gen-2 reservation on this broker-confirmed close (exactly once).
+        _live_settle_gen2_reservation(leg, confirmed_exit_price=real_exit,
+                                      exit_price_source=_exit_src)
         _live_capture_active("before_addon_tracking_replace")
         _live["pyramid_legs"] = [l for l in _live.get("pyramid_legs", [])
                                   if l.get("deal_id") != deal_id]
@@ -10493,6 +10569,9 @@ def _live_check_pyramid_exits(signals: dict) -> None:
                                      if l.get("deal_id") != deal_id]
             if not _live["pyramid_legs"]:
                 _live["pyramid_agg_stop_level"] = None
+            # D-2: LS-detected gen-2 close has no broker exit price -> fail-closed loss settle.
+            _live_settle_gen2_reservation(leg, confirmed_exit_price=None,
+                                          exit_price_source="ls_close_price_unknown")
             _live_save_state()
             # F4 FIX: attempt fail-closed harvest recording via existing dedup guards.
             # No broker exit price available from LS stream alone -- mark source explicitly.
