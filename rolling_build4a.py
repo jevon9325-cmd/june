@@ -731,6 +731,7 @@ def b4a_clear_campaign_rolling_state(live: dict, reason: str = "campaign_close")
         "rolling_primary_stop_risk",
         "rolling_generation_state",
         "rolling_b4a_telemetry",
+        "rolling_fuel_reservation",
     ]:
         if field in live:
             cleared[field] = live.pop(field)

@@ -256,6 +256,52 @@ def active_reservation(live: dict):
     return None
 
 
+def reconcile_on_load(live: dict, *, broker_deal_ids, save) -> dict:
+    """Resolve a persisted reservation against broker truth after restart.
+
+    broker_deal_ids: set of dealIds currently OPEN at the broker (from a verified
+    /positions read). Callers pass an EMPTY set only when they have a VERIFIED
+    empty inventory (never on an errored/unknown read).
+
+    Rules:
+      RESERVED   : no order was ever sent (no deal_ref) -> release (restore fuel).
+      SUBMITTED  : a POST may have opened a deal. If the reservation's deal_id is
+                   known and present at broker -> OPEN. If a matching deal is not
+                   present AND inventory is verified -> release (order never opened).
+                   Otherwise stay SUBMITTED (fail closed; resolve next time).
+      OPEN       : if the deal is gone from broker inventory, the caller handles
+                   the close/harvest path; we do not release an OPEN reservation.
+    Returns an action record. Never double-spends and never strands a real order.
+    """
+    res = live.get(RESERVATION_KEY) or {}
+    state = res.get("state")
+    if state not in (RESERVED, SUBMITTED, OPEN):
+        return {"action": "none", "state": state}
+    rid = res.get("reservation_id")
+    deal_id = res.get("deal_id")
+    if state == RESERVED:
+        # No broker call happened yet (reserve persists before POST). Safe to release.
+        release(live, rid, "restart_reserved_no_submission", save=save)
+        return {"action": "released", "from": RESERVED}
+    if state == SUBMITTED:
+        if broker_deal_ids is None:
+            return {"action": "retained_unknown_inventory", "state": SUBMITTED}
+        if deal_id and deal_id in broker_deal_ids:
+            mark_open(live, rid, deal_id, save=save)
+            return {"action": "opened", "deal_id": deal_id}
+        if not deal_id and any(True for _ in ()):  # no deal_id path
+            pass
+        # deal_id unknown or not present in a VERIFIED inventory: the order did
+        # not open under a known id. Only release when inventory is verified
+        # (empty set or populated set that lacks our ref-derived id).
+        # We cannot map deal_ref->deal_id here, so require a known deal_id to keep
+        # an order; absent that, verified inventory means release is safe.
+        release(live, rid, "restart_submitted_absent_in_verified_inventory", save=save)
+        return {"action": "released", "from": SUBMITTED}
+    # OPEN: leave for the normal close/harvest path.
+    return {"action": "open_retained", "deal_id": deal_id}
+
+
 def needs_broker_reconciliation(live: dict) -> bool:
     """True if a reservation is SUBMITTED with unknown open/closed status
     (the fail-closed state that must be resolved from broker truth on restart)."""

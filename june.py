@@ -6829,10 +6829,48 @@ def _live_load_state() -> bool:
                     logging.warning("B4A rolling state: %s", _bw)
             except Exception as _b4a_ve:
                 logging.warning("B4A extended validation error (non-fatal): %s", _b4a_ve)
+            # Build 4B: reconcile any persisted gen-2 fuel reservation vs broker truth.
+            try:
+                _live_reconcile_fuel_reservation()
+            except Exception as _fr_e:
+                logging.warning("fuel reservation reconcile error (non-fatal): %s", _fr_e)
             return True
     except Exception:
         pass
     return False
+
+
+def _live_reconcile_fuel_reservation() -> None:
+    """Reconcile a persisted gen-2 fuel reservation against VERIFIED broker truth.
+
+    Called on state load (restart). Reads /positions; only passes a deal-id set
+    to rolling_fuel.reconcile_on_load when the inventory read is VERIFIED (a real
+    list). On an errored/unknown read, passes None so SUBMITTED reservations stay
+    fail-closed rather than being released against unverified absence.
+    """
+    import rolling_fuel as _rf
+    res = _live.get(_rf.RESERVATION_KEY) or {}
+    if res.get("state") not in (_rf.RESERVED, _rf.SUBMITTED, _rf.OPEN):
+        return
+    broker_ids = None
+    try:
+        data = _ig_live_get("/positions", version="2")
+        rows = data.get("positions") if isinstance(data, dict) else None
+        if isinstance(rows, list) and all(
+                isinstance(r, dict) and isinstance(r.get("position"), dict)
+                and r["position"].get("dealId") for r in rows):
+            broker_ids = {r["position"]["dealId"] for r in rows}
+    except Exception as _exc:
+        import logging
+        logging.warning("fuel reconcile: broker inventory read failed: %s", _exc)
+        broker_ids = None
+    try:
+        action = _rf.reconcile_on_load(_live, broker_deal_ids=broker_ids, save=_live_save_state)
+        import logging
+        logging.warning("fuel reconcile on load: %s", action)
+    except Exception as _exc:
+        import logging
+        logging.warning("fuel reconcile error (non-fatal, reservation retained): %s", _exc)
 
 
 def _live_validate_rolling_state_on_load() -> None:
