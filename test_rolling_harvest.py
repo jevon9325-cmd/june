@@ -32,14 +32,16 @@ def make_addon_leg(sym="SILVER", dirn="short", fill=6350.0, leg_generation=1):
 def test_rolling_constants_exist():
     import june
     assert hasattr(june, "_ROLLING_MAX_GENERATIONS"), "constant missing"
-    assert june._ROLLING_MAX_GENERATIONS == 1
+    assert june._ROLLING_MAX_GENERATIONS == 2  # V1: one gen-2 permitted
     assert hasattr(june, "_ROLLING_HARVEST_THRESHOLD_PCT"), "constant missing"
     assert june._ROLLING_HARVEST_THRESHOLD_PCT == pytest.approx(0.0025)
 
 
-def test_rolling_max_generations_blocks_gen2():
+def test_rolling_max_generations_blocks_gen3():
+    """V1 permits gen-2 but gen-3 must remain impossible."""
     import june
-    assert june._ROLLING_MAX_GENERATIONS < 2, "gen-2 must be blocked in Build 3"
+    assert june._ROLLING_MAX_GENERATIONS == 2, "V1: gen-2 permitted"
+    assert 3 > june._ROLLING_MAX_GENERATIONS, "gen-3 must remain blocked"
 
 
 # ── Commit 1: leg_generation stamped on open ─────────────────────────────────

@@ -267,11 +267,10 @@ class TestGenerationCap:
         assert result_inel.get("economically_eligible") is False
 
     def test_gen2_order_never_submitted_build3(self):
-        # The constant itself enforces the gate.
+        # V1 supersedes Build-3: gen-2 is now permitted (cap=2), gen-3 impossible.
         import june
-        assert june._ROLLING_MAX_GENERATIONS == 1
-        # gen-2 = 2 > 1 = _ROLLING_MAX_GENERATIONS
-        assert 2 > june._ROLLING_MAX_GENERATIONS
+        assert june._ROLLING_MAX_GENERATIONS == 2
+        assert 3 > june._ROLLING_MAX_GENERATIONS  # gen-3 still blocked
 
 
 # ── C38 Regression Replay ─────────────────────────────────────────────────────

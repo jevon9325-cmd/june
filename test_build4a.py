@@ -631,9 +631,11 @@ class TestGen2SubmissionImpossible:
         assert blocked is False
 
     def test_june_rolling_max_generations_is_1(self):
-        """june._ROLLING_MAX_GENERATIONS == 1 (gen-2 blocked)."""
+        """V1: cap raised to 2 (one gen-2 permitted); gen-3 still impossible."""
         import june
-        assert june._ROLLING_MAX_GENERATIONS == 1
+        assert june._ROLLING_MAX_GENERATIONS == 2
+        # gen-3 must remain impossible
+        assert 3 > june._ROLLING_MAX_GENERATIONS
 
     def test_b4a_can_deploy_profit_blocks(self):
         """b4a_can_deploy_profit always returns False in Build 4A."""
@@ -726,14 +728,13 @@ class TestBuild1Regression:
     def test_build1_stop_sync_constants_present(self):
         """Build-1 stop sync behavior: _ROLLING_MAX_GENERATIONS and stop_sync field."""
         import june
-        # Build-1 invariant: gen-2 submission is blocked by _ROLLING_MAX_GENERATIONS == 1
+        # V1: cap is 2 (one gen-2 permitted); gen-3+ remains impossible.
         assert hasattr(june, "_ROLLING_MAX_GENERATIONS"), (
-            "Build-1 constant _ROLLING_MAX_GENERATIONS missing from june.py"
+            "constant _ROLLING_MAX_GENERATIONS missing from june.py"
         )
-        assert june._ROLLING_MAX_GENERATIONS == 1, (
-            "Build-1: _ROLLING_MAX_GENERATIONS must be 1 to block gen-2"
-        )
-        # Build-1 stop_sync: _live_retry_stop_sync must exist
+        assert june._ROLLING_MAX_GENERATIONS == 2
+        assert 3 > june._ROLLING_MAX_GENERATIONS
+        # Build-1 stop_sync: _live_retry_stop_sync must exist (unchanged)
         assert hasattr(june, "_live_retry_stop_sync"), (
             "Build-1 stop sync function _live_retry_stop_sync missing"
         )

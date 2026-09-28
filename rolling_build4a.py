@@ -884,6 +884,142 @@ def b4a_rolling_path_fail_closed() -> dict:
     }
 
 
+# ---- Profit Upgrade V1: pure self-funding gen-2 admission -------------------
+# Governing rule (from Build-4B reconciliation): additional original-principal
+# risk must purchase additional opportunity. The §2 reconciliation found ZERO
+# historical candidates in the 0.25R incremental band, so V1 uses PURE
+# SELF-FUNDING: realized Ledger-A remaining must fully cover the candidate
+# orderly stop risk, giving D1 == 0. No original principal is placed at risk.
+def b4a_v1_admit_gen2(
+    a_remaining,
+    candidate_stop_risk,
+    ledger_b,
+    r_primary,
+    *,
+    v1_enabled: bool = True,
+    max_generations: int = 2,
+    candidate_generation: int = 2,
+) -> dict:
+    """Pure admission decision for a Profit-Upgrade-V1 gen-2 replacement.
+
+    Returns a dict with admit(bool), reason, d1, d2, fuel_required, policy.
+    FAIL CLOSED on any UNKNOWN input. Never coerces UNKNOWN to 0.
+    D1 must be 0 (self-funded). D2 is reported for telemetry only and never
+    used to authorise the trade or to reduce D1.
+    """
+    result = {
+        "admit": False, "reason": "evaluation_incomplete",
+        "policy": "pure_self_funding_D1_zero",
+        "d1": B4A_UNKNOWN, "d2": B4A_UNKNOWN,
+        "fuel_required": B4A_UNKNOWN,
+        "candidate_generation": candidate_generation,
+    }
+    if not v1_enabled:
+        result["reason"] = "v1_disabled_rollback_flag"
+        return result
+    if candidate_generation > max_generations:
+        result["reason"] = f"generation_{candidate_generation}_exceeds_cap_{max_generations}"
+        return result
+    # Candidate stop risk must be a known positive number.
+    if candidate_stop_risk == B4A_UNKNOWN or not isinstance(candidate_stop_risk, (int, float)):
+        result["reason"] = "candidate_stop_risk_unknown"
+        return result
+    if candidate_stop_risk <= 0:
+        result["reason"] = "candidate_stop_risk_nonpositive"
+        return result
+    # Realized fuel must be a known number.
+    if a_remaining == B4A_UNKNOWN or not isinstance(a_remaining, (int, float)):
+        result["reason"] = "realized_fuel_unknown"
+        return result
+    stop = float(candidate_stop_risk)
+    fuel = float(a_remaining)
+    # D1 via the frozen accounting model (unconditional; reduced only by realized A).
+    opar = b4a_original_principal_at_risk(
+        ledger_a=fuel, ledger_a_valid=(fuel > 0), ledger_b=ledger_b, ledger_d=B4A_UNKNOWN,
+        candidate_margin=0.0, candidate_stop_risk=stop, ledger_a_remaining=fuel)
+    result["d1"] = opar["d1_opar_unconditional"]
+    result["d2"] = opar["d2_opar_conditional"]
+    result["fuel_required"] = round(stop, 8)
+    # Pure self-funding: admit only when realized fuel fully covers the stop (D1==0).
+    if fuel + 1e-9 < stop:
+        result["reason"] = "insufficient_realized_fuel_for_self_funding"
+        return result
+    if result["d1"] == B4A_UNKNOWN or abs(float(result["d1"])) > 1e-9:
+        result["reason"] = "d1_not_zero_self_funding_violated"
+        return result
+    result["admit"] = True
+    result["reason"] = "self_funded_d1_zero"
+    return result
+
+
+# ---- Profit Upgrade V1: pure self-funding gen-2 admission -------------------
+# Governing rule (from Build-4B reconciliation): additional original-principal
+# risk must purchase additional opportunity. The §2 reconciliation found ZERO
+# historical candidates in the 0.25R incremental band, so V1 uses PURE
+# SELF-FUNDING: realized Ledger-A remaining must fully cover the candidate
+# orderly stop risk, giving D1 == 0. No original principal is placed at risk.
+def b4a_v1_admit_gen2(
+    a_remaining,
+    candidate_stop_risk,
+    ledger_b,
+    r_primary,
+    *,
+    v1_enabled: bool = True,
+    max_generations: int = 2,
+    candidate_generation: int = 2,
+) -> dict:
+    """Pure admission decision for a Profit-Upgrade-V1 gen-2 replacement.
+
+    Returns a dict with admit(bool), reason, d1, d2, fuel_required, policy.
+    FAIL CLOSED on any UNKNOWN input. Never coerces UNKNOWN to 0.
+    D1 must be 0 (self-funded). D2 is reported for telemetry only and never
+    used to authorise the trade or to reduce D1.
+    """
+    result = {
+        "admit": False, "reason": "evaluation_incomplete",
+        "policy": "pure_self_funding_D1_zero",
+        "d1": B4A_UNKNOWN, "d2": B4A_UNKNOWN,
+        "fuel_required": B4A_UNKNOWN,
+        "candidate_generation": candidate_generation,
+    }
+    if not v1_enabled:
+        result["reason"] = "v1_disabled_rollback_flag"
+        return result
+    if candidate_generation > max_generations:
+        result["reason"] = f"generation_{candidate_generation}_exceeds_cap_{max_generations}"
+        return result
+    # Candidate stop risk must be a known positive number.
+    if candidate_stop_risk == B4A_UNKNOWN or not isinstance(candidate_stop_risk, (int, float)):
+        result["reason"] = "candidate_stop_risk_unknown"
+        return result
+    if candidate_stop_risk <= 0:
+        result["reason"] = "candidate_stop_risk_nonpositive"
+        return result
+    # Realized fuel must be a known number.
+    if a_remaining == B4A_UNKNOWN or not isinstance(a_remaining, (int, float)):
+        result["reason"] = "realized_fuel_unknown"
+        return result
+    stop = float(candidate_stop_risk)
+    fuel = float(a_remaining)
+    # D1 via the frozen accounting model (unconditional; reduced only by realized A).
+    opar = b4a_original_principal_at_risk(
+        ledger_a=fuel, ledger_a_valid=(fuel > 0), ledger_b=ledger_b, ledger_d=B4A_UNKNOWN,
+        candidate_margin=0.0, candidate_stop_risk=stop, ledger_a_remaining=fuel)
+    result["d1"] = opar["d1_opar_unconditional"]
+    result["d2"] = opar["d2_opar_conditional"]
+    result["fuel_required"] = round(stop, 8)
+    # Pure self-funding: admit only when realized fuel fully covers the stop (D1==0).
+    if fuel + 1e-9 < stop:
+        result["reason"] = "insufficient_realized_fuel_for_self_funding"
+        return result
+    if result["d1"] == B4A_UNKNOWN or abs(float(result["d1"])) > 1e-9:
+        result["reason"] = "d1_not_zero_self_funding_violated"
+        return result
+    result["admit"] = True
+    result["reason"] = "self_funded_d1_zero"
+    return result
+
+
 # ---- Gen-2 submission boundary guard (second invariant) ---------------------
 
 def b4a_gen2_submission_guard(

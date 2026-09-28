@@ -6356,7 +6356,9 @@ _PYRAMID_4LEG_THRESHOLD  = 20     # completions needed to unlock leg 4
 _PYRAMID_3LEG_SIZE_DECAY = 0.75   # leg 3 notional = leg2_notional * 0.75
 _PYRAMID_4LEG_SIZE_DECAY = 0.50   # leg 4 notional = leg2_notional * 0.50
 # ── Build 3: Rolling Harvest / Capacity Recycling ────────────────────────────
-_ROLLING_MAX_GENERATIONS       = 1       # gen-2 replacement blocked until Build 4
+_ROLLING_MAX_GENERATIONS       = 2       # Build-4B V1: one gen-2 replacement permitted
+_ROLLING_V1_ENABLED            = True    # ROLLBACK SWITCH: set False to disable gen-2 submission entirely
+_ROLLING_V1_MAX_MULT           = 1       # V1: gen-2 sized at exactly 1x MINDEAL (no escalation)
 _ROLLING_HARVEST_THRESHOLD_PCT = 0.0025  # 0.25% addon profit floor for harvest
 _RECON_ORPHAN_ESCALATION_THRESHOLD = 4  # consecutive 404+deposit>0 cycles before escalating
 # 4 cycles ~2-4 min: past any plausible IG API settling window for OTC positions.
@@ -10034,23 +10036,260 @@ def _live_evaluate_rolling_replacement(signals: dict) -> None:
         _live_save_state()
         return
 
-    # Build 3 + Build 4A invariant: this branch must never be reached.
-    # Both _ROLLING_MAX_GENERATIONS and b4a_gen2_submission_guard block above.
-    eval_result["reason"] = "build3_build4a_invariant_violation_gen2_would_submit"
-    _live_log("\U0001F6A8 BUILD 4A INVARIANT VIOLATION: gen-2 reached submission gate -- BLOCKED")
-    try:
-        from rolling_build4a import b4a_gen2_submission_guard as _b4a_guard
-        _viol_blocked, _viol_reason = _b4a_guard(
-            replacement_gen, _ROLLING_MAX_GENERATIONS, "invariant_violation_path"
-        )
-        eval_result["b4a_violation_guard"] = {
-            "blocked": _viol_blocked, "reason": _viol_reason
-        }
-    except Exception:
-        pass
+    # ── Profit Upgrade V1: gen-2 replacement is now PERMITTED (cap=2) ──────────
+    # Reaching here means replacement_gen (2) <= _ROLLING_MAX_GENERATIONS (2) and
+    # the campaign is economically eligible. Dispatch to the single audited V1
+    # submission boundary. V1 uses PURE SELF-FUNDING (D1==0). gen-3+ can never
+    # reach here (the > cap branch above handles it as observation-only).
+    eval_result["reason"] = "v1_dispatch"
     _live_observe("rolling_replacement_eval", signals, primary, eval_result)
     _live["rolling_replacement_eval"] = eval_result
     _live_save_state()
+    _live_v1_submit_gen2_replacement(signals, primary)
+
+
+def _live_v1_submit_gen2_replacement(signals: dict, primary: dict) -> None:
+    """THE SINGLE AUDITED GEN-2 BROKER SUBMISSION BOUNDARY (Profit Upgrade V1).
+
+    Grep marker: V1_GEN2_SUBMISSION_BOUNDARY
+
+    Preconditions already established by _live_evaluate_rolling_replacement:
+      - a gen-1 harvest exists and is economically eligible
+      - generation would be 2 and cap == 2
+
+    This function performs, in order:
+      1. all applicable momentum/protection/authority gates
+      2. campaign-identity + capacity + no-existing-gen2 checks
+      3. 1x MINDEAL sizing from live geometry (fail closed if unavailable)
+      4. pure self-funding admission (D1 must be 0)
+      5. durable fuel RESERVATION (persist before any broker call)
+      6. exactly one broker POST, then SUBMITTED persist, confirm, OPEN
+      7. release reservation only on PROVEN broker absence/reject
+
+    Never infers open/close from local intent. Fails closed on UNKNOWN.
+    """
+    import rolling_fuel as _rf
+    from rolling_build4a import b4a_v1_admit_gen2, b4a_build_ledgers, b4a_campaign_id, B4A_UNKNOWN
+
+    # Rollback switch — instant disable.
+    if not _ROLLING_V1_ENABLED:
+        _live_log("[V1] gen-2 disabled by _ROLLING_V1_ENABLED=False")
+        return
+    if not _live_trade_guard():
+        _live_log("[V1] gen-2 blocked: trade guard")
+        return
+    if not _june_live_trading_enabled:
+        _live_log("[V1] gen-2 blocked: new-trade authority disabled")
+        return
+
+    sym  = primary.get("instrument", "")
+    dirn = primary.get("direction", "long")
+
+    # Authority / unresolved-state gates (mirror addon path).
+    if (_live.get("orphan_suspected") or _live.get("manual_review_required")
+            or primary.get("partial_exit_pending") or _live.get("pyramid_entry_pending")):
+        _live_log("[V1] gen-2 blocked: unresolved position/submission state")
+        return
+    # No existing gen-2 order/position (single active reservation in V1).
+    if _rf.active_reservation(_live) is not None:
+        _live_log("[V1] gen-2 blocked: reservation already active")
+        return
+    if any(l.get("leg_generation") == 2 for l in _live.get("pyramid_legs", [])):
+        _live_log("[V1] gen-2 blocked: gen-2 leg already tracked")
+        return
+
+    # A SUBMITTED reservation needing reconciliation must be resolved first.
+    if _rf.needs_broker_reconciliation(_live):
+        _live_log("[V1] gen-2 blocked: prior submission awaiting broker reconciliation")
+        return
+
+    # Campaign identity must match the primary.
+    campaign_id = _live.get("rolling_campaign_id")
+    if not campaign_id or campaign_id != b4a_campaign_id(primary):
+        _live_log("[V1] gen-2 blocked: campaign identity mismatch/absent")
+        return
+
+    # Momentum / performance / regime / market gates.
+    if _live_perf_blocked(sym):
+        _live_log("[V1] gen-2 blocked: performance block")
+        return
+    if sym in _METALS_INSTRUMENTS and _is_metals_weekend_closure():
+        _live_log("[V1] gen-2 blocked: market closed")
+        return
+    if time.time() < _live.get("pause_expiry", {}).get(sym, 0):
+        _live_log("[V1] gen-2 blocked: instrument pause")
+        return
+    if primary.get("deal_id") and _ls_deal_closed(primary["deal_id"]):
+        _live_log("[V1] gen-2 blocked: primary already closed")
+        return
+
+    sig = signals.get(sym, {})
+    mid = sig.get("price", 0.0)
+    if mid <= 0:
+        _live_log("[V1] gen-2 blocked: no price")
+        return
+
+    # 1x MINDEAL sizing from live geometry (fail closed if unavailable).
+    min_deal = _live_min_deal.get(sym)
+    if not min_deal or min_deal <= 0:
+        _live_log("[V1] gen-2 blocked: MINDEAL geometry unavailable")
+        return
+    ig_size = round(min_deal * _ROLLING_V1_MAX_MULT, 4)
+    try:
+        unit = _live_campaign_unit(sym, mid)
+    except Exception as exc:
+        _live_log(f"[V1] gen-2 blocked: unit geometry unavailable: {exc}")
+        return
+    notional = ig_size * unit
+    margin_rate = _live_margin.get(sym, 0.0)
+    margin_req = notional * margin_rate if margin_rate > 0 else None
+
+    # Candidate orderly stop risk from primary stop geometry at campaign stop.
+    stop_pct = primary.get("stop_pct", 0.0)
+    if not stop_pct or stop_pct <= 0:
+        _live_log("[V1] gen-2 blocked: candidate stop_pct unavailable")
+        return
+    candidate_stop_risk = round(ig_size * unit * stop_pct, 8)
+
+    # Margin sufficiency (class B constraint).
+    total   = _live.get("balance_total", 0.0)
+    skimmed = _live.get("skimmed_total", 0.0)
+    equity  = max(0.0, total - skimmed)
+    if margin_req is not None and margin_req > 0.5 * equity:
+        _live_log(f"[V1] gen-2 blocked: margin ${margin_req:.2f} > 50% equity ${equity:.2f}")
+        return
+
+    # Pure self-funding admission (D1 must be 0).
+    ledgers = b4a_build_ledgers(_live)
+    a_rem = _rf.a_remaining(_live)
+    ledger_b = ledgers.get("ledger_b_protected_primary", B4A_UNKNOWN)
+    r_primary = (primary.get("stop_dist", 0.0) or 0.0) * (primary.get("ig_size", 0.0) or 0.0)
+    admit = b4a_v1_admit_gen2(
+        a_remaining=a_rem, candidate_stop_risk=candidate_stop_risk,
+        ledger_b=ledger_b, r_primary=(r_primary or B4A_UNKNOWN),
+        v1_enabled=_ROLLING_V1_ENABLED, max_generations=_ROLLING_MAX_GENERATIONS,
+        candidate_generation=2)
+    if not admit["admit"]:
+        _live_log(f"[V1] gen-2 NOT admitted: {admit['reason']} "
+                  f"(A_rem=${a_rem:.4f} stop=${candidate_stop_risk:.4f} D1={admit['d1']})")
+        _live_observe("v1_gen2_rejected", signals, primary, admit)
+        return
+
+    reservation_id = f"v1res_{campaign_id}_{int(time.time())}"
+    ig_dir = "BUY" if dirn == "long" else "SELL"
+    epic   = INSTRUMENTS.get(sym, "")
+    stop_dist = _live_compute_stop_pts(sym, _PYRAMID_AGG_STOP_PCT, mid)
+
+    # Audit log BEFORE submission (single boundary).
+    _live_log(
+        "[V1_GEN2_SUBMISSION_BOUNDARY] "
+        f"campaign={campaign_id} gen=2 {sym} {ig_dir} ig_size={ig_size} "
+        f"notional=${notional:.2f} margin=${(margin_req or 0):.2f} "
+        f"stop_risk=${candidate_stop_risk:.4f} A_total="
+        f"${(ledgers.get('ledger_a_realized_profit') or 0):.4f} A_rem=${a_rem:.4f} "
+        f"fuel_reserved=${admit['fuel_required']} D1={admit['d1']} D2={admit['d2']} "
+        f"ledgerB_prov={ledgers.get('ledger_b_provenance')} policy={admit['policy']} "
+        f"res_id={reservation_id}"
+    )
+    _live_observe("v1_gen2_admitted", signals, primary,
+                  {**admit, "reservation_id": reservation_id, "ig_size": ig_size,
+                   "notional": notional, "margin_req": margin_req})
+
+    # STEP: durable reservation BEFORE any broker call. Fail closed on persist failure.
+    try:
+        _rf.reserve(_live, admit["fuel_required"], campaign_id, reservation_id,
+                    save=_live_save_state)
+    except Exception as exc:
+        _live_log(f"[V1] gen-2 aborted: fuel reservation failed (no order sent): {exc}")
+        return
+
+    body = {
+        "epic": epic, "expiry": "-", "direction": ig_dir, "size": ig_size,
+        "orderType": "MARKET", "timeInForce": "FILL_OR_KILL", "forceOpen": True,
+        "guaranteedStop": False,
+        "currencyCode": _live_ccy.get(sym, "USD") if sym in _live_equity_cfd else "USD",
+        "stopDistance": stop_dist,
+    }
+    # Mark pending intent (same durable pattern the addon path uses).
+    _live["pyramid_entry_pending"] = {
+        "primary_deal_id": primary.get("deal_id"), "order": body,
+        "gen2_v1": True, "reservation_id": reservation_id,
+        "created_at": time.time(), "status": "submitting"}
+    try:
+        _redis().set(_LIVE_REDIS_KEY, json.dumps(_live), ex=_LIVE_REDIS_TTL)
+    except Exception as exc:
+        # Persist failed after reservation: release reservation (no order sent yet).
+        _live_log(f"[V1] gen-2 aborted: pending-intent persist failed; releasing reservation: {exc}")
+        try:
+            _rf.release(_live, reservation_id, "pending_intent_persist_failed", save=_live_save_state)
+        except Exception:
+            pass
+        _live.pop("pyramid_entry_pending", None)
+        return
+
+    resp = _ig_live_post("/positions/otc", body, version="1")
+    if not resp:
+        # POST returned nothing: outcome UNKNOWN. Do NOT release blindly (order may
+        # exist). Leave reservation RESERVED and pending-intent for reconciliation.
+        _live_log("[V1] gen-2 POST returned no response -- outcome UNKNOWN, "
+                  "reservation retained for reconciliation")
+        return
+    deal_ref = resp.get("dealReference", "")
+    try:
+        _rf.mark_submitted(_live, reservation_id, deal_ref, save=_live_save_state)
+    except Exception as exc:
+        _live_log(f"[V1] gen-2 mark_submitted failed (ref persist): {exc}")
+        return
+
+    confirm = _live_confirm_deal(deal_ref) if deal_ref else None
+    if not confirm:
+        _live_log("[V1] gen-2 confirm UNKNOWN -- reservation stays SUBMITTED for reconciliation")
+        return
+    status = confirm.get("dealStatus")
+    if status == "REJECTED":
+        # Proven the order did not open -> release reservation, restore fuel.
+        try:
+            _rf.release(_live, reservation_id, "broker_rejected", save=_live_save_state)
+        except Exception:
+            pass
+        _live.pop("pyramid_entry_pending", None)
+        _live_save_state()
+        _live_log(f"[V1] gen-2 REJECTED by broker: {confirm.get('reason','?')} -- fuel released")
+        _live_observe("v1_gen2_rejected", signals, primary, {"reason": "broker_rejected"})
+        return
+    if status != "ACCEPTED":
+        _live_log(f"[V1] gen-2 status {status} -- UNKNOWN, reservation stays SUBMITTED")
+        return
+
+    deal_id = confirm.get("dealId", "")
+    fill_price = float(confirm.get("level", mid))
+    fill_size  = float(confirm.get("size", ig_size))
+    if not deal_id or deal_id in {primary.get("deal_id"),
+            *(l.get("deal_id") for l in _live.get("pyramid_legs", []))}:
+        _live_log("[V1] gen-2 accepted but identity missing/duplicate -- reconciliation")
+        return
+    # Broker truth: the deal EXISTS -> reservation OPEN.
+    try:
+        _rf.mark_open(_live, reservation_id, deal_id, save=_live_save_state)
+    except Exception as exc:
+        _live_log(f"[V1] gen-2 mark_open failed: {exc}")
+        return
+
+    # Track the gen-2 leg (leg_generation=2 marks it for harvest routing/dedup).
+    leg = {
+        "instrument": sym, "direction": dirn, "deal_id": deal_id, "deal_ref": deal_ref,
+        "fill_price": fill_price, "ig_size": fill_size, "notional": fill_size * unit,
+        "leg_index": len(_live.get("pyramid_legs", [])) + 2, "leg_generation": 2,
+        "stop_pct": stop_pct, "tp_pct": primary.get("tp_pct", 0.01),
+        "entry_time": time.time(), "broker_stop_level": confirm.get("stopLevel"),
+        "reservation_id": reservation_id, "v1_gen2": True,
+    }
+    _live.setdefault("pyramid_legs", []).append(leg)
+    _live.pop("pyramid_entry_pending", None)
+    _live_save_state()
+    _live_log(f"\u2705 [V1] GEN-2 OPENED: {sym} {ig_dir} @ {fill_price:.5f} "
+              f"deal={deal_id} ig={fill_size} (self-funded, D1=0)")
+    _live_observe("v1_gen2_opened", signals, primary, leg)
 
 
 def _live_close_addon_leg(leg: dict, exit_reason: str, signals: dict) -> None:
