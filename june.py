@@ -8670,7 +8670,24 @@ def _live_settlement_key(pos: dict) -> str:
 
 def _live_already_settled(pos: dict) -> bool:
     key = _live_settlement_key(pos)
-    return key in set(_live.get("settled_primary_keys", []) or [])
+    if key in set(_live.get("settled_primary_keys", []) or []):
+        return True
+    # B4CA2_DURABLE backstop: a crash between the durable history lpush and the
+    # in-memory settled-set persist could otherwise re-settle on restart. Consult
+    # the durable Redis history for this deal_id as a second idempotency source.
+    did = (pos or {}).get("deal_id") or ""
+    if did:
+        try:
+            _rh = _redis()
+            for _raw in _rh.lrange(_LIVE_TRADE_HIST_KEY, 0, 200):
+                try:
+                    if json.loads(_raw).get("deal_id") == did:
+                        return True
+                except Exception:
+                    continue
+        except Exception:
+            pass
+    return False
 
 def _live_mark_settled(pos: dict) -> None:
     key = _live_settlement_key(pos)
@@ -8770,6 +8787,12 @@ def _live_settle_primary_exit(pos: dict, exit_reason: str, source: str,
     except Exception:
         pass
     _live_mark_settled(pos)
+    # B4CA2_DURABLE: persist the settled marker + history now, before any caller
+    # clears open_position, so a restart cannot re-settle the same exit.
+    try:
+        _live_save_state()
+    except Exception:
+        pass
     # Feed adaptive consumers ONCE, and ONLY on CONFIRMED P&L (never train on UNKNOWN).
     if settlement_state == "CONFIRMED" and dollar_pnl is not None:
         _sar = (signals or {}).get(sym, {}).get("spread_atr_ratio")

@@ -11,6 +11,12 @@ from unittest.mock import Mock
 from test_broker_identity import execute, function
 
 
+def _fresh_redis():
+    m = Mock()
+    m.lrange = Mock(return_value=[])   # durable-history idempotency backstop: empty
+    return m
+
+
 def _ns(*, equity_cfd=None, redis_mock=None):
     live = {"balance": 139.31, "trade_history": [], "settled_primary_keys": []}
     perf_calls = []
@@ -29,7 +35,8 @@ def _ns(*, equity_cfd=None, redis_mock=None):
         _IG_EQUITY_COMMISSION_USD=9.0,
         _LIVE_TRADE_HIST_KEY="june_live_trade_history_full",
         _LIVE_TRADE_HIST_CAP=2000, _LIVE_TRADE_HIST_TTL=1000,
-        _redis=Mock(return_value=(redis_mock or Mock())),
+        _redis=Mock(return_value=(redis_mock or _fresh_redis())),
+        _live_save_state=Mock(),
         _live_perf_record=_perf,
         _live_observe=lambda *a, **k: observe_calls.append((a, k)),
         _live_log=Mock(),
@@ -186,6 +193,23 @@ def test_settlement_emits_campaign_telemetry():
 
 
 # ── Commission handling on equity CFDs ─────────────────────────────────────────
+
+def test_durable_backstop_dedups_via_redis_history():
+    # Simulate a crash-then-restart: settled_primary_keys empty, but the deal is
+    # already in the durable Redis history -> must be treated as settled (no dup).
+    rmock = _fresh_redis()
+    rmock.lrange = Mock(return_value=[json.dumps({"deal_id": "CRASH1"})])
+    ns = _ns(redis_mock=rmock)
+    ns["_live_settle_primary_exit"](_pos(deal_id="CRASH1"), "x",
+                                    source="reconciliation.flat_check", confirmed_pnl=1.0)
+    assert len(ns["_live"]["trade_history"]) == 0  # deduped by durable history
+
+
+def test_settlement_persists_state_before_return():
+    ns = _ns()
+    ns["_live_settle_primary_exit"](_pos(), "x", source="s", confirmed_pnl=1.0)
+    assert ns["_live_save_state"].called  # durable persist inside settle
+
 
 def test_equity_commission_applied_on_fill_estimate():
     ns = _ns(equity_cfd={"AAL"})
