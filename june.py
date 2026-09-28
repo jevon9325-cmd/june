@@ -6430,6 +6430,11 @@ _PERF_BLOCK_HARD_LOSS_PCT   = 0.07   # hard block if net dollar loss > 7% of bal
 _PERF_BLOCK_HARD_TTL        = 43200  # 12-hour hard block duration
 _PERF_BLOCK_OBS_LIGHT_PCT   = 0.03   # observer-moderate threshold: net loss >= 3% of balance
 _LIVE_MIN_CONVICTION   = 4       # minimum conviction score for live entries; sim unaffected
+# Build 4C-A: global/instrument DEFENSIVE requires stronger evidence than NORMAL.
+# NORMAL live minimum is 4; DEFENSIVE requires 5 (one step stronger; matches the
+# existing observer-'light' floor semantic of _LIVE_MIN_CONVICTION*1.25=5.0).
+# Defensive mode now EVALUATES normally but admits only high-conviction candidates.
+_LIVE_DEF_CONVICTION_FLOOR = 5   # conviction floor applied while global/instrument defensive
 
 # Tiered defensive mode (NORMAL -> DEFENSIVE -> CB HALT) -------
 # Middle layer between normal operation and the CB killswitch.
@@ -11334,9 +11339,15 @@ def _live_try_entry(signals: dict, regime: str, _notional_skip: set = None) -> N
     # _sim_regime_weight only maps FX instruments; SILVER/OIL always return 1.0
     # regardless of macro state, so gating on the string is the reliable path.
     _gmode = _live.get("global_mode", "normal")
+    # Build 4C-A: DEFENSIVE no longer returns before instrument selection on a
+    # neutral macro regime. It proceeds into the full downstream safety/quality
+    # funnel but requires a stronger conviction floor (see _LIVE_DEF_CONVICTION_FLOOR
+    # applied below). This mitigates opportunity starvation while keeping defensive
+    # meaningfully defensive. All other gates (spread/ATR, SAR, observer, HTF/15m,
+    # exhaustion, CB, kill switch, sizing, stops) are unchanged.
     if _gmode == "defensive" and regime == "neutral":
-        _live_log(f"No live candidate — global DEFENSIVE + regime=neutral")
-        return
+        _live_observe("defensive_eval_proceed", signals, None,
+                      {"scope": "global", "regime": regime, "B4CA": True})
     _ranked = _live_select_instrument(_ext, regime)
     if _notional_skip:
         _ranked = [s for s in _ranked if s not in _notional_skip]
@@ -11350,10 +11361,13 @@ def _live_try_entry(signals: dict, regime: str, _notional_skip: set = None) -> N
         return
 
     # Per-instrument defensive mode regime check (applied after selection)
+    # Build 4C-A: like global defensive, an instrument in defensive mode no longer
+    # hard-returns on neutral macro; it proceeds under the stronger defensive
+    # conviction floor applied below (_in_defensive covers instrument-level too).
     _imode = (_live.get("instrument_mode") or {}).get(sym, "normal")
     if _imode == "defensive" and regime == "neutral":
-        _live_log(f"skip {sym}: instrument DEFENSIVE + regime=neutral")
-        return
+        _live_observe("defensive_eval_proceed", signals, None,
+                      {"scope": "instrument", "instrument": sym, "regime": regime, "B4CA": True})
 
     # Metals session gate: SILVER/OIL follow CME Sunday 18:00 ET reopen,
     # 2h after FX (21:00 UK). Silently skip — no cooldown, no log spam.
@@ -11463,7 +11477,9 @@ def _live_try_entry(signals: dict, regime: str, _notional_skip: set = None) -> N
     _observer_key = _live_get_observer(sym)
     _observer_mult = {"light": 1.25, "moderate": 2.0}.get(_observer_key, 0.0)  # light=5.0 floor (allows 5/10, SILVER ceiling); moderate=8.0 (de-facto block for low-ceiling instruments)
     _obs_floor = (_LIVE_MIN_CONVICTION * _observer_mult) if _observer_mult > 0 else 0.0
-    _def_floor = _LIVE_MIN_CONVICTION if _in_defensive else 0.0
+    # Build 4C-A: defensive floor raised from _LIVE_MIN_CONVICTION (4) to
+    # _LIVE_DEF_CONVICTION_FLOOR (5) so DEFENSIVE requires stronger evidence than NORMAL.
+    _def_floor = _LIVE_DEF_CONVICTION_FLOOR if _in_defensive else 0.0
     _eff_conv_floor = max(_obs_floor, _def_floor)
     # Dynamic exit: score clears raised observer floor AND last trade was a win
     if _observer_key and _obs_floor > 0 and conv >= _obs_floor:
@@ -11480,6 +11496,11 @@ def _live_try_entry(signals: dict, regime: str, _notional_skip: set = None) -> N
             f"skip {sym}: conviction {conv}/10 below floor {_eff_conv_floor:.0f}/10 "
             f"[{'+'.join(_floor_parts)}]"
         )
+        # Build 4C-A telemetry: record conviction-floor rejection (observational only).
+        _live_observe("defensive_conviction_reject", signals, None,
+                      {"instrument": sym, "direction": direction, "conv": conv,
+                       "floor": _eff_conv_floor, "in_defensive": _in_defensive,
+                       "gmode": _gmode, "imode": _imode, "B4CA": True})
         return
     # ── Trend-exhaustion gate ────────────────────────────────────────────────
     # Blocks entries where the directional move in the _history window has

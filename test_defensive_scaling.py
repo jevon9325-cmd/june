@@ -180,10 +180,14 @@ def test_capacity_before_prefinancing_even_with_MINDEAL():
     ns["_ig_live_post"].assert_not_called()
 
 
-def test_fresh_defensive_neutral_still_blocked():
+def test_fresh_defensive_neutral_now_reaches_selection():
+    # Build 4C-A: DEFENSIVE + neutral no longer hard-returns before instrument
+    # selection. It proceeds into the downstream funnel (and is gated there by the
+    # stronger defensive conviction floor). With an empty candidate list, selection
+    # is reached and returns no candidate -> no order. Proves reachability, not admission.
     ns = defensive_harness()
     ns["_live"]["open_position"] = None
-    ns.update(_direct_cfd_signals={}, _live_select_instrument=Mock())
+    ns.update(_direct_cfd_signals={}, _live_select_instrument=Mock(return_value=[]))
     execute([function("_live_try_entry")], ns)
     ns["_live_try_entry"]({}, "neutral")
-    ns["_live_select_instrument"].assert_not_called()
+    ns["_live_select_instrument"].assert_called_once()
