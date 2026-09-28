@@ -9112,7 +9112,20 @@ def _live_refresh_liq_before() -> None:
 
     # Use ONLY broker-acknowledged stop (NOT intended, NOT pending, NOT rejected).
     # acknowledged_stop_level is set by winner_protection.protect() on ACCEPTED confirm.
-    ack_stop = pos.get("acknowledged_stop_level") or pos.get("broker_stop_level")
+    # F1 FIX: track which field supplied the stop so provenance is unambiguous.
+    #   - acknowledged_stop_level: currently acknowledged broker amendment (strongest)
+    #   - broker_stop_level fallback: entry-time stop from opening confirm
+    #     (conservative floor, NOT a recent amendment; labeled differently)
+    _ack_from_amendment = pos.get("acknowledged_stop_level")
+    _ack_from_entry     = pos.get("broker_stop_level")
+    if _ack_from_amendment is not None:
+        ack_stop    = _ack_from_amendment
+        _ack_source = "broker_acknowledged_stop"
+    elif _ack_from_entry is not None:
+        ack_stop    = _ack_from_entry
+        _ack_source = "broker_confirmed_entry_stop_fallback"
+    else:
+        ack_stop = None
     if ack_stop is None or fill_px is None or ig_size is None or fill_px <= 0:
         # Rule C/D/E: no confirmed stop -> do not overwrite existing valid value
         return
@@ -9136,7 +9149,7 @@ def _live_refresh_liq_before() -> None:
         "ig_size":                 float(ig_size),
         "multiplier":              float(multiplier),
         "direction":               direction,
-        "source":                  "broker_acknowledged_stop",
+        "source":                  _ack_source,
         "campaign_id":             campaign_id,
         "epoch":                   time.time(),
     }
@@ -10204,6 +10217,45 @@ def _live_check_pyramid_exits(signals: dict) -> None:
             if not _live["pyramid_legs"]:
                 _live["pyramid_agg_stop_level"] = None
             _live_save_state()
+            # F4 FIX: attempt fail-closed harvest recording via existing dedup guards.
+            # No broker exit price available from LS stream alone -- mark source explicitly.
+            # The eligibility + deal_id dedup guards prevent double-credit if a normal
+            # close confirmation arrives later in the same or a subsequent cycle.
+            # If evidence is insufficient (no deal_id, wrong gen, slot mismatch)
+            # those guards block credit and log the reason -- we never invent P&L.
+            if deal_id and leg.get("leg_generation", 1) == 1:
+                _ls_leg = dict(leg)
+                _ls_leg["confirmed_exit_price"] = None
+                _ls_leg["exit_price_source"]    = "ls_close_price_unknown"
+                _live_log(
+                    f"[LS] PYRAMID leg {leg_idx}: attempting fail-closed harvest record "
+                    f"(no broker exit price -- P&L estimate only)"
+                )
+                try:
+                    _live_record_rolling_harvest(_ls_leg, signals)
+                except Exception as _ls_he:
+                    import logging as _ls_logging
+                    _ls_logging.warning(
+                        "F4: LS harvest record error (fail-closed, capacity slot unchanged): %s",
+                        _ls_he,
+                    )
+            # If both primary and all addons are now gone, ensure campaign cleanup
+            # fires so stale rolling fuel cannot carry to the next campaign.
+            if not _live.get("open_position") and not _live.get("pyramid_legs"):
+                try:
+                    from rolling_build4a import b4a_clear_campaign_rolling_state
+                    _ls_cleared = b4a_clear_campaign_rolling_state(
+                        _live, reason="ls_detected_full_campaign_close"
+                    )
+                    if _ls_cleared:
+                        _live_log(
+                            f"[LS] Campaign cleanup after LS-detected close: "
+                            f"cleared {list(_ls_cleared.keys())}"
+                        )
+                    _live_save_state()
+                except Exception as _ls_ce:
+                    import logging as _ls_clogging
+                    _ls_clogging.warning("F4: LS campaign cleanup error (non-fatal): %s", _ls_ce)
             continue
 
         leg_pnl_pct = (

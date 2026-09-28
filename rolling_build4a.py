@@ -111,7 +111,10 @@ def b4a_build_ledgers(live: dict) -> dict:
             else "current_liq_before"
         )
     elif bootstrap_liq is not None:
-        liq_before          = bootstrap_liq
+        # F2 FIX: stale bootstrap is preserved as historical telemetry ONLY.
+        # It must NOT be used as actionable Ledger B for D2 economics --
+        # only a currently broker-backed acknowledgement may reduce D2.
+        liq_before          = None   # cleared for actionable path
         ledger_b_provenance = "bootstrap_snapshot_stale"
     else:
         liq_before          = None
@@ -765,11 +768,22 @@ def b4a_detect_stale_rolling_state(live: dict, new_primary: dict) -> dict:
 
 # ---- Restart/recovery validation (B4A extension) ----------------------------
 
+# Valid liq_before source labels (F5); anything else is unverified.
+_B4A_VALID_LIQ_SOURCES = frozenset({
+    "broker_acknowledged_stop",
+    "broker_confirmed_entry_stop_fallback",
+})
+
+
 def b4a_validate_rolling_state_extended(live: dict) -> list:
     """Extended rolling state validation -- Build 4A supplement.
 
     Returns list of warning strings. Empty = clean.
     Never grants capacity. Never manufactures profit.
+
+    F5 FIX: validates liq_before provenance; persisted liq_before is
+    untrusted when provenance is missing, campaign mismatched, source
+    unrecognised, or primary absent.
     """
     warnings    = []
     harvest     = live.get("rolling_realized_harvest") or {}
@@ -795,6 +809,40 @@ def b4a_validate_rolling_state_extended(live: dict) -> list:
             f"B4A_UNEXPECTED_DEPLOYMENT: deployed={deployed:.6f} "
             f"(Build 4A must never deploy profit)"
         )
+
+    # F5: liq_before provenance integrity checks
+    liq_before = live.get("liq_before")
+    prov       = live.get("liq_before_provenance") or {}
+    if liq_before is not None:
+        if primary is None:
+            warnings.append(
+                "B4A_LIQ_BEFORE_PRIMARY_ABSENT: liq_before present but no open_position; "
+                "protection value should have been cleared on primary close"
+            )
+        if not prov:
+            warnings.append(
+                "B4A_LIQ_BEFORE_NO_PROVENANCE: liq_before present with no provenance record; "
+                "cannot verify source -- treat as untrustworthy"
+            )
+        else:
+            prov_campaign = prov.get("campaign_id")
+            if prov_campaign is None:
+                warnings.append(
+                    "B4A_LIQ_BEFORE_MISSING_CAMPAIGN_ID: provenance has no campaign_id; "
+                    "cannot confirm this value belongs to the current campaign"
+                )
+            elif campaign_id is not None and prov_campaign != campaign_id:
+                warnings.append(
+                    f"B4A_LIQ_BEFORE_CAMPAIGN_MISMATCH: "
+                    f"provenance.campaign_id={prov_campaign} != rolling_campaign_id={campaign_id}; "
+                    "stale protection from previous campaign"
+                )
+            src_val = prov.get("source", "")
+            if src_val not in _B4A_VALID_LIQ_SOURCES:
+                warnings.append(
+                    f"B4A_LIQ_BEFORE_INVALID_SOURCE: source={src_val!r} not in approved set "
+                    f"{sorted(_B4A_VALID_LIQ_SOURCES)}; treat liq_before as untrustworthy"
+                )
     return warnings
 
 
