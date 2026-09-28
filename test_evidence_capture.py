@@ -12,6 +12,7 @@ from broker_capture import EvidenceCapture
 from broker_pending import PendingCloseStore
 from test_broker_pending import FaultClient
 from test_live_accounting import close_harness
+from typing import Optional
 from test_broker_identity import TREE
 
 

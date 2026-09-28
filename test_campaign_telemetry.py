@@ -202,6 +202,15 @@ class TelemetryTests(unittest.TestCase):
             with patch("campaign_telemetry.default_store", side_effect=OSError() if failing else None, return_value=self.store):
                 ns["_live_close_position"]("stop_loss", {"GOLD": {"price": 99., "spread_pct": .1}})
             outputs.append((ns["_ig_live_post"].call_args, ns["_live"]))
+        # Normalise the wall-clock audit epoch written by
+        # b4a_clear_campaign_rolling_state (time.time() from its own module
+        # namespace; the AST harness cannot freeze it). This audit field is
+        # not part of the "telemetry failure must not change close decision"
+        # contract -- the economically meaningful state must still match.
+        for _call_args, _live_state in outputs:
+            _cleared = _live_state.get("rolling_last_campaign_cleared")
+            if isinstance(_cleared, dict) and "epoch" in _cleared:
+                _cleared["epoch"] = "NORMALISED_FOR_COMPARISON"
         self.assertEqual(outputs[0], outputs[1])
 
     def test_partial_and_mindeal_hooks(self):

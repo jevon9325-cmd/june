@@ -250,12 +250,19 @@ class TestReleasedMarginNotProfit:
 
 class TestProtectedPrimaryNotProfit:
     def test_ledger_b_not_added_to_ledger_a(self):
-        """Protected primary (Ledger B) is separate from realized profit (Ledger A)."""
+        """Protected primary (Ledger B) is separate from realized profit (Ledger A).
+        F2: Ledger B is actionable only from a CURRENT broker-backed liq_before,
+        so supply one explicitly (bootstrap alone is now historical-only)."""
         live = make_live_with_harvest(liq_before=0.5, realized_pnl=0.12)
+        live["liq_before"] = 0.5
+        live["liq_before_provenance"] = {
+            "source": "broker_acknowledged_stop",
+            "campaign_id": live["rolling_campaign_id"],
+        }
         ledgers = rb4.b4a_build_ledgers(live)
         # Ledger A is only the harvest pnl, not liq_before
         assert abs(ledgers["ledger_a_realized_profit"] - 0.12) < 1e-9
-        # Ledger B is the liq_before value
+        # Ledger B is the current broker-backed liq_before value
         assert abs(ledgers["ledger_b_protected_primary"] - 0.5) < 1e-9
         assert ledgers["protected_primary_treated_as_cash"] is False
 
@@ -318,8 +325,15 @@ class TestK5Invariant:
         assert result["b_entered_profit_ledger"] is False
 
     def test_zero_liq_before_is_not_unknown(self):
-        """A real value of 0.0 for liq_before is valid (not UNKNOWN)."""
+        """A real CURRENT value of 0.0 for liq_before is valid (not UNKNOWN).
+        F2: exercised via a current broker-backed provenance, since a bootstrap
+        snapshot alone is now historical-only and yields UNKNOWN."""
         live = make_live_with_harvest(liq_before=0.0)
+        live["liq_before"] = 0.0
+        live["liq_before_provenance"] = {
+            "source": "broker_acknowledged_stop",
+            "campaign_id": live["rolling_campaign_id"],
+        }
         ledgers = rb4.b4a_build_ledgers(live)
         assert ledgers["ledger_b_protected_primary"] == 0.0
         assert ledgers["ledger_b_protected_primary"] != rb4.B4A_UNKNOWN
@@ -1238,12 +1252,17 @@ class TestNF1LiqBeforeProvenance:
         assert abs(ledgers["ledger_b_protected_primary"] - 0.20) < 1e-9
 
     def test_nf1_pending_stop_does_not_become_ledger_b(self):
+        # F2 REPAIR: with no CURRENT broker-backed liq_before, only a stale
+        # bootstrap snapshot remains. Post-F2 that snapshot is historical-only
+        # and MUST NOT be used as actionable Ledger B -> UNKNOWN (fail closed).
         live = make_live_with_harvest(liq_before=0.08)
         live.pop("liq_before", None)
         live.pop("liq_before_provenance", None)
         ledgers = rb4.b4a_build_ledgers(live)
-        assert abs(ledgers["ledger_b_protected_primary"] - 0.08) < 1e-9
-        assert "bootstrap" in ledgers["ledger_b_provenance"]
+        assert ledgers["ledger_b_protected_primary"] == rb4.B4A_UNKNOWN
+        assert ledgers["ledger_b_provenance"] == "bootstrap_snapshot_stale"
+        # Bootstrap value is still preserved for provenance/telemetry only.
+        assert abs(ledgers["bootstrap_liq_before_historical"] - 0.08) < 1e-9
 
     def test_nf1_rejected_stop_does_not_become_ledger_b(self):
         live = make_live_with_harvest(liq_before=0.08)
@@ -1265,6 +1284,9 @@ class TestNF1LiqBeforeProvenance:
         assert ledgers["ledger_b_provenance"] == "primary_closed_protection_cleared"
 
     def test_nf1_campaign_mismatch_invalidates_liq_before(self):
+        # A mismatched-campaign CURRENT liq_before must be invalidated.
+        # F2 REPAIR: after invalidation only a stale bootstrap remains, which
+        # is now historical-only -> actionable Ledger B is UNKNOWN (fail closed).
         live = make_live_with_harvest(liq_before=0.08)
         live["liq_before"] = 0.99
         live["liq_before_provenance"] = {
@@ -1273,8 +1295,11 @@ class TestNF1LiqBeforeProvenance:
         }
         live["rolling_campaign_id"] = "campaign_PRIMARY"
         ledgers = rb4.b4a_build_ledgers(live)
+        # Mismatched current value must NOT survive
         assert ledgers["ledger_b_protected_primary"] != 0.99
-        assert abs(ledgers["ledger_b_protected_primary"] - 0.08) < 1e-9
+        # And the stale bootstrap must NOT silently substitute -> UNKNOWN
+        assert ledgers["ledger_b_protected_primary"] == rb4.B4A_UNKNOWN
+        assert abs(ledgers["bootstrap_liq_before_historical"] - 0.08) < 1e-9
 
     def test_nf1_restart_valid_provenance_preserves_liq_before(self):
         import json as _json
