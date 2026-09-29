@@ -1183,26 +1183,36 @@ def is_overnight() -> bool:
     return m >= OVERNIGHT_START_MIN or m < OVERNIGHT_END_MIN
 
 
-def _current_sub_session(sym: str) -> str:
-    """Trading sub-session label for SAR block bucketing.
-
-    OIL / SILVER / NATGAS / WHEAT: day session split into three independent buckets so
-    that a bad early-morning reading cannot block the primary trading window.
-      pre_nyse:       07:00 UTC - NYSE open     (London + pre-market hours)
-      nyse_morning:   NYSE open - 12:00 ET noon (highest volume, tightest spreads)
-      nyse_afternoon: 12:00 ET  - 21:00 UTC     (lower volume, wider spreads)
-    WHEAT added: clearing window is 12:45-15:00 UTC (CBOT morning). A pre_nyse block
-    expires at NYSE open (13:30 UTC), preserving the nyse_morning clearing window.
-    Other instruments: plain "day" (single bucket, unchanged behaviour).
-    Overnight always returns "overnight" for all instruments.
+def _current_sub_session(sym: str = "") -> str:
+    """Canonical trading sub-session label — Build 4C-C generalized classifier.
+    Deterministic from the current UTC time; DST-correct via ZoneInfo(_US_EAST_TZ).
+    FOUR canonical sessions, applied uniformly to the WHOLE tradable universe
+    (previously only OIL/SILVER/NATGAS/WHEAT received the daytime split):
+      overnight:      21:00 UTC - 07:00 UTC   (Asia / overnight; fixed UTC)
+      pre_nyse:       07:00 UTC - NYSE open    (Europe / London; ET-anchored, DST-aware)
+      nyse_morning:   NYSE open - 12:00 ET     (US / New York core; highest volume)
+      nyse_afternoon: 12:00 ET  - 21:00 UTC    (late-US / transition)
+    Boundaries are unchanged from the prior OIL/SILVER path; this only widens WHICH
+    instruments receive them. `sym` is retained for a small justified override table
+    (_SESSION_BOUNDARY_OVERRIDES) and future asset-class interpretation; it never
+    causes a missing/generic bucket. Classifier failure is impossible here (pure
+    clock arithmetic, no I/O, no API).
     """
     if is_overnight():
         return "overnight"
-    if sym not in ("OIL", "SILVER", "NATGAS", "WHEAT"):
-        return "day"
+    # Optional explicit per-instrument boundary override (none currently justified).
+    _ovr = _SESSION_BOUNDARY_OVERRIDES.get(sym)
     now_et       = datetime.now(_US_EAST_TZ)
     nyse_open_et = now_et.replace(hour=9,  minute=30, second=0, microsecond=0)
     nyse_mid_et  = now_et.replace(hour=12, minute=0,  second=0, microsecond=0)
+    if _ovr is not None:
+        # Override hook (reserved): callable(now_et) -> label. Fall through on any error.
+        try:
+            _lbl = _ovr(now_et)
+            if _lbl in ("pre_nyse", "nyse_morning", "nyse_afternoon"):
+                return _lbl
+        except Exception:
+            pass
     if now_et < nyse_open_et:
         return "pre_nyse"
     if now_et < nyse_mid_et:
@@ -6394,6 +6404,18 @@ _PERF_BLOCK_WR_THRESH  = 0.30    # block if win rate < 30% over window
 _PERF_BLOCK_SAR_THRESH = 0.50    # block if avg Spread/ATR ratio > 50% over window
 _PERF_BLOCK_TTL             = 86400  # 24-hour block duration (seconds)
 _PERF_BLOCK_SAR_SESSION_MIN = 4      # min same-session trades before SAR block fires
+# Build 4C-C: session schema version. v2 = generalized granular daytime split
+# (pre_nyse/nyse_morning/nyse_afternoon) applied to the WHOLE universe instead of
+# only OIL/SILVER/NATGAS/WHEAT. Legacy v1 records (tagged 'day'/'overnight' only)
+# are preserved and matched via the existing legacy-fallback; new granular buckets
+# for previously-'day' instruments start fresh and cannot fire a SAR block until
+# they accumulate >= _PERF_BLOCK_SAR_SESSION_MIN valid samples.
+_SESSION_SCHEMA_VERSION = 2
+# Instruments with a genuinely justified session-boundary override (kept explicit).
+# WHEAT: CBOT clearing window 12:45-15:00 UTC; the generic pre_nyse->nyse_morning
+# split at NYSE open (13:30 UTC) already preserves its clearing window, so no
+# distinct boundary is needed — retained here only as documentation of the review.
+_SESSION_BOUNDARY_OVERRIDES: dict = {}
 _PERF_SAR_OIL_BOUNDARY_FLOOR_SECS = 30 * 60  # OIL NYSE boundary: floor = 6 scan cycles
 _PERF_BLOCK_RECENCY_DAYS    = 14     # only trades within this window count for WR/SAR evaluation
 _PERF_BLOCK_SAR_EPOCH_CUTOFF = 1787898314  # exclude pre-a62093f trades from SAR eval (2026-08-28 06:25 UTC — OIL/SILVER sizing fix)
@@ -7908,6 +7930,7 @@ def _live_perf_record(sym: str, won: bool, sar, pnl_dollar: float = 0.0, entry_s
             "persistence_confirmed": persistence_confirmed,
             "session": session,
             "sub_session": sub_session,
+            "session_schema": _SESSION_SCHEMA_VERSION,  # B4CC provenance
             "epoch": int(time.time()),
             "pnl_dollar": round(pnl_dollar, 4),
             **({"excluded_defect_id": excluded_defect_id} if excluded_defect_id else {}),
