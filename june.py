@@ -9842,7 +9842,19 @@ def _live_check_exit(signals: dict, regime: str) -> None:
         _mpd_slp_l  = _MPD_SLIPPAGE_PIPS * _mpd_pip_l         # slippage buffer (native)
         _mpd_mgp_l  = _MPD_MIN_PROFIT_PIPS * _mpd_pip_l       # min guaranteed profit (native)
         _mpd_fric_l = _mpd_spn_l + _mpd_slp_l + _mpd_mgp_l   # total friction (native)
-        _mpd_act    = (
+        # B4CB_MPD: meaningful-MFE arm gate. Previously MPD armed the instant
+        # spread-adjusted profit cleared fixed friction (~breakeven+3pips), far
+        # below DPLE's breakeven lock (0.5xTP), the pyramid gate (+0.15%) and TP.
+        # That made MPD an accidental breakeven-scratch take-profit that clipped
+        # winners before any compounding/continuation could occur (SILVER
+        # DIAAAAR8VWPHYAR: exited +0.05%, price then ran to TP + past pyramid gate).
+        # Fix: MPD now defers to DPLE — it only arms once profit reaches the SAME
+        # threshold DPLE uses to lock breakeven (0.5 x TP). Below that, DPLE (which
+        # is MFE-aware and proportional) plus the initial broker stop own protection.
+        # The friction floor is retained as a necessary (not sufficient) condition,
+        # so MPD can never lock a sub-friction/negative level.
+        _mpd_mfe_gate = (_dple_tp_l > 0 and pnl_pct >= 0.5 * _dple_tp_l)
+        _mpd_act    = _mpd_mfe_gate and (
             (dirn == "long"  and _exit_px - fill_px >= _mpd_fric_l) or
             (dirn == "short" and fill_px - _exit_px >= _mpd_fric_l)
         )
