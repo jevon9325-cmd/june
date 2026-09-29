@@ -6833,6 +6833,267 @@ def _live_observe(event, signals=None, position=None, details=None):
         logging.warning("CAMPAIGN TELEMETRY GAP: %s; trading continues", type(exc).__name__)
 
 
+# ── Build 4C-B1: thesis-aware same-direction post-loss re-entry ──────────────
+_B1_THESIS_SCHEMA_VERSION = 1
+_B1_FAILURE_MAX_AGE_SECS  = 14 * 24 * 3600
+_B1_MIN_CONVICTION_DELTA  = 2
+_B1_MIN_EXHAUSTION_RESET  = 1.0
+_B1_PRICE_RESET_ATR       = 1.0
+_B1_FAILURES_KEY           = "failed_theses"
+_B1_FAILURE_HISTORY_KEY    = "failed_thesis_history"
+_B1_REENTRY_LOGGED: set    = set()
+
+
+def _live_b1_macro_class(macro_scale) -> str:
+    try:
+        value = float(macro_scale)
+    except (TypeError, ValueError):
+        return "unknown"
+    if value >= 0.95:
+        return "aligned"
+    if value <= 0.55:
+        return "conflict"
+    return "neutral"
+
+
+def _live_b1_thesis_key(snapshot: dict) -> str:
+    """Inspectable, deterministic setup fingerprint; no wall-clock/random input."""
+    conv = int(snapshot.get("conviction", 0) or 0)
+    conv_band = "low" if conv <= 4 else ("mid" if conv <= 6 else "high")
+    ex = float(snapshot.get("exhaustion", 0.0) or 0.0)
+    ex_bucket = "clear" if ex < _EXHAUST_RATIO_REDUCE else (
+        "elevated" if ex < _EXHAUST_RATIO_BLOCK else "exhausted")
+    payload = {
+        "v": _B1_THESIS_SCHEMA_VERSION,
+        "instrument": snapshot.get("instrument"),
+        "direction": snapshot.get("direction"),
+        "conv_band": conv_band,
+        "htf": snapshot.get("htf_bias", "unknown"),
+        "exhaustion": ex_bucket,
+        "macro": _live_b1_macro_class(snapshot.get("macro_scale")),
+        "regime": snapshot.get("regime", "neutral"),
+        "sub_session": snapshot.get("sub_session", "unknown"),
+        "change_5m": round(float(snapshot.get("change_5m", 0.0) or 0.0), 2),
+        "change_15m": round(float(snapshot.get("change_15m", 0.0) or 0.0), 2),
+    }
+    return json.dumps(payload, sort_keys=True, separators=(",", ":"))
+
+
+def _live_b1_build_snapshot(sym: str, direction: str, signals: dict, regime: str,
+                            conviction: int, htf_bias: str, htf_move: float,
+                            exhaustion: float, macro_scale: float, claudia_dir: int,
+                            macro_note: str, atr5, gate_mode: str,
+                            rel_score, persistence: bool) -> dict:
+    sig = (signals or {}).get(sym, {})
+    snap = {
+        "schema": _B1_THESIS_SCHEMA_VERSION,
+        "instrument": sym,
+        "direction": direction,
+        "entry_price": sig.get("price"),
+        "conviction": int(conviction),
+        "regime": regime,
+        "session": "overnight" if is_overnight() else "day",
+        "sub_session": _current_sub_session(sym),
+        "htf_bias": htf_bias,
+        "htf_move": round(float(htf_move or 0.0), 6),
+        "exhaustion": round(float(exhaustion or 0.0), 4),
+        "macro_scale": round(float(macro_scale or 0.0), 3),
+        "claudia_dir": claudia_dir,
+        "macro_note": macro_note,
+        "atr5": round(float(atr5), 6) if atr5 and atr5 > 0 else None,
+        "change_5m": sig.get("change_5m"),
+        "change_15m": sig.get("change_15m"),
+        "spread_atr_ratio": sig.get("spread_atr_ratio"),
+        "persistence_confirmed": bool(persistence),
+        "gate_mode": gate_mode,
+        "rel_score": rel_score,
+    }
+    snap["thesis_key"] = _live_b1_thesis_key(snap)
+    return snap
+
+
+def _live_b1_material_change(failure: dict, current: dict, now=None) -> tuple:
+    """Return (changed_dimensions, unchanged_dimensions); missing data never changes."""
+    changed, unchanged = {}, []
+    try:
+        old_conv = int(failure.get("entry_conviction"))
+        new_conv = int(current.get("conviction"))
+        if new_conv - old_conv >= _B1_MIN_CONVICTION_DELTA:
+            changed["conviction"] = {"old": old_conv, "new": new_conv}
+        else:
+            unchanged.append("conviction")
+    except (TypeError, ValueError):
+        unchanged.append("conviction_missing")
+
+    direction = failure.get("direction")
+    old_htf = failure.get("entry_htf_bias", "unknown")
+    new_htf = current.get("htf_bias", "unknown")
+    old_aligned = ((direction == "long" and old_htf == "bull") or
+                   (direction == "short" and old_htf == "bear"))
+    new_aligned = ((direction == "long" and new_htf == "bull") or
+                   (direction == "short" and new_htf == "bear"))
+    if new_aligned and not old_aligned:
+        changed["htf_alignment"] = {"old": old_htf, "new": new_htf}
+    else:
+        unchanged.append("htf_alignment")
+
+    try:
+        old_ex = float(failure.get("entry_exhaustion"))
+        new_ex = float(current.get("exhaustion"))
+        if (old_ex >= _EXHAUST_RATIO_REDUCE and
+                new_ex < _EXHAUST_RATIO_REDUCE and
+                old_ex - new_ex >= _B1_MIN_EXHAUSTION_RESET):
+            changed["exhaustion_reset"] = {"old": round(old_ex, 3), "new": round(new_ex, 3)}
+        else:
+            unchanged.append("exhaustion")
+    except (TypeError, ValueError):
+        unchanged.append("exhaustion_missing")
+
+    old_macro = _live_b1_macro_class(failure.get("entry_macro_scale"))
+    new_macro = _live_b1_macro_class(current.get("macro_scale"))
+    if new_macro == "aligned" and old_macro != "aligned":
+        changed["macro_alignment"] = {"old": old_macro, "new": new_macro}
+    else:
+        unchanged.append("macro_alignment")
+
+    try:
+        old_px = float(failure.get("entry_price"))
+        new_px = float(current.get("entry_price"))
+        old_atr = float(failure.get("entry_atr")) if failure.get("entry_atr") else 0.0
+        new_atr = float(current.get("atr5")) if current.get("atr5") else 0.0
+        reset_atr = max(old_atr, new_atr)
+        signed_move = (new_px - old_px) if direction == "long" else (old_px - new_px)
+        if reset_atr > 0 and signed_move >= _B1_PRICE_RESET_ATR * reset_atr:
+            changed["price_structure_reset"] = {
+                "old": old_px, "new": new_px,
+                "directional_move": round(signed_move, 6),
+                "atr_reference": round(reset_atr, 6),
+            }
+        else:
+            unchanged.append("price_structure")
+    except (TypeError, ValueError):
+        unchanged.append("price_structure_missing")
+
+    return changed, unchanged
+
+
+def _live_b1_record_failure(pos: dict, exit_record: dict, source: str) -> None:
+    """Persist the latest negative/unknown primary stop-loss thesis failure once."""
+    if not pos or exit_record.get("exit_reason") != "stop_loss":
+        return
+    pnl = exit_record.get("dollar_pnl")
+    if isinstance(pnl, (int, float)) and pnl > 0:
+        return  # a partial campaign that netted positive is not a failed thesis
+    snap = dict(pos.get("thesis_snapshot") or {})
+    sym = pos.get("instrument", snap.get("instrument", "?"))
+    direction = pos.get("direction", snap.get("direction", "?"))
+    combo = _sim_combo_key(sym, direction)
+    failure_id = str(pos.get("deal_id") or
+                     f"{sym}|{direction}|{pos.get('entry_time', 0)}|{exit_record.get('exit_epoch', 0)}")
+    record = {
+        "schema": _B1_THESIS_SCHEMA_VERSION,
+        "failure_id": failure_id,
+        "instrument": sym,
+        "direction": direction,
+        "failure_epoch": int(exit_record.get("exit_epoch") or time.time()),
+        "exit_reason": "stop_loss",
+        "settlement_state": exit_record.get("settlement_state", "UNKNOWN"),
+        "settlement_source": source,
+        "dollar_pnl": pnl,
+        "deal_id": pos.get("deal_id"),
+        "entry_price": snap.get("entry_price", pos.get("fill_price")),
+        "exit_price": exit_record.get("exit_price"),
+        "entry_conviction": snap.get("conviction", pos.get("conviction")),
+        "entry_session": snap.get("session"),
+        "entry_sub_session": snap.get("sub_session"),
+        "entry_regime": snap.get("regime"),
+        "entry_htf_bias": snap.get("htf_bias", pos.get("htf_bias", "unknown")),
+        "entry_htf_move": snap.get("htf_move"),
+        "entry_exhaustion": snap.get("exhaustion", 0.0),
+        "entry_macro_scale": snap.get("macro_scale"),
+        "entry_macro_note": snap.get("macro_note"),
+        "entry_atr": snap.get("atr5"),
+        "entry_change_5m": snap.get("change_5m"),
+        "entry_change_15m": snap.get("change_15m"),
+        "entry_sar": pos.get("entry_sar"),
+        "entry_thesis_key": snap.get("thesis_key"),
+        "failure_thesis_key": snap.get("thesis_key"),
+        "provenance": "B4CB1_stop_loss_failure",
+    }
+    active = _live.setdefault(_B1_FAILURES_KEY, {})
+    prior = active.get(combo)
+    if prior and prior.get("failure_id") == failure_id:
+        return
+    active[combo] = record
+    _live_log(
+        f"[THESIS FAILURE] {sym} {direction} stop_loss | deal={pos.get('deal_id') or 'n/a'} "
+        f"| settlement={record['settlement_state']} | thesis={record.get('failure_thesis_key', '?')}"
+    )
+    _live_save_state()
+
+
+def _live_b1_reentry_allowed(sym: str, direction: str, current: dict) -> bool:
+    """Gate only same-direction re-entry after a recorded stop-loss thesis failure."""
+    combo = _sim_combo_key(sym, direction)
+    failure = (_live.get(_B1_FAILURES_KEY) or {}).get(combo)
+    if not failure:
+        return True
+    changed, unchanged = _live_b1_material_change(failure, current)
+    age = max(0, time.time() - float(failure.get("failure_epoch", time.time())))
+    required = 2 if age > _B1_FAILURE_MAX_AGE_SECS else 1
+    if len(changed) >= required:
+        released = dict(failure)
+        released["released_at"] = int(time.time())
+        released["released_dimensions"] = sorted(changed)
+        released["release_thesis_key"] = current.get("thesis_key")
+        history = _live.setdefault(_B1_FAILURE_HISTORY_KEY, [])
+        history.append(released)
+        _live[_B1_FAILURE_HISTORY_KEY] = history[-50:]
+        (_live.get(_B1_FAILURES_KEY) or {}).pop(combo, None)
+        _live_log(
+            f"[THESIS REENTRY RELEASE] instrument={sym} direction={direction} "
+            f"changed={sorted(changed)} unchanged={unchanged} age={int(age)}s "
+            f"thesis_id_old={failure.get('failure_thesis_key')} "
+            f"thesis_id_new={current.get('thesis_key')}"
+        )
+        _live_save_state()
+        return True
+    log_key = (combo, failure.get("failure_id"), tuple(sorted(changed)), tuple(unchanged))
+    if log_key not in _B1_REENTRY_LOGGED:
+        _B1_REENTRY_LOGGED.add(log_key)
+        _live_log(
+            f"[THESIS REENTRY BLOCK] instrument={sym} direction={direction} "
+            f"prior_failure={failure.get('failure_id')} cooldown_expired=True "
+            f"changed={sorted(changed)} unchanged={unchanged} age={int(age)}s "
+            f"reason=material evidence change required"
+        )
+    return False
+
+
+def _live_b1_update_excursion(pos: dict, pnl_pct: float) -> None:
+    """Non-decision telemetry for current primary MAE/MFE, persisted on new extremes."""
+    if not pos:
+        return
+    stop = float(pos.get("initial_sl_pct", pos.get("stop_pct", 0.0)) or 0.0)
+    if stop <= 0:
+        return
+    cur = _live.get("open_position") or pos
+    fav = max(float(pnl_pct), 0.0)
+    adv = max(-float(pnl_pct), 0.0)
+    changed = False
+    if fav > float(cur.get("max_favorable_excursion_pct", 0.0) or 0.0):
+        cur["max_favorable_excursion_pct"] = round(fav, 6)
+        cur["max_favorable_excursion_r"] = round(fav / stop, 4)
+        changed = True
+    if adv > float(cur.get("max_adverse_excursion_pct", 0.0) or 0.0):
+        cur["max_adverse_excursion_pct"] = round(adv, 6)
+        cur["max_adverse_excursion_r"] = round(adv / stop, 4)
+        changed = True
+    if changed:
+        _live["open_position"] = cur
+        _live_save_state()
+
+
 def _live_save_state() -> None:
     _live_capture_active("state_snapshot")
     try:
@@ -8491,7 +8752,8 @@ def _live_entry_evidence(sym, role, order, response, confirm, local=None):
 
 def _live_open_position(sym: str, direction: str, signals: dict,
                         pos_size: float, leverage: int, conviction: int,
-                        stop_mult: float = 1.0, htf_bias: str = "unknown") -> None:
+                        stop_mult: float = 1.0, htf_bias: str = "unknown",
+                        thesis_snapshot: dict = None) -> None:
     """Place a real BUY/SELL order on the IG live account.
 
     STRUCTURALLY GATED: _live_trade_guard() is the first call. No code path can
@@ -8740,6 +9002,13 @@ def _live_open_position(sym: str, direction: str, signals: dict,
         "entry_sar":      round(sig.get("spread_atr_ratio") or 0.0, 4),
         "persistence_confirmed": _last_cycle_direction.get(sym) == ("bull" if direction == "long" else "bear"),
         "htf_bias":     htf_bias,  # observation-only; never gates or conviction
+        # Build 4C-B1 / forensic telemetry: immutable entry thesis + MAE/MFE extrema.
+        "thesis_snapshot": dict(thesis_snapshot or {}),
+        "thesis_key":    (thesis_snapshot or {}).get("thesis_key"),
+        "max_favorable_excursion_pct": 0.0,
+        "max_favorable_excursion_r":   0.0,
+        "max_adverse_excursion_pct":   0.0,
+        "max_adverse_excursion_r":     0.0,
     }
     _live["open_position"]["broker_entry_evidence"] = _live_entry_evidence(
         sym, "primary", order_body, resp, confirm,
@@ -9045,7 +9314,17 @@ def _live_settle_primary_exit(pos: dict, exit_reason: str, source: str,
         "conviction":  pos.get("conviction", 0),
         "reconciled":  settlement_state == "CONFIRMED",
         "B4CA2":       True,
+        "thesis_key":  pos.get("thesis_key"),
+        "thesis_snapshot": pos.get("thesis_snapshot"),
+        "max_favorable_excursion_pct": pos.get("max_favorable_excursion_pct", 0.0),
+        "max_favorable_excursion_r":   pos.get("max_favorable_excursion_r", 0.0),
+        "max_adverse_excursion_pct":   pos.get("max_adverse_excursion_pct", 0.0),
+        "max_adverse_excursion_r":     pos.get("max_adverse_excursion_r", 0.0),
     }
+    if exit_reason == "stop_loss":
+        _b1_record = globals().get("_live_b1_record_failure")
+        if _b1_record is not None:
+            _b1_record(pos, rec, source)
     # Append to live history + durable Redis list exactly once.
     hist = _live.setdefault("trade_history", [])
     hist.append(rec)
@@ -9272,6 +9551,16 @@ def _live_close_position(exit_reason: str, signals: dict) -> None:
         trade_rec["deal_id"] = deal_id  # B4CA2: identity for cross-path dedup
         trade_rec["settlement_state"] = "CONFIRMED"
         trade_rec["settlement_source"] = "june_managed_close"
+        trade_rec["thesis_key"] = pos.get("thesis_key")
+        trade_rec["thesis_snapshot"] = pos.get("thesis_snapshot")
+        trade_rec["max_favorable_excursion_pct"] = pos.get("max_favorable_excursion_pct", 0.0)
+        trade_rec["max_favorable_excursion_r"] = pos.get("max_favorable_excursion_r", 0.0)
+        trade_rec["max_adverse_excursion_pct"] = pos.get("max_adverse_excursion_pct", 0.0)
+        trade_rec["max_adverse_excursion_r"] = pos.get("max_adverse_excursion_r", 0.0)
+        if exit_reason == "stop_loss":
+            _b1_record = globals().get("_live_b1_record_failure")
+            if _b1_record is not None:
+                _b1_record(pos, trade_rec, "june_managed_close")
         hist = _live.setdefault("trade_history", [])
         hist.append(trade_rec)
         if len(hist) > 50:
@@ -9988,6 +10277,9 @@ def _live_check_exit(signals: dict, regime: str) -> None:
     _half_sp = mid * _sp_pct / 200.0   # spread_pct is %; /100 for fraction, /2 for half-spread
     _exit_px = (mid - _half_sp) if dirn == "long" else (mid + _half_sp)
     pnl_pct  = (_exit_px - fill_px) / fill_px if dirn == "long" else (fill_px - _exit_px) / fill_px
+    _b1_excursion = globals().get("_live_b1_update_excursion")
+    if _b1_excursion is not None:
+        _b1_excursion(pos, pnl_pct)
     sig_dir  = sig.get("direction", "neutral")
 
     # [BLOCK OPEN] observational audit log — no behavior change.
@@ -12158,6 +12450,19 @@ def _live_try_entry(signals: dict, regime: str, _notional_skip: set = None) -> N
                     if len(_skip) <= 3:
                         _live_try_entry(signals, regime, _notional_skip=_skip)
                     return
+    _b1_build = globals().get("_live_b1_build_snapshot")
+    _b1_gate = globals().get("_live_b1_reentry_allowed")
+    _b1_snapshot = (_b1_build(
+        sym, direction, _ext, regime, conv, _htf_b, _htf_m, _ex_ratio,
+        _macro_scale, _claudia_dir, _conf_note, _atr5, gate_mode, rel_score,
+        _last_cycle_direction.get(sym) == ("bull" if direction == "long" else "bear"))
+        if _b1_build is not None else {})
+    if _b1_gate is not None and not _b1_gate(sym, direction, _b1_snapshot):
+        _skip = (_notional_skip or set()) | {sym}
+        if len(_skip) <= 3:
+            _live_try_entry(signals, regime, _notional_skip=_skip)
+        return
+
     # Re-entry observation telemetry: fires when an entry is about to open.
     # Double try/except; any exception here must never veto the entry.
     try:
@@ -12204,7 +12509,8 @@ def _live_try_entry(signals: dict, regime: str, _notional_skip: set = None) -> N
         pass
     _live_open_position(sym, direction, _ext, pos_size, lev, conv,
                        stop_mult=0.8 if _compress_sl else 1.0,
-                       htf_bias=_htf_b)
+                       htf_bias=_htf_b,
+                       thesis_snapshot=_b1_snapshot)
 
 
 
@@ -12866,6 +13172,9 @@ def _live_startup() -> None:
         "live_phase_losses":         0,
         "live_phase_consec_losses":  0,
         "live_phase_entry_balance":  None, # set on first activation or phase change
+        # Build 4C-B1: latest durable failed primary thesis by instrument+direction.
+        "failed_theses":            {},
+        "failed_thesis_history":    [],
     }
     for k, v in defaults.items():
         _live.setdefault(k, v)
