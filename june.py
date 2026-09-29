@@ -6584,6 +6584,13 @@ _HTF_CALIB_MIN_SEP     = 0.10    # 10pp aligned vs opposed WR gap required
 _LIVE_TRADE_HIST_KEY   = 'june_live_trade_history_full'
 _LIVE_TRADE_HIST_CAP   = 2000
 _LIVE_TRADE_HIST_TTL   = 86400 * 30
+# Build 4C-A3: broker-truth settlement reconciliation cadence/backoff.
+_RECON_MAX_PER_CYCLE      = 5        # cap provisional records reconciled per pass (rate-safe)
+_RECON_MIN_AGE_SECS       = 120      # let broker post settlement before first attempt
+_RECON_BASE_BACKOFF_SECS  = 300      # first retry gap; doubles per attempt
+_RECON_MAX_BACKOFF_SECS   = 6 * 3600 # cap retry gap
+_RECON_GIVEUP_SECS        = 14 * 24 * 3600  # beyond this stay UNRESOLVED, poll rarely
+_RECON_SCHEMA_VERSION     = 1
 _LIVE_REENTRY_TEL_KEY  = 'june_reversal_reentry_tel'
 _LIVE_REENTRY_TEL_CAP  = 500
 _LIVE_REENTRY_TEL_TTL  = 86400 * 30
@@ -7231,6 +7238,178 @@ def _live_poll_pnl() -> None:
 
 
 # ── Skim-cycle mechanics (Part 4) ────────────────────────────────────────────
+
+def _live_reconcile_provisional_settlements() -> None:
+    """B4CA3: promote eligible PROVISIONAL/UNKNOWN primary settlements to CONFIRMED
+    using authoritative IG broker evidence. Read-only to the broker; idempotent;
+    never invents P&L. Runs on the bounded _LIVE_POLL_INTERVAL cadence.
+    """
+    now = time.time()
+    try:
+        _rh = _redis()
+        raw_list = _rh.lrange(_LIVE_TRADE_HIST_KEY, 0, -1) or []
+    except Exception as exc:
+        _live_log(f"[RECON] durable history unavailable: {exc}")
+        return
+    # Select provisional/unknown records that are due for a reconciliation attempt.
+    due = []  # (index, record)
+    for idx, raw in enumerate(raw_list):
+        try:
+            rec = json.loads(raw)
+        except Exception:
+            continue
+        if rec.get("settlement_state") != "PROVISIONAL":
+            continue                      # only modern provisional records; legacy untouched
+        if rec.get("dollar_pnl") is not None:
+            continue                      # already has authoritative P&L
+        if not rec.get("deal_id"):
+            continue                      # no strong identity -> cannot confirm; leave UNKNOWN
+        exit_epoch = rec.get("exit_epoch", 0) or 0
+        if now - exit_epoch < _RECON_MIN_AGE_SECS:
+            continue                      # give broker time to post the settlement
+        if now - exit_epoch > _RECON_GIVEUP_SECS:
+            continue                      # too old; remain UNRESOLVED, do not churn
+        last = rec.get("recon_last_attempt", 0) or 0
+        att  = rec.get("recon_attempts", 0) or 0
+        backoff = min(_RECON_MAX_BACKOFF_SECS, _RECON_BASE_BACKOFF_SECS * (2 ** att))
+        if now - last < backoff:
+            continue                      # backoff not elapsed
+        due.append((idx, rec))
+        if len(due) >= _RECON_MAX_PER_CYCLE:
+            break
+    if not due:
+        return
+
+    # Fetch a bounded transactions window ONCE (shared across all due records).
+    _tx_data = _ig_live_get(
+        "/history/transactions",
+        params={"type": "ALL_DEAL", "maxSpanSeconds": 14 * 24 * 3600, "pageSize": 0},
+        version="2",
+    )
+    _txs = (_tx_data or {}).get("transactions", []) if isinstance(_tx_data, dict) else []
+
+    for idx, rec in due:
+        deal_id = rec["deal_id"]
+        sym     = rec.get("instrument", "?")
+        dirn    = rec.get("direction", "long")
+        # Record the attempt durably FIRST (prevents retry storm across restart).
+        rec["recon_attempts"]     = (rec.get("recon_attempts", 0) or 0) + 1
+        rec["recon_last_attempt"] = int(now)
+        rec["recon_schema"]       = _RECON_SCHEMA_VERSION
+        try:
+            _rh.lset(_LIVE_TRADE_HIST_KEY, idx, json.dumps(rec))
+        except Exception:
+            pass
+        _live_observe("settlement_reconcile_attempt", None, None,
+                      {"deal_id": deal_id, "instrument": sym,
+                       "attempt": rec["recon_attempts"], "B4CA3": True})
+
+        # STRONG IDENTITY: confirm this exact deal is closed via /history/activity.
+        _act = _ig_live_get("/history/activity",
+                            params={"dealId": deal_id, "detailed": "true",
+                                    "maxSpanSeconds": 14 * 24 * 3600, "pageSize": 500},
+                            version="3")
+        _acts = (_act or {}).get("activities", []) if isinstance(_act, dict) else []
+        _closed = None
+        for a in _acts:
+            if a.get("dealId") != deal_id:
+                continue
+            det = a.get("details") or {}
+            for action in (det.get("actions") or []):
+                if action.get("actionType") in ("POSITION_CLOSED", "POSITION_PARTIALLY_CLOSED"):
+                    _closed = {"epic": a.get("epic"),
+                               "level": det.get("level"),
+                               "size": det.get("size"),
+                               "direction": det.get("direction"),
+                               "date": a.get("date"),
+                               "partial": action.get("actionType") == "POSITION_PARTIALLY_CLOSED"}
+                    break
+            if _closed:
+                break
+        if not _closed:
+            # No authoritative close activity yet (or unavailable) -> stay PROVISIONAL.
+            _live_observe("settlement_reconcile_deferred", None, None,
+                          {"deal_id": deal_id, "reason": "no_close_activity_yet", "B4CA3": True})
+            continue
+        if _closed.get("partial"):
+            # Partial close: campaign not fully realized. Do NOT finalize on a partial.
+            _live_observe("settlement_reconcile_deferred", None, None,
+                          {"deal_id": deal_id, "reason": "partial_close_not_final", "B4CA3": True})
+            continue
+
+        # AUTHORITATIVE P&L: match exactly one /history/transactions DEAL row.
+        _epic  = _closed.get("epic")
+        _clvl  = _closed.get("level")
+        _cands = []
+        for tx in _txs:
+            if tx.get("transactionType") != "DEAL":
+                continue
+            # Match by instrument identity + close level (strong, level is exact).
+            _tx_close = tx.get("closeLevel")
+            _match_lvl = False
+            try:
+                if _clvl is not None and _tx_close is not None:
+                    _match_lvl = abs(float(_tx_close) - float(_clvl)) < 1e-6
+            except (TypeError, ValueError):
+                _match_lvl = False
+            # Instrument identity: our instrument symbol must appear in the IG
+            # transaction instrumentName (e.g. "Silver" / "Spot Gold"), OR our
+            # stored epic matches. Level match alone is NOT sufficient.
+            _tx_name = str(tx.get("instrumentName", "")).upper()
+            _instr_ok = bool(_tx_name) and (
+                sym.upper() in _tx_name or
+                (rec.get("epic") and str(rec.get("epic")).upper() in _tx_name)
+            )
+            if _match_lvl and _instr_ok:
+                _cands.append(tx)
+        # Require EXACTLY ONE unambiguous P&L candidate.
+        if len(_cands) != 1:
+            _live_observe("settlement_match_ambiguous", None, None,
+                          {"deal_id": deal_id, "n_candidates": len(_cands), "B4CA3": True})
+            continue
+        _pnl_str = _cands[0].get("profitAndLoss")
+        try:
+            _pnl = float(str(_pnl_str).replace("$", "").replace(",", ""))
+        except (TypeError, ValueError):
+            _live_observe("settlement_match_ambiguous", None, None,
+                          {"deal_id": deal_id, "reason": "unparseable_pnl", "B4CA3": True})
+            continue
+
+        # Exactly-once promotion. Re-read the record at idx to avoid clobbering a
+        # concurrent change; only promote if still PROVISIONAL with no dollar_pnl.
+        try:
+            _cur_raw = _rh.lindex(_LIVE_TRADE_HIST_KEY, idx)
+            _cur = json.loads(_cur_raw) if _cur_raw else rec
+        except Exception:
+            _cur = rec
+        if (_cur.get("deal_id") != deal_id
+                or _cur.get("settlement_state") != "PROVISIONAL"
+                or _cur.get("dollar_pnl") is not None):
+            continue  # already changed/confirmed elsewhere -> skip (idempotent)
+        _cur["dollar_pnl"]        = round(_pnl, 4)
+        _cur["exit_price"]        = _clvl
+        _cur["settlement_state"]  = "CONFIRMED"
+        _cur["pnl_source"]        = "broker_confirmed_transaction_reconciled"
+        _cur["settlement_source"] = (_cur.get("settlement_source", "") + "+recon_activity_tx")
+        _cur["reconciled"]        = True
+        _cur["reconciled_at"]     = int(now)
+        _cur["recon_schema"]      = _RECON_SCHEMA_VERSION
+        try:
+            _rh.lset(_LIVE_TRADE_HIST_KEY, idx, json.dumps(_cur))
+        except Exception as exc:
+            _live_log(f"[RECON] persist failed for {deal_id}: {exc}")
+            continue
+        # Feed adaptive consumer EXACTLY ONCE, only now that P&L is authoritative.
+        try:
+            _live_perf_record(sym, _pnl > 0, None, pnl_dollar=_pnl)
+        except Exception as exc:
+            _live_log(f"[RECON] perf_record failed (non-fatal) {deal_id}: {exc}")
+        _live_log(f"[RECON] CONFIRMED {sym} {dirn} deal={deal_id} P&L ${_pnl:+.4f} "
+                  f"(broker transaction, was PROVISIONAL/UNKNOWN)")
+        _live_observe("settlement_confirmed", None, None,
+                      {"deal_id": deal_id, "instrument": sym, "dollar_pnl": round(_pnl, 4),
+                       "prior_state": "PROVISIONAL", "match": "activity_dealId+tx_closeLevel",
+                       "B4CA3": True})
 
 def _live_check_skim() -> None:
     """Apply confirmed skim milestones. No other numbers or tiers.
@@ -12080,6 +12259,7 @@ def _run_live_step_observed(signals: dict) -> None:
     # Periodic balance and P&L refresh (every 5 minutes, not every cycle)
     _live_poll_balance()
     _live_poll_pnl()
+    _live_reconcile_provisional_settlements()  # B4CA3 broker-truth reconciliation
 
     # Skim check after P&L update
     _live_check_skim()

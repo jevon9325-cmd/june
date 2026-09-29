@@ -27,7 +27,7 @@ def step_harness():
               _LIVE_DEF_MICRO_FLOOR_USD=1, _LIVE_DEF_MICRO_PCT=.15,
               _LIVE_DEF_FLOOR_USD=10, _LIVE_DEF_PCT=.025, _LIVE_DEF_TIMEOUT_SECS=1800,
               _redis=Mock(return_value=Mock(get=Mock(return_value=None))))
-    for name in ("_live_poll_balance", "_live_poll_pnl", "_live_check_skim",
+    for name in ("_live_poll_balance", "_live_poll_pnl", "_live_reconcile_provisional_settlements", "_live_check_skim",
                  "_live_publish_eligible_instruments", "_sim_apply_pos_adjust",
                  "_live_check_exit", "_live_check_pyramid_exits", "_live_check_pyramid_entry",
                  "_live_retry_stop_sync", "_live_refresh_liq_before", "_live_check_circuit_breaker", "_live_save_state",

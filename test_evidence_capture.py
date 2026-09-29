@@ -310,7 +310,7 @@ class RuntimeTests(CaptureTests):
                             for r in self.rows()))
         ns['_live'].update(open_position=None, pyramid_legs=[leg], balance=0)
         ns['_current_cycle_signals_snap'] = {}
-        for name in ('_live_poll_balance', '_live_poll_pnl', '_live_check_skim',
+        for name in ('_live_poll_balance', '_live_poll_pnl', '_live_reconcile_provisional_settlements', '_live_check_skim',
                      '_live_publish_eligible_instruments', '_live_check_circuit_breaker',
                      '_live_update_defensive_mode', '_live_close_all_addon_legs', '_live_settle_primary_exit', '_live_mark_settled', '_ls_confirmed_pnl'):
             ns[name] = Mock()
