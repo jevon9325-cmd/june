@@ -7239,10 +7239,45 @@ def _live_poll_pnl() -> None:
 
 # ── Skim-cycle mechanics (Part 4) ────────────────────────────────────────────
 
+# Build 4C-A31: instrument -> IG transaction instrumentName token(s) for join.
+# Only authoritative, already-known relationships. Ambiguous -> match fails closed.
+_RECON_INSTR_TOKENS = {
+    "SILVER": ("SILVER",), "GOLD": ("GOLD",), "OIL": ("OIL", "CRUDE"),
+    "NATGAS": ("NATURAL GAS", "NAT GAS"), "WHEAT": ("WHEAT",),
+    "SUGAR": ("SUGAR",), "COCOA": ("COCOA",), "HO": ("HEATING OIL",),
+}
+
+def _recon_instr_matches(sym, tx_name):
+    """True iff the IG transaction instrumentName authoritatively identifies sym.
+    Fail-closed: unknown symbol or no token hit -> False."""
+    name = str(tx_name or "").upper()
+    if not name:
+        return False
+    toks = _RECON_INSTR_TOKENS.get(str(sym).upper())
+    if not toks:
+        # No authoritative normalization for this symbol -> refuse (fail closed).
+        return False
+    return any(tok in name for tok in toks)
+
+def _recon_iso(epoch_sec):
+    """UTC ISO-8601 'YYYY-MM-DDTHH:MM:SS' for IG /history/activity from/to params."""
+    import datetime as _dt
+    return _dt.datetime.utcfromtimestamp(int(epoch_sec)).strftime("%Y-%m-%dT%H:%M:%S")
+
 def _live_reconcile_provisional_settlements() -> None:
-    """B4CA3: promote eligible PROVISIONAL/UNKNOWN primary settlements to CONFIRMED
-    using authoritative IG broker evidence. Read-only to the broker; idempotent;
-    never invents P&L. Runs on the bounded _LIVE_POLL_INTERVAL cadence.
+    """B4CA3/B4CA31: promote eligible PROVISIONAL/UNKNOWN primary settlements to
+    CONFIRMED using authoritative IG broker evidence. Read-only to the broker;
+    idempotent; never invents P&L. Bounded cadence via _LIVE_POLL_INTERVAL.
+
+    Matching (fail-closed at every step):
+      Match A: /history/activity?dealId=<open deal_id> over a bounded from/to
+               window -> POSITION_CLOSED for that dealId.
+      Match B: if A misses (broker-managed close indexed under a different close
+               dealId), scan the same bounded window for a UNIQUE activity whose
+               details.actions[].affectedDealId == our deal_id and actionType
+               POSITION_CLOSED.
+      Then join to exactly ONE /history/transactions DEAL row by authoritative
+      instrument identity + exact close level. Partial closes never finalize.
     """
     now = time.time()
     try:
@@ -7251,36 +7286,57 @@ def _live_reconcile_provisional_settlements() -> None:
     except Exception as exc:
         _live_log(f"[RECON] durable history unavailable: {exc}")
         return
-    # Select provisional/unknown records that are due for a reconciliation attempt.
-    due = []  # (index, record)
+
+    # ---- Phase A31.7: replay perf-consumer for CONFIRMED-but-not-yet-fed records ----
+    # (Covers the crash window between CONFIRMED persist and perf_record.)
+    for idx, raw in enumerate(raw_list):
+        try:
+            rec = json.loads(raw)
+        except Exception:
+            continue
+        if (rec.get("settlement_state") == "CONFIRMED" and rec.get("reconciled")
+                and rec.get("dollar_pnl") is not None and not rec.get("perf_fed")):
+            try:
+                _live_perf_record(rec.get("instrument", "?"),
+                                  rec["dollar_pnl"] > 0, None, pnl_dollar=rec["dollar_pnl"])
+            except Exception:
+                continue  # try again next cycle; perf_fed stays False (no double-feed)
+            rec["perf_fed"] = True
+            try:
+                _rh.lset(_LIVE_TRADE_HIST_KEY, idx, json.dumps(rec))
+            except Exception:
+                pass
+
+    # Select provisional records due for a reconciliation attempt.
+    due = []
     for idx, raw in enumerate(raw_list):
         try:
             rec = json.loads(raw)
         except Exception:
             continue
         if rec.get("settlement_state") != "PROVISIONAL":
-            continue                      # only modern provisional records; legacy untouched
+            continue
         if rec.get("dollar_pnl") is not None:
-            continue                      # already has authoritative P&L
+            continue
         if not rec.get("deal_id"):
-            continue                      # no strong identity -> cannot confirm; leave UNKNOWN
+            continue
         exit_epoch = rec.get("exit_epoch", 0) or 0
         if now - exit_epoch < _RECON_MIN_AGE_SECS:
-            continue                      # give broker time to post the settlement
+            continue
         if now - exit_epoch > _RECON_GIVEUP_SECS:
-            continue                      # too old; remain UNRESOLVED, do not churn
+            continue
         last = rec.get("recon_last_attempt", 0) or 0
         att  = rec.get("recon_attempts", 0) or 0
         backoff = min(_RECON_MAX_BACKOFF_SECS, _RECON_BASE_BACKOFF_SECS * (2 ** att))
         if now - last < backoff:
-            continue                      # backoff not elapsed
+            continue
         due.append((idx, rec))
         if len(due) >= _RECON_MAX_PER_CYCLE:
             break
     if not due:
         return
 
-    # Fetch a bounded transactions window ONCE (shared across all due records).
+    # Shared bounded transactions window (v2 params: maxSpanSeconds is valid here).
     _tx_data = _ig_live_get(
         "/history/transactions",
         params={"type": "ALL_DEAL", "maxSpanSeconds": 14 * 24 * 3600, "pageSize": 0},
@@ -7292,7 +7348,6 @@ def _live_reconcile_provisional_settlements() -> None:
         deal_id = rec["deal_id"]
         sym     = rec.get("instrument", "?")
         dirn    = rec.get("direction", "long")
-        # Record the attempt durably FIRST (prevents retry storm across restart).
         rec["recon_attempts"]     = (rec.get("recon_attempts", 0) or 0) + 1
         rec["recon_last_attempt"] = int(now)
         rec["recon_schema"]       = _RECON_SCHEMA_VERSION
@@ -7302,49 +7357,71 @@ def _live_reconcile_provisional_settlements() -> None:
             pass
         _live_observe("settlement_reconcile_attempt", None, None,
                       {"deal_id": deal_id, "instrument": sym,
-                       "attempt": rec["recon_attempts"], "B4CA3": True})
+                       "attempt": rec["recon_attempts"], "B4CA31": True})
 
-        # STRONG IDENTITY: confirm this exact deal is closed via /history/activity.
+        # Bounded activity window around the observed close (from/to REQUIRED by v3).
+        _exit_ep = rec.get("exit_epoch", now) or now
+        _from = _recon_iso(_exit_ep - 2 * 3600)
+        _to   = _recon_iso(min(now, _exit_ep + 6 * 3600))
+
+        def _scan_close(activities):
+            """Return dict for a UNIQUE full-close activity of our deal (A or B), or
+            None; returns ('AMBIGUOUS',) sentinel if multiple B candidates."""
+            direct = None
+            affected = []
+            for a in (activities or []):
+                det = a.get("details") or {}
+                acts = det.get("actions") or []
+                # Match A: this activity IS our deal.
+                if a.get("dealId") == deal_id:
+                    for ac in acts:
+                        if ac.get("actionType") == "POSITION_CLOSED":
+                            direct = {"epic": a.get("epic"), "level": det.get("level"),
+                                      "size": det.get("size"), "direction": det.get("direction"),
+                                      "date": a.get("date"), "match": "A_direct"}
+                        elif ac.get("actionType") == "POSITION_PARTIALLY_CLOSED":
+                            return ("PARTIAL",)
+                # Match B: an activity whose action affected our deal.
+                for ac in acts:
+                    if ac.get("affectedDealId") == deal_id:
+                        if ac.get("actionType") == "POSITION_PARTIALLY_CLOSED":
+                            return ("PARTIAL",)
+                        if ac.get("actionType") == "POSITION_CLOSED":
+                            affected.append({"epic": a.get("epic"), "level": det.get("level"),
+                                             "size": det.get("size"), "direction": det.get("direction"),
+                                             "date": a.get("date"), "match": "B_affected"})
+            if direct is not None:
+                return direct
+            if len(affected) == 1:
+                return affected[0]
+            if len(affected) > 1:
+                return ("AMBIGUOUS",)
+            return None
+
         _act = _ig_live_get("/history/activity",
-                            params={"dealId": deal_id, "detailed": "true",
-                                    "maxSpanSeconds": 14 * 24 * 3600, "pageSize": 500},
-                            version="3")
+                            params={"from": _from, "to": _to, "detailed": "true",
+                                    "pageSize": 500}, version="3")
         _acts = (_act or {}).get("activities", []) if isinstance(_act, dict) else []
-        _closed = None
-        for a in _acts:
-            if a.get("dealId") != deal_id:
-                continue
-            det = a.get("details") or {}
-            for action in (det.get("actions") or []):
-                if action.get("actionType") in ("POSITION_CLOSED", "POSITION_PARTIALLY_CLOSED"):
-                    _closed = {"epic": a.get("epic"),
-                               "level": det.get("level"),
-                               "size": det.get("size"),
-                               "direction": det.get("direction"),
-                               "date": a.get("date"),
-                               "partial": action.get("actionType") == "POSITION_PARTIALLY_CLOSED"}
-                    break
-            if _closed:
-                break
-        if not _closed:
-            # No authoritative close activity yet (or unavailable) -> stay PROVISIONAL.
+        _closed = _scan_close(_acts)
+
+        if _closed is None:
             _live_observe("settlement_reconcile_deferred", None, None,
-                          {"deal_id": deal_id, "reason": "no_close_activity_yet", "B4CA3": True})
+                          {"deal_id": deal_id, "reason": "no_close_activity_yet", "B4CA31": True})
             continue
-        if _closed.get("partial"):
-            # Partial close: campaign not fully realized. Do NOT finalize on a partial.
+        if _closed == ("PARTIAL",):
             _live_observe("settlement_reconcile_deferred", None, None,
-                          {"deal_id": deal_id, "reason": "partial_close_not_final", "B4CA3": True})
+                          {"deal_id": deal_id, "reason": "partial_close_not_final", "B4CA31": True})
+            continue
+        if _closed == ("AMBIGUOUS",):
+            _live_observe("settlement_match_ambiguous", None, None,
+                          {"deal_id": deal_id, "reason": "multiple_affected_closes", "B4CA31": True})
             continue
 
-        # AUTHORITATIVE P&L: match exactly one /history/transactions DEAL row.
-        _epic  = _closed.get("epic")
-        _clvl  = _closed.get("level")
+        _clvl = _closed.get("level")
         _cands = []
         for tx in _txs:
             if tx.get("transactionType") != "DEAL":
                 continue
-            # Match by instrument identity + close level (strong, level is exact).
             _tx_close = tx.get("closeLevel")
             _match_lvl = False
             try:
@@ -7352,64 +7429,57 @@ def _live_reconcile_provisional_settlements() -> None:
                     _match_lvl = abs(float(_tx_close) - float(_clvl)) < 1e-6
             except (TypeError, ValueError):
                 _match_lvl = False
-            # Instrument identity: our instrument symbol must appear in the IG
-            # transaction instrumentName (e.g. "Silver" / "Spot Gold"), OR our
-            # stored epic matches. Level match alone is NOT sufficient.
-            _tx_name = str(tx.get("instrumentName", "")).upper()
-            _instr_ok = bool(_tx_name) and (
-                sym.upper() in _tx_name or
-                (rec.get("epic") and str(rec.get("epic")).upper() in _tx_name)
-            )
+            _instr_ok = _recon_instr_matches(sym, tx.get("instrumentName"))
             if _match_lvl and _instr_ok:
                 _cands.append(tx)
-        # Require EXACTLY ONE unambiguous P&L candidate.
         if len(_cands) != 1:
             _live_observe("settlement_match_ambiguous", None, None,
-                          {"deal_id": deal_id, "n_candidates": len(_cands), "B4CA3": True})
+                          {"deal_id": deal_id, "n_candidates": len(_cands),
+                           "close_match": _closed.get("match"), "B4CA31": True})
             continue
-        _pnl_str = _cands[0].get("profitAndLoss")
         try:
-            _pnl = float(str(_pnl_str).replace("$", "").replace(",", ""))
+            _pnl = float(str(_cands[0].get("profitAndLoss")).replace("$", "").replace(",", ""))
         except (TypeError, ValueError):
             _live_observe("settlement_match_ambiguous", None, None,
-                          {"deal_id": deal_id, "reason": "unparseable_pnl", "B4CA3": True})
+                          {"deal_id": deal_id, "reason": "unparseable_pnl", "B4CA31": True})
             continue
 
-        # Exactly-once promotion. Re-read the record at idx to avoid clobbering a
-        # concurrent change; only promote if still PROVISIONAL with no dollar_pnl.
+        # Exactly-once promotion (re-read guard).
         try:
-            _cur_raw = _rh.lindex(_LIVE_TRADE_HIST_KEY, idx)
-            _cur = json.loads(_cur_raw) if _cur_raw else rec
+            _cur = json.loads(_rh.lindex(_LIVE_TRADE_HIST_KEY, idx))
         except Exception:
             _cur = rec
         if (_cur.get("deal_id") != deal_id
                 or _cur.get("settlement_state") != "PROVISIONAL"
                 or _cur.get("dollar_pnl") is not None):
-            continue  # already changed/confirmed elsewhere -> skip (idempotent)
+            continue
         _cur["dollar_pnl"]        = round(_pnl, 4)
         _cur["exit_price"]        = _clvl
         _cur["settlement_state"]  = "CONFIRMED"
         _cur["pnl_source"]        = "broker_confirmed_transaction_reconciled"
-        _cur["settlement_source"] = (_cur.get("settlement_source", "") + "+recon_activity_tx")
+        _cur["settlement_source"] = (_cur.get("settlement_source", "") + "+recon:" + _closed.get("match", "?"))
         _cur["reconciled"]        = True
         _cur["reconciled_at"]     = int(now)
         _cur["recon_schema"]      = _RECON_SCHEMA_VERSION
+        _cur["perf_fed"]          = False   # will be fed just below; replayed if we crash first
         try:
             _rh.lset(_LIVE_TRADE_HIST_KEY, idx, json.dumps(_cur))
         except Exception as exc:
             _live_log(f"[RECON] persist failed for {deal_id}: {exc}")
             continue
-        # Feed adaptive consumer EXACTLY ONCE, only now that P&L is authoritative.
+        # Feed adaptive consumer exactly once; mark perf_fed durably.
         try:
             _live_perf_record(sym, _pnl > 0, None, pnl_dollar=_pnl)
+            _cur["perf_fed"] = True
+            _rh.lset(_LIVE_TRADE_HIST_KEY, idx, json.dumps(_cur))
         except Exception as exc:
-            _live_log(f"[RECON] perf_record failed (non-fatal) {deal_id}: {exc}")
+            _live_log(f"[RECON] perf_record deferred (will replay) {deal_id}: {exc}")
         _live_log(f"[RECON] CONFIRMED {sym} {dirn} deal={deal_id} P&L ${_pnl:+.4f} "
-                  f"(broker transaction, was PROVISIONAL/UNKNOWN)")
+                  f"via {_closed.get('match')} (broker transaction, was PROVISIONAL/UNKNOWN)")
         _live_observe("settlement_confirmed", None, None,
                       {"deal_id": deal_id, "instrument": sym, "dollar_pnl": round(_pnl, 4),
-                       "prior_state": "PROVISIONAL", "match": "activity_dealId+tx_closeLevel",
-                       "B4CA3": True})
+                       "prior_state": "PROVISIONAL", "match": _closed.get("match"),
+                       "B4CA31": True})
 
 def _live_check_skim() -> None:
     """Apply confirmed skim milestones. No other numbers or tiers.

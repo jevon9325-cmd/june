@@ -32,8 +32,14 @@ def _harness(records, activity_by_deal, transactions, *, now=1_000_000.0):
         if path == "/history/transactions":
             return {"transactions": transactions}
         if path == "/history/activity":
-            did = (params or {}).get("dealId")
-            return {"activities": activity_by_deal.get(did, [])}
+            # B4CA31: the reconciler now queries a bounded from/to window (no dealId
+            # param) and matches internally via _scan_close. Serve every fixture
+            # activity in the window; the function filters by dealId/affectedDealId.
+            assert params and "from" in params and "to" in params, "activity must use from/to"
+            merged = []
+            for _lst in activity_by_deal.values():
+                merged.extend(_lst)
+            return {"activities": merged}
         return None
 
     ns = dict(
@@ -43,12 +49,20 @@ def _harness(records, activity_by_deal, transactions, *, now=1_000_000.0):
         _RECON_MAX_PER_CYCLE=5, _RECON_MIN_AGE_SECS=120,
         _RECON_BASE_BACKOFF_SECS=300, _RECON_MAX_BACKOFF_SECS=6*3600,
         _RECON_GIVEUP_SECS=14*24*3600, _RECON_SCHEMA_VERSION=1,
+        # B4CA31 token map so _recon_instr_matches resolves its global.
+        _RECON_INSTR_TOKENS={
+            "SILVER": ("SILVER",), "GOLD": ("GOLD",), "OIL": ("OIL", "CRUDE"),
+            "NATGAS": ("NATURAL GAS", "NAT GAS"), "WHEAT": ("WHEAT",),
+            "SUGAR": ("SUGAR",), "COCOA": ("COCOA",), "HO": ("HEATING OIL",),
+        },
         _ig_live_get=_igget,
         _live_perf_record=lambda sym, won, sar, pnl_dollar=0.0, **k: perf_calls.append((sym, won, pnl_dollar)),
         _live_observe=lambda ev, *a, **k: observe.append(ev),
         _live_log=Mock(),
     )
-    execute([function("_live_reconcile_provisional_settlements")], ns)
+    # B4CA31: extract the new helpers the reconciler now depends on.
+    execute([function("_recon_instr_matches"), function("_recon_iso"),
+             function("_live_reconcile_provisional_settlements")], ns)
     ns["_live_reconcile_provisional_settlements"]()
     return fake.parsed(), perf_calls, observe
 
