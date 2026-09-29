@@ -22,7 +22,7 @@ def _ns(*, equity_cfd=None, redis_mock=None):
     perf_calls = []
 
     def _perf(sym, won, sar, pnl_dollar=0.0, entry_sar=None, persistence_confirmed=None,
-              excluded_defect_id=None):
+              excluded_defect_id=None, **kwargs):
         perf_calls.append({"sym": sym, "won": won, "pnl_dollar": pnl_dollar})
 
     observe_calls = []

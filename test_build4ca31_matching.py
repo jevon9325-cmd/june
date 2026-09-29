@@ -190,14 +190,20 @@ def test_no_evidence_keeps_unknown_not_zero():
 # ── 22/23: perf-replay for CONFIRMED-but-not-fed (crash window) ─────────────
 def test_perf_replay_for_unfed_confirmed():
     unfed = _prov("D1"); unfed.update(settlement_state="CONFIRMED", dollar_pnl=0.35,
-                                      reconciled=True, perf_fed=False)
+                                      reconciled=True, perf_fed=False,
+                                      evidence_class="BROKER_CONFIRMED_LIVE",
+                                      settlement_identity="deal:D1",
+                                      pnl_source="broker_confirmed_realized_pnl")
     recs, perf, obs = _run([unfed], [], [_tx()])
     assert perf == [("SILVER", True, 0.35)]       # replayed once
     assert recs[0]["perf_fed"] is True
 
 def test_perf_replay_not_double_fed():
     fed = _prov("D1"); fed.update(settlement_state="CONFIRMED", dollar_pnl=0.35,
-                                  reconciled=True, perf_fed=True)
+                                  reconciled=True, perf_fed=True,
+                                  evidence_class="BROKER_CONFIRMED_LIVE",
+                                  settlement_identity="deal:D1",
+                                  pnl_source="broker_confirmed_realized_pnl")
     recs, perf, obs = _run([fed], [], [_tx()])
     assert perf == []                             # already fed -> no replay
 

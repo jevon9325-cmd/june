@@ -3279,6 +3279,7 @@ def _sim_save_state() -> None:
         "win_moves":            _sim.get("win_moves", {}),
         "loss_moves":           _sim.get("loss_moves", {}),
         "combo_outcomes":       _sim.get("combo_outcomes", {}),
+        "calibration_evidence_class": _EVIDENCE_SIM_PRIOR,
         "failure_snapshot":     _sim.get("failure_snapshot"),
         "failure_context_checked": _sim.get("failure_context_checked", True),
         "approach_skip_counts": _sim.get("approach_skip_counts", {}),
@@ -3853,13 +3854,20 @@ def _sim_update_streak(sym: str, direction: str, won: bool) -> None:
         )
 
 
-def _sim_15m_record(sym, direction, change_15m, won):
-    """Record 15m signal vs outcome for per-instrument directional reliability scoring."""
+def _sim_15m_record(sym, direction, change_15m, won,
+                    evidence_class="SIM_PRIOR"):
+    """Record 15m reliability with explicit SIM/live outcome provenance."""
+    _cls_fn = globals().get("_evidence_class")
+    _cls = _cls_fn(evidence_class) if _cls_fn is not None else evidence_class
+    if _cls in ("PROVISIONAL", "UNKNOWN"):
+        return
     rel      = _sim.setdefault("15m_reliability", {})
     sym_data = rel.setdefault(sym, {})
     dir_data = sym_data.setdefault(direction, {"history": []})
     agreed   = (direction == "long" and change_15m > 0) or (direction == "short" and change_15m < 0)
-    dir_data["history"].append({"agreed": agreed, "won": won, "change_15m": round(change_15m, 4)})
+    dir_data["history"].append({"agreed": agreed, "won": bool(won),
+                                 "change_15m": round(change_15m, 4),
+                                 "evidence_class": _cls})
     if len(dir_data["history"]) > _SIM_15M_LOOKBACK:
         dir_data["history"] = dir_data["history"][-_SIM_15M_LOOKBACK:]
 
@@ -4738,6 +4746,8 @@ def _sim_close_position(prices: dict, exit_reason: str) -> None:
         "claudia_pts": pos.get("claudia_pts", 0.0),
         "forecast_pts": pos.get("forecast_pts", 0.0),
         "forecast_boundary_crossed": pos.get("forecast_boundary_crossed", False),
+        "evidence_class": "SIM_PRIOR",
+        "source": "simulation",
     }
     _fc_pts = pos.get("forecast_pts", 0.0)
     if _fc_pts:
@@ -5606,6 +5616,7 @@ def _sim_stop(reason: str, signals=None) -> None:
             "win_moves":        _sim.get("win_moves", {}),
             "loss_moves":       _sim.get("loss_moves", {}),
             "combo_outcomes":   _sim.get("combo_outcomes", {}),
+            "evidence_class":    _EVIDENCE_SIM_PRIOR,
             "failure_snapshot": _failure_snapshot,
         }
         r.set("june_sim_calibration", json.dumps(_cal), ex=90 * 24 * 3600)
@@ -5773,6 +5784,7 @@ def run_simulation_step(signals: dict) -> None:
                 "win_moves":        _sim.get("win_moves", {}),
                 "loss_moves":       _sim.get("loss_moves", {}),
                 "combo_outcomes":   _sim.get("combo_outcomes", {}),
+                "evidence_class":    _EVIDENCE_SIM_PRIOR,
                 "failure_snapshot": _floor_fail_snap,
             }
             _r_bf.set("june_sim_calibration", json.dumps(_cal_bf), ex=90 * 24 * 3600)
@@ -6595,6 +6607,63 @@ _LIVE_REENTRY_TEL_KEY  = 'june_reversal_reentry_tel'
 _LIVE_REENTRY_TEL_CAP  = 500
 _LIVE_REENTRY_TEL_TTL  = 86400 * 30
 
+# ── Build 4C-C: explicit evidence provenance contract ─────────────────────────
+_EVIDENCE_SIM_PRIOR           = "SIM_PRIOR"
+_EVIDENCE_BROKER_CONFIRMED   = "BROKER_CONFIRMED_LIVE"
+_EVIDENCE_LEGACY_LIVE        = "LEGACY_LIVE"
+_EVIDENCE_PROVISIONAL        = "PROVISIONAL"
+_EVIDENCE_UNKNOWN            = "UNKNOWN"
+_EVIDENCE_CLASSES             = frozenset({
+    _EVIDENCE_SIM_PRIOR, _EVIDENCE_BROKER_CONFIRMED,
+    _EVIDENCE_LEGACY_LIVE, _EVIDENCE_PROVISIONAL, _EVIDENCE_UNKNOWN,
+})
+
+
+def _evidence_class(value=None, *, settlement_state=None, pnl=None,
+                    source=None, default=_EVIDENCE_LEGACY_LIVE) -> str:
+    """Normalize evidence without upgrading old/unknown data to confirmed."""
+    if value in _EVIDENCE_CLASSES:
+        return value
+    if source in ("simulation", "sim", _EVIDENCE_SIM_PRIOR):
+        return _EVIDENCE_SIM_PRIOR
+    if settlement_state == "PROVISIONAL":
+        return _EVIDENCE_PROVISIONAL
+    if settlement_state == "UNKNOWN":
+        return _EVIDENCE_UNKNOWN
+    if settlement_state == "CONFIRMED" and value == _EVIDENCE_BROKER_CONFIRMED:
+        return _EVIDENCE_BROKER_CONFIRMED
+    # Existing rows have no modern evidence contract. Preserve, but label legacy.
+    return default if default in _EVIDENCE_CLASSES else _EVIDENCE_LEGACY_LIVE
+
+
+def _record_evidence_class(record: dict, default=_EVIDENCE_LEGACY_LIVE) -> str:
+    if not isinstance(record, dict):
+        return default
+    return _evidence_class(
+        record.get("evidence_class"),
+        settlement_state=record.get("settlement_state"),
+        pnl=record.get("dollar_pnl"), source=record.get("source"), default=default)
+
+
+def _confirmed_outcome_record(record: dict) -> bool:
+    """Only explicit broker-confirmed, non-null outcomes train confirmed-live planes."""
+    return (_record_evidence_class(record) == _EVIDENCE_BROKER_CONFIRMED
+            and record.get("dollar_pnl") is not None)
+
+
+def _performance_learning_rows(records: list) -> list:
+    """Backward-compatible rows: confirmed plus explicit legacy, never unresolved."""
+    return [r for r in (records or [])
+            if _record_evidence_class(r) in (_EVIDENCE_BROKER_CONFIRMED, _EVIDENCE_LEGACY_LIVE)
+            and r.get("dollar_pnl") is not None]
+
+
+def _outcome_observation_id(*, settlement_identity=None, deal_id=None,
+                            campaign_id=None, fallback=None):
+    return (settlement_identity or
+            (f"deal:{deal_id}" if deal_id else None) or
+            (f"campaign:{campaign_id}" if campaign_id else None) or fallback)
+
 
 def _live_fetch_htf_candles(sym):
     """Return last 4 hourly OHLC mid-price dicts via IG REST.
@@ -6660,10 +6729,10 @@ def _compute_htf_alignment(sym, direction):
     return htf_bias, htf_move, note
 
 
-def _live_write_htf_event(sym, direction, htf_bias, htf_move_pct, entry_price):
-    """Write completed-trade HTF event to Redis for calibration.  Fire-and-forget.
-    OBSERVATION-ONLY.
-    """
+def _live_write_htf_event(sym, direction, htf_bias, htf_move_pct, entry_price,
+                          evidence_class=_EVIDENCE_SIM_PRIOR,
+                          deal_id=None, settlement_identity=None):
+    """Write an HTF event with explicit evidence provenance."""
     try:
         rec = json.dumps({
             "ts":           int(time.time()),
@@ -6672,6 +6741,9 @@ def _live_write_htf_event(sym, direction, htf_bias, htf_move_pct, entry_price):
             "htf_bias":     htf_bias,
             "htf_move_pct": round(htf_move_pct, 5),
             "entry_price":  round(entry_price, 5),
+            "evidence_class": _evidence_class(evidence_class),
+            "deal_id": deal_id,
+            "settlement_identity": settlement_identity,
         })
         _r = _redis()
         _r.lpush(_HTF_EVENTS_KEY, rec)
@@ -6699,22 +6771,31 @@ def _htf_self_calibrate():
                 events.append(json.loads(raw))
             except Exception:
                 pass
-        trade_hist = _live.get("trade_history", []) + _sim.get("trade_history", [])
+        # Build only the confirmed-live population for the live HTF gate.
+        # Simulation and legacy histories remain diagnostic but never mix into
+        # htf_combo_outcomes; unresolved P&L is never coerced to a loss.
+        trade_hist = [t for t in (_live.get("trade_history", []) or [])
+                      if _confirmed_outcome_record(t)]
         try:
             _pr = _r.lrange(_LIVE_TRADE_HIST_KEY, 0, -1)
             _ph = [json.loads(x) for x in _pr]
-            _sk = {(t.get("instrument"),t.get("direction"),t.get("exit_epoch")) for t in trade_hist}
-            trade_hist = trade_hist + [t for t in _ph if (t.get("instrument"),t.get("direction"),t.get("exit_epoch")) not in _sk]
+            _sk = {(t.get("instrument"), t.get("direction"), t.get("exit_epoch"))
+                   for t in trade_hist}
+            trade_hist += [t for t in _ph
+                           if _confirmed_outcome_record(t)
+                           and (t.get("instrument"), t.get("direction"), t.get("exit_epoch")) not in _sk]
         except Exception:
             pass
         results = {"aligned": [], "opposed": [], "neutral": []}
-        per_combo: dict = {}   # {sym_dir_bias: [(won, pnl), ...]}
+        per_combo: dict = {}   # confirmed-live only
         matched = 0
         for ev in events:
             ev_ts  = ev.get("ts", 0)
             ev_sym = ev.get("sym", "")
             ev_dir = ev.get("direction", "")
             htf_b  = ev.get("htf_bias", "unknown")
+            if _record_evidence_class(ev) != _EVIDENCE_BROKER_CONFIRMED:
+                continue
             match = None
             for tr in trade_hist:
                 if tr.get("instrument") != ev_sym or tr.get("direction") != ev_dir:
@@ -6722,11 +6803,13 @@ def _htf_self_calibrate():
                 if abs(tr.get("exit_epoch", 0) - ev_ts) <= 1800:
                     match = tr
                     break
-            if match is None:
+            if match is None or match.get("dollar_pnl") is None:
+                continue
+            pnl = match.get("pnl_pct")
+            if pnl is None:
                 continue
             matched += 1
-            won = match.get("dollar_pnl", 0.0) > 0
-            pnl = match.get("pnl_pct", 0.0)
+            won = float(match["dollar_pnl"]) > 0
             aligned = ((ev_dir == "long"  and htf_b == "bull") or
                        (ev_dir == "short" and htf_b == "bear"))
             opposed = ((ev_dir == "long"  and htf_b == "bear") or
@@ -6907,6 +6990,14 @@ def _live_b1_build_snapshot(sym: str, direction: str, signals: dict, regime: str
         "persistence_confirmed": bool(persistence),
         "gate_mode": gate_mode,
         "rel_score": rel_score,
+        "evidence_classes": {
+            "conviction": "MIXED_SIM_PRIOR_LIVE_STATS",
+            "htf": "CURRENT_MARKET",
+            "exhaustion": "CURRENT_MARKET",
+            "macro": "CURRENT_EXTERNAL_DIRECTIVE",
+            "atr_price_reset": "CURRENT_MARKET",
+            "session": "CURRENT_CLOCK",
+        },
     }
     snap["thesis_key"] = _live_b1_thesis_key(snap)
     return snap
@@ -7550,16 +7641,26 @@ def _live_reconcile_provisional_settlements() -> None:
 
     # ---- Phase A31.7: replay perf-consumer for CONFIRMED-but-not-yet-fed records ----
     # (Covers the crash window between CONFIRMED persist and perf_record.)
+    _record_class_fn = globals().get("_record_evidence_class")
     for idx, raw in enumerate(raw_list):
         try:
             rec = json.loads(raw)
         except Exception:
             continue
-        if (rec.get("settlement_state") == "CONFIRMED" and rec.get("reconciled")
+        _rec_class = (_record_class_fn(rec) if _record_class_fn is not None
+                      else rec.get("evidence_class"))
+        if (_rec_class == "BROKER_CONFIRMED_LIVE"
+                and rec.get("settlement_state") == "CONFIRMED"
+                and rec.get("reconciled")
                 and rec.get("dollar_pnl") is not None and not rec.get("perf_fed")):
             try:
-                _live_perf_record(rec.get("instrument", "?"),
-                                  rec["dollar_pnl"] > 0, None, pnl_dollar=rec["dollar_pnl"])
+                _live_perf_record(
+                    rec.get("instrument", "?"), rec["dollar_pnl"] > 0, None,
+                    pnl_dollar=rec["dollar_pnl"],
+                    campaign_id=rec.get("campaign_id"), deal_id=rec.get("deal_id"),
+                    settlement_identity=rec.get("settlement_identity") or (f"deal:{rec.get('deal_id')}" if rec.get("deal_id") else None),
+                    settlement_state="CONFIRMED", evidence_class="BROKER_CONFIRMED_LIVE",
+                    pnl_source=rec.get("pnl_source"), exit_reason=rec.get("exit_reason"))
             except Exception:
                 continue  # try again next cycle; perf_fed stays False (no double-feed)
             rec["perf_fed"] = True
@@ -7720,6 +7821,8 @@ def _live_reconcile_provisional_settlements() -> None:
         _cur["pnl_source"]        = "broker_confirmed_transaction_reconciled"
         _cur["settlement_source"] = (_cur.get("settlement_source", "") + "+recon:" + _closed.get("match", "?"))
         _cur["reconciled"]        = True
+        _cur["evidence_class"]    = "BROKER_CONFIRMED_LIVE"
+        _cur["settlement_identity"] = f"deal:{deal_id}"
         _cur["reconciled_at"]     = int(now)
         _cur["recon_schema"]      = _RECON_SCHEMA_VERSION
         _cur["perf_fed"]          = False   # will be fed just below; replayed if we crash first
@@ -7730,7 +7833,12 @@ def _live_reconcile_provisional_settlements() -> None:
             continue
         # Feed adaptive consumer exactly once; mark perf_fed durably.
         try:
-            _live_perf_record(sym, _pnl > 0, None, pnl_dollar=_pnl)
+            _live_perf_record(
+                sym, _pnl > 0, None, pnl_dollar=_pnl,
+                campaign_id=_cur.get("campaign_id"), deal_id=deal_id,
+                settlement_identity=_cur.get("settlement_identity") or f"deal:{deal_id}",
+                settlement_state="CONFIRMED", evidence_class="BROKER_CONFIRMED_LIVE",
+                pnl_source=_cur.get("pnl_source"), exit_reason=_cur.get("exit_reason"))
             _cur["perf_fed"] = True
             _rh.lset(_LIVE_TRADE_HIST_KEY, idx, json.dumps(_cur))
         except Exception as exc:
@@ -8319,7 +8427,7 @@ def _live_perf_last_won(sym: str) -> bool:
         import json as _json
         raw = _redis().get(f"june_perf_stats:{sym}")
         if raw:
-            trades = _json.loads(raw).get("trades", [])
+            trades = _performance_learning_rows(_json.loads(raw).get("trades", []))
             if trades:
                 return bool(trades[-1].get("won", False))
     except Exception:
@@ -8348,7 +8456,8 @@ def _live_migrate_perf_blocks() -> None:
             trades = []
 
         cutoff = _time.time() - _PERF_BLOCK_RECENCY_DAYS * 86400
-        recent = [t for t in trades if t.get("epoch", 0) >= cutoff and not t.get("excluded_defect_id")]
+        recent = _performance_learning_rows(
+            [t for t in trades if t.get("epoch", 0) >= cutoff])
         n = len(recent)
         wins = sum(1 for t in recent if t.get("won"))
         wr = wins / n if n > 0 else 1.0
@@ -8415,7 +8524,12 @@ def _live_migrate_perf_blocks() -> None:
                     f"(n={n}, WR={wr:.0%}, loss={loss_pct:.1%})"
                 )
 
-def _live_perf_record(sym: str, won: bool, sar, pnl_dollar: float = 0.0, entry_sar=None, persistence_confirmed=None, excluded_defect_id: str = None) -> None:
+def _live_perf_record(sym: str, won: bool, sar, pnl_dollar: float = 0.0,
+                      entry_sar=None, persistence_confirmed=None,
+                      excluded_defect_id: str = None, campaign_id=None,
+                      deal_id=None, settlement_identity=None,
+                      settlement_state=None, evidence_class=None,
+                      pnl_source=None, exit_reason=None) -> None:
     """Update rolling per-instrument performance stats in Redis.
     Each record carries epoch timestamp and dollar P&L.
     Severity tiers keyed to % of current balance lost:
@@ -8423,14 +8537,30 @@ def _live_perf_record(sym: str, won: bool, sar, pnl_dollar: float = 0.0, entry_s
       Observer Moderate -- WR < 30%, >= 8 recent, net loss >= 3%
       Hard Block        -- WR < 20%, >= 12 recent, net loss > 7%, 12h TTL
     SAR block logic unchanged.
-    Called only after a confirmed IG position close.
+    Called only after a confirmed IG position close. Provisional/UNKNOWN rows are
+    never outcome-training observations.
     """
+    _cls = _evidence_class(evidence_class, settlement_state=settlement_state,
+                           pnl=pnl_dollar, default=_EVIDENCE_LEGACY_LIVE)
+    if _cls in (_EVIDENCE_SIM_PRIOR, _EVIDENCE_PROVISIONAL, _EVIDENCE_UNKNOWN):
+        _live_log(f"[PERF SKIP] {sym}: evidence_class={_cls} is not live outcome training")
+        return
+    if pnl_dollar is None:
+        _live_log(f"[PERF SKIP] {sym}: missing P&L; outcome remains UNKNOWN")
+        return
+    _observation_id = _outcome_observation_id(
+        settlement_identity=settlement_identity, deal_id=deal_id,
+        campaign_id=campaign_id)
+    won = float(pnl_dollar) > 0
     try:
         r      = _redis()
         key    = f"june_perf_stats:{sym}"
         raw    = r.get(key)
         stats  = json.loads(raw) if raw else {"trades": []}
         trades = stats.get("trades", [])
+        if _observation_id and any(t.get("observation_id") == _observation_id for t in trades):
+            _live_log(f"[PERF DEDUP] {sym}: observation={_observation_id} already consumed")
+            return
         session     = "overnight" if is_overnight() else "day"
         sub_session = _current_sub_session(sym)
         trades.append({
@@ -8443,6 +8573,14 @@ def _live_perf_record(sym: str, won: bool, sar, pnl_dollar: float = 0.0, entry_s
             "session_schema": _SESSION_SCHEMA_VERSION,  # B4CC provenance
             "epoch": int(time.time()),
             "pnl_dollar": round(pnl_dollar, 4),
+            "campaign_id": campaign_id,
+            "deal_id": deal_id,
+            "settlement_identity": settlement_identity,
+            "settlement_state": settlement_state or "CONFIRMED",
+            "evidence_class": _cls,
+            "pnl_source": pnl_source,
+            "exit_reason": exit_reason,
+            "observation_id": _observation_id,
             **({"excluded_defect_id": excluded_defect_id} if excluded_defect_id else {}),
         })
         keep = max(_PERF_BLOCK_WINDOW, _PERF_BLOCK_HARD_MIN_TRADES)
@@ -8454,7 +8592,11 @@ def _live_perf_record(sym: str, won: bool, sar, pnl_dollar: float = 0.0, entry_s
         # ── Recency filter ─────────────────────────────────────────────────────────────────────────
         cutoff = time.time() - (_PERF_BLOCK_RECENCY_DAYS * 86400)
         _recent_all = [t for t in trades if t.get("epoch", 0) >= cutoff]
-        recent = [t for t in _recent_all if not t.get("excluded_defect_id")]
+        _training_rows = _performance_learning_rows(_recent_all)
+        _skipped_unresolved = len(_recent_all) - len(_training_rows)
+        if _skipped_unresolved:
+            _live_log(f"[PERF PROVENANCE] {sym}: skipped {_skipped_unresolved} unresolved/non-live rows")
+        recent = [t for t in _training_rows if not t.get("excluded_defect_id")]
         _qt_wr = len(_recent_all) - len(recent)
         if _qt_wr:
             _live_log(f"  [QUARANTINE] {sym}: {_qt_wr} defect-tagged trade(s) excluded from WR eval")
@@ -8989,7 +9131,9 @@ def _live_open_position(sym: str, direction: str, signals: dict,
         "leverage":     leverage,
         "notional":     actual_n,
         "stop_pct":     stop_pct,
+        "stop_source":  "SIM_PRIOR+CURRENT_MARKET_SPREAD_FLOOR",
         "tp_pct":       tp_pct,
+        "tp_source":   "SIM_PRIOR",
         "stop_dist":    stop_dist,
         "broker_stop_level": _broker_stop_level,
         "entry_time":   time.time(),
@@ -9306,6 +9450,8 @@ def _live_settle_primary_exit(pos: dict, exit_reason: str, source: str,
         "partial_dollar_pnl": round(partial_pnl, 4),
         "commission":  round(commission, 2),
         "pnl_source":  pnl_provenance,
+        "tp_source":    pos.get("tp_source", "SIM_PRIOR"),
+        "stop_source":  pos.get("stop_source", "SIM_PRIOR+CURRENT_MARKET_SPREAD_FLOOR"),
         "settlement_state": settlement_state,
         "settlement_source": source,               # e.g. ls_fully_closed / reconciliation.flat / close_guard_absent
         "hold_min":    round(hold_min, 1),
@@ -9313,6 +9459,11 @@ def _live_settle_primary_exit(pos: dict, exit_reason: str, source: str,
         "exit_reason": exit_reason,
         "conviction":  pos.get("conviction", 0),
         "reconciled":  settlement_state == "CONFIRMED",
+        "evidence_class": ("BROKER_CONFIRMED_LIVE"
+                            if settlement_state == "CONFIRMED" else
+                            ("PROVISIONAL" if dollar_pnl is None else "UNKNOWN")),
+        "settlement_identity": f"deal:{deal_id}" if deal_id else None,
+        "campaign_id": pos.get("campaign_id") or pos.get("rolling_campaign_id"),
         "B4CA2":       True,
         "thesis_key":  pos.get("thesis_key"),
         "thesis_snapshot": pos.get("thesis_snapshot"),
@@ -9348,9 +9499,20 @@ def _live_settle_primary_exit(pos: dict, exit_reason: str, source: str,
     if settlement_state == "CONFIRMED" and dollar_pnl is not None:
         _sar = (signals or {}).get(sym, {}).get("spread_atr_ratio")
         try:
+            _perf_id = f"deal:{deal_id}" if deal_id else None
             _live_perf_record(sym, dollar_pnl > 0, _sar, pnl_dollar=dollar_pnl,
                               entry_sar=pos.get("entry_sar"),
-                              persistence_confirmed=pos.get("persistence_confirmed"))
+                              persistence_confirmed=pos.get("persistence_confirmed"),
+                              campaign_id=pos.get("campaign_id") or pos.get("rolling_campaign_id"),
+                              deal_id=deal_id, settlement_identity=_perf_id,
+                              settlement_state="CONFIRMED",
+                              evidence_class="BROKER_CONFIRMED_LIVE",
+                              pnl_source=pnl_provenance, exit_reason=exit_reason)
+            if pos.get("htf_bias") not in (None, "unknown"):
+                _live_write_htf_event(
+                    sym, dirn, pos.get("htf_bias"), 0.0, fill_px,
+                    evidence_class="BROKER_CONFIRMED_LIVE",
+                    deal_id=deal_id, settlement_identity=_perf_id)
         except Exception as _pexc:
             _live_log(f"[SETTLE] perf_record failed (non-fatal): {_pexc}")
     _live_observe("primary_settled", signals, pos, {
@@ -9551,6 +9713,11 @@ def _live_close_position(exit_reason: str, signals: dict) -> None:
         trade_rec["deal_id"] = deal_id  # B4CA2: identity for cross-path dedup
         trade_rec["settlement_state"] = "CONFIRMED"
         trade_rec["settlement_source"] = "june_managed_close"
+        trade_rec["tp_source"] = pos.get("tp_source", "SIM_PRIOR")
+        trade_rec["stop_source"] = pos.get("stop_source", "SIM_PRIOR+CURRENT_MARKET_SPREAD_FLOOR")
+        trade_rec["evidence_class"] = "BROKER_CONFIRMED_LIVE"
+        trade_rec["settlement_identity"] = f"deal:{deal_id}" if deal_id else None
+        trade_rec["campaign_id"] = pos.get("campaign_id") or pos.get("rolling_campaign_id")
         trade_rec["thesis_key"] = pos.get("thesis_key")
         trade_rec["thesis_snapshot"] = pos.get("thesis_snapshot")
         trade_rec["max_favorable_excursion_pct"] = pos.get("max_favorable_excursion_pct", 0.0)
@@ -9606,10 +9773,18 @@ def _live_close_position(exit_reason: str, signals: dict) -> None:
         _live_update_streak(sym, dirn, won)
         _htf_b_c = pos.get("htf_bias", "unknown")
         if _htf_b_c not in ("unknown", None):
-            _live_write_htf_event(sym, dirn, _htf_b_c, 0.0, fill_px)
+            _live_write_htf_event(sym, dirn, _htf_b_c, 0.0, fill_px,
+                                  evidence_class="BROKER_CONFIRMED_LIVE",
+                                  deal_id=deal_id,
+                                  settlement_identity=f"deal:{deal_id}" if deal_id else None)
         _live_perf_record(sym, won, sig.get("spread_atr_ratio"), pnl_dollar=complete_dollar,
-                          entry_sar=pos.get("entry_sar"), persistence_confirmed=pos.get("persistence_confirmed"))
-        _sim_15m_record(sym, dirn, pos.get("entry_change_15m") or 0.0, won)
+                          entry_sar=pos.get("entry_sar"), persistence_confirmed=pos.get("persistence_confirmed"),
+                          campaign_id=pos.get("campaign_id") or pos.get("rolling_campaign_id"),
+                          deal_id=deal_id, settlement_identity=f"deal:{deal_id}" if deal_id else None,
+                          settlement_state="CONFIRMED", evidence_class="BROKER_CONFIRMED_LIVE",
+                          pnl_source="confirmed_fill_estimate", exit_reason=exit_reason)
+        _sim_15m_record(sym, dirn, pos.get("entry_change_15m") or 0.0, won,
+                        evidence_class="BROKER_CONFIRMED_LIVE")
         # Live phase stat update — only counted when above balance gate
         if _live.get("balance", 0.0) >= _LIVE_PHASE_GATE_BAL:
             _live["live_phase_trades"]  = _live.get("live_phase_trades", 0) + 1
@@ -11747,6 +11922,8 @@ def _live_add_pyramid_leg(signals: dict, decision=None) -> None:
                     proposed_quantity=ig_size)
     stop_pct = max(_sim_get_dynamic_stop(sym), _sim_get_spread_floor(sym))
     tp_pct   = _sim_get_tp(sym, dirn, primary.get("conviction", 5))
+    decision["tp_source"] = "SIM_PRIOR"
+    decision["stop_source"] = "SIM_PRIOR+CURRENT_MARKET_SPREAD_FLOOR"
 
     # Equity CFD gates — mirror of _live_open_position() gates; this path bypasses
     # that function so both checks must be replicated here for equity add-ons.
