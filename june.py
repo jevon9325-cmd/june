@@ -451,6 +451,8 @@ _live_min_deal:  dict = {}   # sym -> minDealSize.value from LIVE API (populated
 _live_pip_sizes: dict = {}   # sym -> pip size in price units from LIVE API (populated in _live_startup)
 _live_price_unit: dict = {}  # sym -> USD-per-native-price-unit (0.01 for cents, 1.0 otherwise)
 _live_margin:    dict = {}   # sym -> IG margin rate (0.0-1.0 fraction) from LIVE API, e.g. 0.8=80%
+_live_market_status: dict = {}  # sym -> latest IG marketStatus capability snapshot
+_live_capability_skip_logged: set = set()  # bounded one-time capability reason logs
 _live_equity_cfd: set = set() # syms whose epic ends .CASH.IP — IG size field is shares, not lots
 _live_fx_instruments: set = set() # syms whose epic matches CS.D.*.CFD.IP — FX pairs (correct sizing: lot_sz/pip_sz)
 _live_ccy:    dict = {}   # sym -> ISO currency code from IG currencies[0].name ("USD", "GBP", …)
@@ -921,6 +923,10 @@ def fetch_price(epic: str) -> Optional[dict]:
     if not data:
         return None
     snap  = data.get("snapshot", {})
+    _price_sym = _INSTRUMENTS_REVERSE.get(epic)
+    _market_status = snap.get("marketStatus")
+    if _price_sym and _market_status:
+        _live_market_status[_price_sym] = _market_status
     bid   = snap.get("bid")
     offer = snap.get("offer")
 
@@ -1998,6 +2004,13 @@ def _maybe_discover_cfd(needed_bases: set) -> None:
         if epic:
             _direct_cfd_map[base] = epic
             _save_direct_cfd_cache()
+            if (base not in INSTRUMENTS
+                    and base not in _sim_min_notional
+                    and not any(_pending_sym == base for _pending_sym, _ in _notional_pending)):
+                _notional_pending.append((base, epic))
+                _live_log(
+                    f"INSTRUMENT_CAPABILITY: symbol={base} reason=discovered_queued_for_backfill"
+                )
         else:
             _cfd_miss_cache[base] = now + DIRECT_CFD_CONFIRMED_MISS_TTL
         return  # one search per invocation
@@ -2081,6 +2094,9 @@ def _refresh_direct_cfd_signals() -> None:
         if not detail:
             continue
         snap = detail.get("snapshot", {})
+        _direct_status = snap.get("marketStatus")
+        if _direct_status:
+            _live_market_status[base] = _direct_status
         pct  = snap.get("percentageChange")
         if pct is None:
             continue
@@ -8235,6 +8251,9 @@ def _live_fetch_market_data(sym: str, epic: str) -> bool:
     data = _ig_live_get(f"/markets/{epic}", version="1")
     if not data:
         return False
+    _market_status = (data.get("snapshot") or {}).get("marketStatus")
+    if _market_status:
+        _live_market_status[sym] = _market_status
     inst     = data.get("instrument", {})
     _live_broker_market_evidence[sym] = {
         "source": "IG.markets.instrument", "epic": epic,
@@ -8476,6 +8495,25 @@ def _live_publish_eligible_instruments(signals: dict) -> None:
         _live_log("\u26a0\ufe0f barbie_june_eligible_instruments publish failed: {}".format(_elig_exc))
 
 
+def _live_instrument_capability(sym: str) -> tuple:
+    """Return (usable, reason) for current broker capability metadata.
+
+    This is an in-memory, current-session gate. It does not blacklist symbols or
+    alter discovery history: temporary CLOSED/metadata gaps are re-evaluated when
+    fresh broker data arrives or on restart. EDITS_ONLY is structurally not
+    openable, while missing margin is not safe to rank for live execution.
+    """
+    status = (_live_market_status or {}).get(sym)
+    if status == "EDITS_ONLY":
+        return False, "market_edits_only"
+    if status in ("CLOSED", "OFFLINE", "SUSPENDED", "UNTRADEABLE"):
+        return False, "market_temporarily_closed"
+    if sym not in _live_margin or (_live_margin.get(sym) or 0.0) <= 0.0:
+        if sym not in _live_fx_instruments:
+            return False, "missing_margin"
+    return True, None
+
+
 def _live_is_eligible(sym: str) -> bool:
     """Eligibility check using effective live balance and IG's real per-instrument margin rate.
 
@@ -8494,6 +8532,13 @@ def _live_is_eligible(sym: str) -> bool:
     Covers all IG instrument categories: FX/commodities/indices use decimal fraction
     scale (0.5=50% margin); equity/ETF types use percentage scale (20.0=20% margin).
     """
+    _cap_ok, _cap_reason = _live_instrument_capability(sym)
+    if not _cap_ok:
+        _cap_key = (sym, _cap_reason)
+        if _cap_key not in _live_capability_skip_logged:
+            _live_capability_skip_logged.add(_cap_key)
+            _live_log(f"INSTRUMENT_INELIGIBLE: symbol={sym} reason={_cap_reason}")
+        return False
     total   = _live.get("balance_total", 0.0)
     skimmed = _live.get("skimmed_total", 0.0)
     bal     = max(0.0, total - skimmed)
