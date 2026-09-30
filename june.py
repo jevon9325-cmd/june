@@ -7469,6 +7469,46 @@ def _live_validate_rolling_state_on_load() -> None:
             )
 
 
+def _live_expire_prior_epoch_global_defensive(today_utc: str) -> bool:
+    """Expire only a global defensive episode that began before today's UTC risk day.
+
+    This is deliberately separate from baseline seeding.  The daily baseline is
+    authoritative only after a successful account poll, and startup may already
+    have restored today's per-date Redis baseline before that poll runs.  Using
+    the defensive episode's own entry timestamp therefore distinguishes:
+      * same-day restart/current-day defensive: preserve it;
+      * genuine new UTC risk date after an older defensive episode: expire it.
+
+    Invalid or missing legacy timestamps fail closed by preserving defensive mode.
+    No CB, kill-switch, position, B1, provenance, rolling, or simulation state is
+    changed here.
+    """
+    if _live.get("global_mode", "normal") != "defensive":
+        return False
+    try:
+        entered_at = float(_live.get("global_mode_entered_at", 0.0) or 0.0)
+        if entered_at <= 0.0:
+            return False
+        origin_utc = datetime.fromtimestamp(
+            entered_at, tz=timezone.utc).strftime("%Y-%m-%d")
+    except (TypeError, ValueError, OverflowError, OSError):
+        return False
+    if origin_utc >= today_utc:
+        return False
+
+    _live["global_mode"] = "normal"
+    _live["global_mode_bal_entry"] = 0.0
+    _live["global_mode_entered_at"] = 0.0
+    for _key in ("global_mode_reference", "global_mode_reference_date",
+                 "global_mode_defensive_since", "global_mode_defensive_date"):
+        _live.pop(_key, None)
+    _live_log(
+        f"[DEFENSIVE] Global: prior UTC risk epoch expired "
+        f"(origin={origin_utc}, new_epoch={today_utc})"
+    )
+    return True
+
+
 def _live_update_defensive_mode() -> None:
     """Update account hysteresis and independent instrument recovery each cycle."""
     from defensive_state import update
@@ -7677,6 +7717,7 @@ def _live_poll_balance() -> None:
                 _live["instrument_mode_entered_at"] = {}
                 _live["instrument_stopouts_today"] = {}
                 _live["instrument_won_after_def"]  = {}
+            _live_expire_prior_epoch_global_defensive(_today_utc)
             _live_log(f"Balance: ${_live['balance']:.2f} available, "
                       f"${_live['balance_margin']:.2f} in margin")
             _live_save_state()
