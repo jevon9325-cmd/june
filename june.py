@@ -2992,6 +2992,22 @@ _LEV_FUND_EVIDENCE_KEY  = "june_lev_fund_sim_evidence"   # Redis incr counter
 _LEV_FUND_EVIDENCE_REQUIRED = 25  # sim completions needed before tier can activate
 _SIM_STOP_COLD       = 0.0020  # 0.20% cold-start when no vol_history available
 
+# ── Build 4C-C1: simulation quote-scale continuity guard ──────────────────────
+# When an instrument's underlying IG epic is remapped (e.g. a 403'd BMU contract
+# is rediscovered as a CFM contract) its quotes can change scale by an order of
+# magnitude while an active simulated position still carries its old-scale entry.
+# Computing P&L across that boundary manufactures a fictitious ~99% move that
+# poisons win_moves / loss_moves / vol_history / TP / stop calibration.
+#
+# The invariant is DISCONTINUITY-based, NOT magnitude-based: a legitimate large
+# move (AG 6.60%, SMCI 5.97%, SQQQ 4.44%, OXY 4.30%, NATGAS 3.58%) keeps the
+# entry↔observation price ratio within ~1.07×; a scale remap produces ~100×.
+# The 8× ceiling sits far above any real single-position move yet far below any
+# plausible remap, so it never rejects a large-but-valid move.  Instrument-
+# agnostic: no per-symbol special-casing.
+_SIM_SCALE_RATIO_MAX = 8.0     # entry/observation price ratio above which scales are deemed incompatible
+_SIM_INVALID_SCALE   = "SIM_INVALID_SCALE"  # evidence subtype for scale-discontinuity observations (no training)
+
 # Spread-aware stop floors — fallback when june_spread_baselines unavailable (fractions)
 _SIM_SPREAD_FLOORS = {
     "SILVER": 0.0015,   # 0.15%
@@ -3506,6 +3522,42 @@ def _sim_reconstruct_prices(sym: str, signals: dict) -> dict:
     spread_pct = sig.get("spread_pct", 0.0)
     half       = mid * spread_pct / 200.0
     return {"bid": mid - half, "ask": mid + half, "mid": mid}
+
+
+def _sim_scale_ratio(entry_price, observed_price):
+    """Order-of-magnitude ratio between a position's entry price and a fresh
+    observation, always >= 1.0.  Returns None when either input is non-positive
+    (undefined — cannot judge continuity)."""
+    try:
+        e = float(entry_price)
+        o = float(observed_price)
+    except (TypeError, ValueError):
+        return None
+    if e <= 0.0 or o <= 0.0:
+        return None
+    hi, lo = (e, o) if e >= o else (o, e)
+    return hi / lo
+
+
+def _sim_scale_continuity_ok(entry_price, observed_price, ratio_max=8.0):
+    """Generic, instrument-agnostic price-scale continuity test.
+
+    Returns True when `observed_price` is on a scale compatible with
+    `entry_price` (their ratio is within ``ratio_max``), False when the two are
+    dimensionally incompatible (an epic remap / quote-scale discontinuity).
+
+    This targets DISCONTINUITY, not profit magnitude: the largest legitimate
+    single-position moves observed (~6.6%) keep the ratio at ~1.07, far inside
+    the 8× ceiling, while an order-of-magnitude epic remap (e.g. 6303.8 → 63.1)
+    produces ~100×.  When the ratio is undefined (missing/zero price) the test
+    fails OPEN (returns True) so ordinary warmup/data-gaps are never mistaken
+    for a scale break — the caller's existing price-availability gates handle
+    those.  ``ratio_max`` is a literal-defaulted parameter so the function is
+    safe under AST single-function extraction (no module-global dependency)."""
+    ratio = _sim_scale_ratio(entry_price, observed_price)
+    if ratio is None:
+        return True  # fail-open on undefined ratio; not a scale-break signal
+    return ratio <= ratio_max
 
 
 # ── Position sizing ───────────────────────────────────────────────────────────
@@ -4666,9 +4718,98 @@ def _sim_compute_pnl_pct(prices: dict) -> float:
 
 
 # ── Position close ────────────────────────────────────────────────────────────
+def _sim_invalidate_scale_break(pos: dict, observed_mid: float, exit_reason: str) -> None:
+    """Fail-closed close for a simulated position whose exit observation is on a
+    quote scale incompatible with its entry (epic remap / quote-scale break).
+
+    NO P&L is computed across the boundary and NO calibration evidence is
+    produced: win_moves / loss_moves / vol_history / combo_outcomes / 15m
+    reliability / HTF are all left untouched, and the balance is NOT changed
+    (neither a fictitious profit nor a fictitious loss is booked).  The
+    observation is recorded as SIM_INVALID_SCALE with pnl_pct=None so it is
+    auditable but can never enter any calibration path.  The symbol's rolling
+    price history is cleared because it now straddles two incompatible scales.
+
+    This mirrors the fail-closed treatment the live fallback path already applies
+    (scale correction + _history reset); it applies it to the SIMULATION side of
+    the epic-discovery/remap path, which previously had no such handling.
+    """
+    sym   = pos.get("instrument", "?")
+    dirn  = pos.get("direction", "long")
+    entry = pos.get("fill_price", 0.0)
+    entry_t = pos.get("entry_time", time.time())
+    hold_min = (time.time() - entry_t) / 60.0
+    ratio = _sim_scale_ratio(entry, observed_mid)
+
+    inv_rec = {
+        "instrument": sym, "direction": dirn,
+        "entry_price": entry, "exit_price": observed_mid,
+        "size": pos.get("size", 0.0), "leverage": pos.get("leverage", 1),
+        "pnl_pct": None, "dollar_pnl": 0.0,
+        "hold_min": round(hold_min, 1), "exit_epoch": int(time.time()),
+        "exit_reason": exit_reason,
+        "approach": pos.get("approach", ""), "vol_bucket": pos.get("vol_bucket", ""),
+        "entry_vol": pos.get("entry_vol", 0),
+        "stage": _sim.get("stage", "sprout"), "phase": _sim.get("phase", 1),
+        "conviction": pos.get("conviction", 5),
+        "claudia_pts": pos.get("claudia_pts", 0.0),
+        "evidence_class": "SIM_INVALID_SCALE",
+        "invalid_reason": "quote_scale_discontinuity",
+        "scale_ratio": round(ratio, 4) if ratio is not None else None,
+    }
+    # Persist to trade history for audit ONLY — NOT to win_moves/loss_moves/
+    # vol_history/combo_outcomes/15m/HTF and with zero balance impact.
+    history = _sim.setdefault("trade_history", [])
+    history.append(inv_rec)
+    try:
+        _sim_save_trade(inv_rec)
+    except Exception:
+        pass
+    if len(history) > 50:
+        _sim["trade_history"] = history[-50:]
+
+    # Clear dimensionally-incompatible rolling price history for this symbol so
+    # subsequent 5m/15m change calculations do not straddle the scale boundary.
+    try:
+        if sym in _history:
+            _history[sym].clear()
+    except Exception:
+        pass
+
+    _sim["open_position"] = None
+    _sim_log(
+        f"⛔ SIM SCALE-BREAK: {sym}/{dirn} entry {entry:.6g} vs observed "
+        f"{observed_mid:.6g} (ratio {ratio:.1f}× > {_SIM_SCALE_RATIO_MAX:.0f}×) — "
+        f"observation INVALIDATED (no P&L, no calibration); position closed flat"
+        if ratio is not None else
+        f"⛔ SIM SCALE-BREAK: {sym}/{dirn} — observation INVALIDATED (no P&L, no calibration)"
+    )
+    _sim_save_state()
+
+
 def _sim_close_position(prices: dict, exit_reason: str) -> None:
     pos = (_sim.get("open_position") or {}).copy()
     if not pos:
+        return
+
+    # ── Build 4C-C1 scale-continuity guard ────────────────────────────────────
+    # If the fresh observation used to price this exit is on a quote scale
+    # incompatible with the position's entry (epic remap / quote-scale break),
+    # never compute P&L across the boundary and never let the observation train
+    # calibration.  Delegate to the fail-closed invalidation path instead.
+    _obs_mid = None
+    try:
+        _obs_mid = prices.get("mid")
+        if _obs_mid is None:
+            # Reconstruct an effective mid from bid/ask when mid is absent.
+            _b = prices.get("bid"); _a = prices.get("ask")
+            if _b is not None and _a is not None:
+                _obs_mid = (float(_b) + float(_a)) / 2.0
+    except Exception:
+        _obs_mid = None
+    if _obs_mid is not None and not _sim_scale_continuity_ok(
+            pos.get("fill_price", 0.0), _obs_mid, _SIM_SCALE_RATIO_MAX):
+        _sim_invalidate_scale_break(pos, _obs_mid, exit_reason)
         return
 
     dirn     = pos["direction"]
@@ -5214,6 +5355,14 @@ def _sim_check_exit(signals: dict, regime: str) -> None:
             "change_15m":   None,
         }
     prices   = _sim_reconstruct_prices(sym, _exit_sig)
+    # Build 4C-C1: if the fresh observation is on a quote scale incompatible with
+    # the position's entry (epic remap / quote-scale break), invalidate the
+    # observation BEFORE any P&L-based management decision (DPLE/MPD/stop/reversal)
+    # can act on a fictitious cross-scale move.  Fail-closed: no P&L, no training.
+    if not _sim_scale_continuity_ok(pos.get("fill_price", 0.0),
+                                    prices.get("mid"), _SIM_SCALE_RATIO_MAX):
+        _sim_invalidate_scale_break(pos, prices.get("mid"), "scale_break")
+        return
     pnl_pct  = _sim_compute_pnl_pct(prices)
     dirn     = pos["direction"]
     sig_dir  = _exit_sig[sym].get("direction", "neutral")
