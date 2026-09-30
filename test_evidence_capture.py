@@ -274,7 +274,7 @@ class RuntimeTests(CaptureTests):
 
     def test_runtime_broker_flat_reconciliation_is_observation_only(self):
         ns = self.runtime()
-        extract({'_live_reconcile_positions'}, ns)
+        extract({'_live_reconcile_positions', '_live_finalize_reconciled_stale_primary'}, ns)
         ns['_ig_live_get'].return_value = {'positions': []}
         ns['_live_reconcile_positions']()
         self.assertIsNone(ns['_live']['open_position'])

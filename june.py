@@ -13166,6 +13166,24 @@ def _live_recovery_metadata(position: dict, management_role: str) -> dict:
     }
 
 
+def _live_finalize_reconciled_stale_primary() -> None:
+    """Persist the flat state after broker-confirmed stale-primary settlement.
+
+    Settlement must already be recorded before this helper is called.  Keeping
+    the clear in one helper makes the ordering explicit and prevents a restart
+    from resurrecting a broker-flat position after an in-memory-only clear.
+    """
+    _live_capture_active("before_primary_clear")
+    _live["open_position"] = None
+    try:
+        from rolling_build4a import b4a_clear_campaign_rolling_state as _b4a_clr
+        _b4a_clr(_live, reason="stale_state_cleared_at_startup")
+    except Exception:
+        pass
+    _live.pop("manual_review_required", None)  # cascade fully resolved — unblock closes
+    _live_save_state()
+
+
 def _live_reconcile_positions() -> None:
     global _recon_consecutive_404_with_deposit
     # Reconcile _live["open_position"] against IG real open positions.
@@ -13466,14 +13484,7 @@ def _live_reconcile_positions() -> None:
         _live_log(f"   Action    : open_position cleared -- June is now flat")
         _live_log(f"   Likely    : position closed in IG app or before this restart")
         _live_log("=" * 58)
-        _live_capture_active("before_primary_clear")
-        _live["open_position"] = None
-        try:
-            from rolling_build4a import b4a_clear_campaign_rolling_state as _b4a_clr
-            _b4a_clr(_live, reason="stale_state_cleared_at_startup")
-        except Exception:
-            pass
-        _live.pop("manual_review_required", None)  # cascade fully resolved — unblock closes
+        _live_finalize_reconciled_stale_primary()
 
 
 def _apply_defect_quarantine() -> None:
