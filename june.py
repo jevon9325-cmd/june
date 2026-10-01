@@ -13333,6 +13333,21 @@ def _live_reconcile_positions() -> None:
                         float(leg.get("ig_size", 0.)), observed)
             except (KeyError, TypeError, ValueError):
                 pass  # No release on incomplete broker evidence.
+            # Stop-ack integrity: when a stop amendment was accepted by the broker
+            # but the local acknowledgement never caught up (lost/ambiguous confirm
+            # reply, or the confirm identity bug), the authoritative broker POSITION
+            # snapshot carries the applied stopLevel. If the broker already holds
+            # the requested-or-stronger stop on this exact open deal, promote the
+            # pending request to acknowledged. Fail-closed: broker truth only,
+            # never the local/software intention; strongest broker-supported floor.
+            try:
+                _broker_stop = matches[0].get("stopLevel")
+                if _broker_stop is not None and (leg.get("stop_sync") or {}).get("status") != "acknowledged":
+                    from winner_protection import reconcile_broker_stop as _recon_stop
+                    _recon_stop(leg, _broker_stop, matches[0].get("dealId"),
+                                now=time.time(), log=_live_log)
+            except (KeyError, TypeError, ValueError):
+                pass  # Incomplete broker evidence -> leave acknowledgement unresolved.
     primary = _live.get("open_position")
     group = ((INSTRUMENTS.get(primary.get("instrument")),
               "BUY" if primary.get("direction") == "long" else "SELL") if primary else None)
