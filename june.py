@@ -10441,6 +10441,62 @@ def _live_retry_stop_sync(signals):
             _live_protect_stop(position, target)
 
 
+def _wc_readiness_observe(sym, pos, signals, ig_sz, min_deal) -> None:
+    """OBSERVATION-ONLY: compute and record unsplittable-winner continuation
+    readiness for a 1xMINDEAL winner reaching the full-close fallback.
+
+    Pure diagnostic. Takes NO exposure action, changes NO decision, loosens NO
+    protection. Uses only broker-ACKNOWLEDGED protection (never software floors).
+    Emits a 'unsplittable_winner_readiness' telemetry event. All failures are
+    swallowed by the caller; the full-close fallback proceeds regardless.
+    """
+    from winner_continuity import unsplittable_readiness
+    from winner_protection import strongest
+    dirn    = pos.get("direction")
+    fill_px = pos.get("fill_price", 0.0)
+    sync    = (pos.get("stop_sync") or {})
+    ack     = strongest(dirn, pos.get("acknowledged_stop_level"),
+                         pos.get("broker_stop_level")) if dirn in ("long", "short") else None
+    sig     = signals.get(sym, {}) if signals else {}
+    mid     = sig.get("price", fill_px)
+    try:
+        multiplier = _live_campaign_unit(sym, fill_px) / fill_px if fill_px else 1.0
+    except Exception:
+        multiplier = float(_live_lot_sizes.get(sym, 1.0))
+    # Expected round-trip cost reserve at MINDEAL, consistent with F50 accounting
+    # (stop-distance + two-sided slippage; equity commission when applicable).
+    try:
+        pip   = _live_pip_sizes.get(sym, _LIVE_FX_PIP)
+        punit = _live_price_unit.get(sym, 1.0)
+        point = pip / punit if punit else pip
+        stop_native = _live_compute_stop_pts(sym, _PYRAMID_AGG_STOP_PCT, mid) * point
+        slip  = _MPD_SLIPPAGE_PIPS * max(pip, point)
+        commission = (2 * _IG_EQUITY_COMMISSION_USD) if sym in _live_equity_cfd else 0.0
+        cost_reserve = ig_sz * multiplier * (stop_native + 2.0 * slip) + commission
+    except Exception:
+        cost_reserve = 0.0
+    verdict = unsplittable_readiness(
+        pos, ig_size=ig_sz, min_deal=min_deal,
+        acknowledged_stop_level=ack, stop_sync_status=sync.get("status"),
+        exit_price=mid, multiplier=multiplier, cost_reserve=cost_reserve,
+        manual_review=bool(_live.get("manual_review_required")),
+        orphan=bool(_live.get("orphan_suspected")),
+        partial_exit_pending=bool(pos.get("partial_exit_pending")))
+    _live_observe("unsplittable_winner_readiness", signals, pos, {
+        "verdict": verdict["verdict"], "reason": verdict["reason"],
+        "legal_split": verdict["legal_split"],
+        "protected_gross": verdict["protected_gross"],
+        "protected_net": verdict["protected_net"],
+        "current_value": verdict["current_value"],
+        "giveback_budget": verdict["giveback_budget"],
+        "acknowledged_stop_level": verdict["acknowledged_stop_level"],
+        "observation_only": True, "no_decision_change": True})
+    _live_log(
+        f"[WINNER-READINESS obs] {sym}: {verdict['verdict']} ({verdict['reason']}) "
+        f"net_protected={verdict['protected_net']} giveback={verdict['giveback_budget']} "
+        f"— OBSERVATION ONLY; full close proceeds")
+
+
 def _live_partial_tp_exit(signals: dict) -> None:
     """Close 50% of live position at TP; let remaining 50% run with breakeven stop.
 
@@ -10450,6 +10506,10 @@ def _live_partial_tp_exit(signals: dict) -> None:
 
     Sim equivalent: _sim_partial_tp_exit(). Called from _live_check_exit when
     pnl_pct >= tp_pct and partial_exit_done is not yet set on the position.
+
+    NOTE: the MINDEAL full-close fallback additionally emits an OBSERVATION-ONLY
+    unsplittable-winner continuation-readiness record (see _wc_readiness_observe);
+    the full close still executes unchanged.
     """
     pos = (_live.get("open_position") or {}).copy()
     if not pos:
@@ -10469,6 +10529,16 @@ def _live_partial_tp_exit(signals: dict) -> None:
     half_sz  = round(ig_sz / 2, 4)
     # Both the close leg and the residual position must clear minDeal.
     if half_sz < min_deal or round(ig_sz - half_sz, 4) < min_deal:
+        # B-WC OBSERVATION-ONLY: evaluate unsplittable-winner continuation readiness
+        # BEFORE the existing full-close fallback — which still executes unchanged.
+        # This records whether a broker-protected continuation WOULD be admissible
+        # under a safe contract; it changes NO trading decision, loosens NO
+        # protection, and takes NO exposure action. Readiness is deferred/unproven
+        # per the 2026-09-30 continuation design forensics.
+        try:
+            _wc_readiness_observe(sym, pos, signals, ig_sz, min_deal)
+        except Exception:
+            pass  # telemetry is best-effort; never affects the exit
         _live_observe("mindeal_full_close_fallback", signals, pos)
         _live_log(
             f"⚠️ {sym}: partial TP not feasible "
@@ -12190,6 +12260,34 @@ def _live_add_pyramid_leg(signals: dict, decision=None) -> None:
                 estimated_addon_stop_loss = _est_addon_loss,
                 estimated_floor_after   = round(evidence["liquidation_before"] - _est_addon_loss, 6),
             )
+            # B-WC OBSERVATION-ONLY joint-sizing diagnostic: record what a jointly
+            # constrained solver (F50 max AND allocation AND F50-cost) WOULD choose
+            # and which constraint binds, WITHOUT changing the selected F50 size.
+            # The live size remains exactly _f50_ig. This exists to measure whether
+            # the max-first/validate-after ordering ever rejects a quantity a
+            # smaller legal MINDEAL multiple could satisfy (forensic baseline: 0).
+            try:
+                from winner_continuity import joint_sizing_diagnostic as _wc_joint
+                _wc_diag = _wc_joint(
+                    q_f50=_f50_ig, min_deal=_f50_min_deal, mid=mid, leverage=lev,
+                    remaining_allocation=_addon_budget,
+                    margin_fraction=_real_margin_fraction(sym, positive(_live_margin.get(sym))),
+                    equity=sym in _live_equity_cfd,
+                    residual_notional=_campaign.get("actual_notional", 0.0),
+                    per_lot_cost=_f50_per_lot,
+                    expendable=evidence["liquidation_before"] * 0.5,
+                    commission=evidence["commission"])
+                decision["joint_sizing_diagnostic"] = _wc_diag
+                _live_observe("joint_addon_sizing_diagnostic", signals, primary, {
+                    **_wc_diag, "selected_ig": _f50_ig,
+                    "observation_only": True, "no_decision_change": True})
+                if _wc_diag.get("joint_lt_f50"):
+                    _live_log(
+                        f"[JOINT-SIZING obs] {sym}: joint q={_wc_diag['q_joint']} "
+                        f"< f50 q={_f50_ig} binding={_wc_diag['binding_constraint']} "
+                        f"— OBSERVATION ONLY; selected size unchanged ({_f50_ig})")
+            except Exception:
+                pass  # diagnostic is best-effort; never affects sizing/decision
             if _f50_ig <= 0:
                 decision["reason"] = f"f50_mindeal_blocked: {_f50_reason}"
                 return
