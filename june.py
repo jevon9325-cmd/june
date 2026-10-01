@@ -7902,6 +7902,11 @@ def _live_reconcile_provisional_settlements() -> None:
         if len(due) >= _RECON_MAX_PER_CYCLE:
             break
     if not due:
+        # Nothing to reconcile this cycle, but still reconcile the in-memory
+        # snapshot view against durable truth (cheap, idempotent, no perf feed).
+        _refresh_fn = globals().get("_live_refresh_trade_history_snapshot")
+        if _refresh_fn is not None:
+            _refresh_fn()
         return
 
     # Shared bounded transactions window (v2 params: maxSpanSeconds is valid here).
@@ -7932,85 +7937,45 @@ def _live_reconcile_provisional_settlements() -> None:
         _from = _recon_iso(_exit_ep - 2 * 3600)
         _to   = _recon_iso(min(now, _exit_ep + 6 * 3600))
 
-        def _scan_close(activities):
-            """Return dict for a UNIQUE full-close activity of our deal (A or B), or
-            None; returns ('AMBIGUOUS',) sentinel if multiple B candidates."""
-            direct = None
-            affected = []
-            for a in (activities or []):
-                det = a.get("details") or {}
-                acts = det.get("actions") or []
-                # Match A: this activity IS our deal.
-                if a.get("dealId") == deal_id:
-                    for ac in acts:
-                        if ac.get("actionType") == "POSITION_CLOSED":
-                            direct = {"epic": a.get("epic"), "level": det.get("level"),
-                                      "size": det.get("size"), "direction": det.get("direction"),
-                                      "date": a.get("date"), "match": "A_direct"}
-                        elif ac.get("actionType") == "POSITION_PARTIALLY_CLOSED":
-                            return ("PARTIAL",)
-                # Match B: an activity whose action affected our deal.
-                for ac in acts:
-                    if ac.get("affectedDealId") == deal_id:
-                        if ac.get("actionType") == "POSITION_PARTIALLY_CLOSED":
-                            return ("PARTIAL",)
-                        if ac.get("actionType") == "POSITION_CLOSED":
-                            affected.append({"epic": a.get("epic"), "level": det.get("level"),
-                                             "size": det.get("size"), "direction": det.get("direction"),
-                                             "date": a.get("date"), "match": "B_affected"})
-            if direct is not None:
-                return direct
-            if len(affected) == 1:
-                return affected[0]
-            if len(affected) > 1:
-                return ("AMBIGUOUS",)
-            return None
-
         _act = _ig_live_get("/history/activity",
                             params={"from": _from, "to": _to, "detailed": "true",
                                     "pageSize": 500}, version="3")
         _acts = (_act or {}).get("activities", []) if isinstance(_act, dict) else []
-        _closed = _scan_close(_acts)
 
-        if _closed is None:
-            _live_observe("settlement_reconcile_deferred", None, None,
-                          {"deal_id": deal_id, "reason": "no_close_activity_yet", "B4CA31": True})
-            continue
-        if _closed == ("PARTIAL",):
-            _live_observe("settlement_reconcile_deferred", None, None,
-                          {"deal_id": deal_id, "reason": "partial_close_not_final", "B4CA31": True})
-            continue
-        if _closed == ("AMBIGUOUS",):
+        # B4SI: delegate matching + partial/final aggregation to the pure
+        # settlement_reconcile module. It no longer vetoes on a partial action
+        # when the final close is present, aggregates every authoritative broker
+        # DEAL row for the campaign exactly once (dedup by reference, full
+        # quantity coverage required), and supports a fail-closed TRANSACTION_ONLY
+        # path when close activity has not yet been returned but the booked
+        # transactions reconcile to the opening by identity + exact quantity.
+        import settlement_reconcile as _sr
+        _verdict = _sr.reconcile_settlement(rec, _acts, _txs, _recon_instr_matches, now=now)
+        if _verdict["verdict"] == _sr.AMBIGUOUS:
             _live_observe("settlement_match_ambiguous", None, None,
-                          {"deal_id": deal_id, "reason": "multiple_affected_closes", "B4CA31": True})
+                          {"deal_id": deal_id, "reason": _verdict.get("reason"), "B4CA31": True})
             continue
-
-        _clvl = _closed.get("level")
-        _cands = []
-        for tx in _txs:
-            if tx.get("transactionType") != "DEAL":
-                continue
-            _tx_close = tx.get("closeLevel")
-            _match_lvl = False
-            try:
-                if _clvl is not None and _tx_close is not None:
-                    _match_lvl = abs(float(_tx_close) - float(_clvl)) < 1e-6
-            except (TypeError, ValueError):
-                _match_lvl = False
-            _instr_ok = _recon_instr_matches(sym, tx.get("instrumentName"))
-            if _match_lvl and _instr_ok:
-                _cands.append(tx)
-        if len(_cands) != 1:
-            _live_observe("settlement_match_ambiguous", None, None,
-                          {"deal_id": deal_id, "n_candidates": len(_cands),
-                           "close_match": _closed.get("match"), "B4CA31": True})
+        if _verdict["verdict"] == _sr.DEFER:
+            _reason = _verdict.get("reason") or "deferred"
+            # Match/transaction inconsistencies and coverage gaps are "match"
+            # problems; "not yet final" / "no activity yet" are plain deferrals.
+            _ambiguous_reasons = (
+                "quantity_coverage_incomplete", "unparseable_pnl",
+                "close_activity_without_transactions", "no_transaction_at_close_level")
+            _ev = ("settlement_match_ambiguous"
+                   if _reason in _ambiguous_reasons
+                   else "settlement_reconcile_deferred")
+            _live_observe(_ev, None, None,
+                          {"deal_id": deal_id, "reason": _reason,
+                           "aggregated_abs_size": _verdict.get("aggregated_abs_size"),
+                           "opening_qty": _verdict.get("opening_qty"), "B4CA31": True})
             continue
-        try:
-            _pnl = float(str(_cands[0].get("profitAndLoss")).replace("$", "").replace(",", ""))
-        except (TypeError, ValueError):
-            _live_observe("settlement_match_ambiguous", None, None,
-                          {"deal_id": deal_id, "reason": "unparseable_pnl", "B4CA31": True})
-            continue
+        # CONFIRM: aggregated authoritative economics.
+        _pnl           = _verdict["dollar_pnl"]
+        _clvl          = _verdict.get("exit_price")
+        _match_label   = _verdict.get("match")
+        _evidence_path = _verdict.get("evidence_path")
+        _n_tx          = _verdict.get("n_transactions")
 
         # Exactly-once promotion (re-read guard).
         try:
@@ -8025,10 +7990,12 @@ def _live_reconcile_provisional_settlements() -> None:
         _cur["exit_price"]        = _clvl
         _cur["settlement_state"]  = "CONFIRMED"
         _cur["pnl_source"]        = "broker_confirmed_transaction_reconciled"
-        _cur["settlement_source"] = (_cur.get("settlement_source", "") + "+recon:" + _closed.get("match", "?"))
+        _cur["settlement_source"] = (_cur.get("settlement_source", "") + "+recon:" + (_match_label or "?"))
         _cur["reconciled"]        = True
         _cur["evidence_class"]    = "BROKER_CONFIRMED_LIVE"
         _cur["settlement_identity"] = f"deal:{deal_id}"
+        _cur["recon_evidence_path"] = _evidence_path
+        _cur["recon_tx_count"]      = _n_tx
         _cur["reconciled_at"]     = int(now)
         _cur["recon_schema"]      = _RECON_SCHEMA_VERSION
         _cur["perf_fed"]          = False   # will be fed just below; replayed if we crash first
@@ -8050,11 +8017,85 @@ def _live_reconcile_provisional_settlements() -> None:
         except Exception as exc:
             _live_log(f"[RECON] perf_record deferred (will replay) {deal_id}: {exc}")
         _live_log(f"[RECON] CONFIRMED {sym} {dirn} deal={deal_id} P&L ${_pnl:+.4f} "
-                  f"via {_closed.get('match')} (broker transaction, was PROVISIONAL/UNKNOWN)")
+                  f"via {_match_label} ({_evidence_path}, {_n_tx} broker txn(s) aggregated, "
+                  f"was PROVISIONAL/UNKNOWN)")
         _live_observe("settlement_confirmed", None, None,
                       {"deal_id": deal_id, "instrument": sym, "dollar_pnl": round(_pnl, 4),
-                       "prior_state": "PROVISIONAL", "match": _closed.get("match"),
+                       "prior_state": "PROVISIONAL", "match": _match_label,
+                       "evidence_path": _evidence_path, "tx_count": _n_tx,
                        "B4CA31": True})
+
+    # B4SI: refresh the in-memory trade_history snapshot from the durable list so
+    # stale PROVISIONAL copies pick up economics already finalized durably. This
+    # is a pure state-view sync — it NEVER re-feeds performance (perf delivery is
+    # exactly-once via settlement_identity on the durable record).
+    _refresh_fn = globals().get("_live_refresh_trade_history_snapshot")
+    if _refresh_fn is not None:
+        _refresh_fn()
+
+
+def _live_refresh_trade_history_snapshot() -> None:
+    """Reconcile _live['trade_history'] (bounded snapshot) with the durable
+    settlement list by stable identity, copying confirmed economics onto stale
+    provisional copies WITHOUT replaying performance or re-ordering history.
+
+    Idempotent: a row already carrying economics is left untouched; a repeated
+    call makes no further change. No new rows are invented from the durable list.
+    """
+    hist = _live.get("trade_history")
+    if not hist:
+        return
+    try:
+        _rh = _redis()
+        raw_list = _rh.lrange(_LIVE_TRADE_HIST_KEY, 0, -1) or []
+    except Exception:
+        return
+    # Index durable CONFIRMED economics by stable identity.
+    durable = {}
+    for raw in raw_list:
+        try:
+            d = json.loads(raw)
+        except Exception:
+            continue
+        if d.get("settlement_state") != "CONFIRMED" or d.get("dollar_pnl") is None:
+            continue
+        for ident in (d.get("settlement_identity"),
+                      (f"deal:{d.get('deal_id')}" if d.get("deal_id") else None),
+                      (f"campaign:{d.get('campaign_id')}" if d.get("campaign_id") else None)):
+            if ident and ident not in durable:
+                durable[ident] = d
+    changed = False
+    for row in hist:
+        if row.get("settlement_state") != "PROVISIONAL" or row.get("dollar_pnl") is not None:
+            continue
+        match = None
+        for ident in ((f"deal:{row.get('deal_id')}" if row.get("deal_id") else None),
+                      row.get("settlement_identity"),
+                      (f"campaign:{row.get('campaign_id')}" if row.get("campaign_id") else None)):
+            if ident and ident in durable:
+                match = durable[ident]
+                break
+        if match is None:
+            continue
+        row["dollar_pnl"]       = match.get("dollar_pnl")
+        row["pnl_pct"]          = match.get("pnl_pct", row.get("pnl_pct"))
+        row["exit_price"]       = match.get("exit_price", row.get("exit_price"))
+        row["settlement_state"] = "CONFIRMED"
+        row["pnl_source"]       = match.get("pnl_source", row.get("pnl_source"))
+        row["settlement_source"] = match.get("settlement_source", row.get("settlement_source"))
+        row["reconciled"]       = True
+        row["evidence_class"]   = "BROKER_CONFIRMED_LIVE"
+        row["settlement_identity"] = match.get("settlement_identity") or row.get("settlement_identity")
+        row["recon_evidence_path"] = match.get("recon_evidence_path", row.get("recon_evidence_path"))
+        row["recon_tx_count"]      = match.get("recon_tx_count", row.get("recon_tx_count"))
+        row["snapshot_refreshed_from_durable"] = True
+        changed = True
+    if changed:
+        try:
+            _live_save_state()
+        except Exception:
+            pass
+
 
 def _live_check_skim() -> None:
     """Apply confirmed skim milestones. No other numbers or tiers.
