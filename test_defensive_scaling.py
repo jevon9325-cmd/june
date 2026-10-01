@@ -73,6 +73,14 @@ def defensive_harness(stop=101., mode="defensive"):
               _ls_deal_closed=Mock(return_value=False), _PYRAMID_PROFIT_GATE_PCT=.0015,
               _live_perf_blocked=Mock(return_value=False), _METALS_INSTRUMENTS=set(),
               _compute_atr_5m=lambda _: (1., False), _spread_atr_threshold=lambda *a: 1.)
+    ns.update(_spread_hist={"GOLD": [.0002] * 60}, SPREAD_MIN_READINGS=5,
+              SPREAD_ALERT_FACTOR=3.)
+    ns["_ig_live_get"] = Mock(side_effect=lambda *a, **k: {"positions": [
+        {"position": {"dealId": leg["deal_id"], "size": leg["ig_size"],
+                      "direction": "BUY" if leg["direction"] == "long" else "SELL",
+                      "stopLevel": leg.get("broker_stop_level")},
+         "market": {"epic": ns["INSTRUMENTS"][leg["instrument"]]}}
+        for leg in [ns["_live"]["open_position"], *ns["_live"].get("pyramid_legs", [])]]})
     ns["_ig_live_put"] = Mock(return_value={"dealReference": "stop"})
     def confirm(ref):
         if ref == "stop":
@@ -85,7 +93,8 @@ def defensive_harness(stop=101., mode="defensive"):
     return ns
 
 
-SIGNALS = {"GOLD": {"price": 105., "spread_pct": .02}}
+# Leave room for the newly explicit spread reserve in this approval fixture.
+SIGNALS = {"GOLD": {"price": 105., "spread_pct": .0002}}
 
 
 def evaluate(ns, regime="neutral"):

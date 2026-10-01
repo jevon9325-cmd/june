@@ -311,7 +311,8 @@ def test_initial_sizing_not_from_f50():
 def test_max_legs_constant_unchanged():
     """_PYRAMID_MAX_LEGS and _PYRAMID_HARD_MAX_LEGS must be unchanged."""
     # We can't import june.py directly (it auto-starts), so we check the source.
-    with open("/opt/bots/june-build1/june.py") as f:
+    from pathlib import Path
+    with Path(__file__).with_name("june.py").open(encoding="utf-8") as f:
         src = f.read()
     assert "_PYRAMID_MAX_LEGS        = 2" in src, "PYRAMID_MAX_LEGS must still be 2"
     assert "_PYRAMID_HARD_MAX_LEGS   = 4" in src, "PYRAMID_HARD_MAX_LEGS must still be 4"

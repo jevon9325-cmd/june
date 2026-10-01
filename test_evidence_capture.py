@@ -190,7 +190,12 @@ class RuntimeTests(CaptureTests):
                 if point == 'before_confirmation_capture':
                     ns['_live_confirm_deal'].side_effect = Crash()
                 if point == 'after_clear':
-                    ns['_live_save_state'] = Mock(side_effect=Crash())
+                    def crash_after_clear():
+                        # The continuation-disable save precedes submission now.
+                        # Inject at the named lifecycle point, not the first save.
+                        if ns['_live'].get('open_position') is None:
+                            raise Crash()
+                    ns['_live_save_state'] = Mock(side_effect=crash_after_clear)
                 with self.assertRaises(Crash):
                     self.full_close(ns)
                 rows = self.rows()
@@ -247,7 +252,10 @@ class RuntimeTests(CaptureTests):
         ns['_ls_deal_closed'] = lambda deal: deal == 'fixture-deal'
         ns['_ig_live_get'] = lambda path, **kw: None if path == '/positions/otc' else {
             'positions': [{'position': {'dealId': 'addon-deal'}}]}
-        ns['_live_save_state'] = Mock(side_effect=Crash())
+        def crash_after_promotion():
+            if (ns['_live'].get('open_position') or {}).get('deal_id') == 'addon-deal':
+                raise Crash()
+        ns['_live_save_state'] = Mock(side_effect=crash_after_promotion)
         with self.assertRaises(Crash):
             ns['_live_close_position']('stop_loss', {'GOLD': {'price': 99}})
         promoted = ns['_live']['open_position']

@@ -9873,6 +9873,11 @@ def _live_close_position(exit_reason: str, signals: dict) -> None:
         "timeInForce": "FILL_OR_KILL",
         "dealId":         deal_id,
     }
+    # A full-close attempt makes this campaign's continuation history uncertain
+    # until closure settles. Keep managing the exit; never fund an addon from it.
+    if _live.get("open_position"):
+        _live["open_position"]["scaling_history_complete"] = False
+        _live_save_state()
     _live_capture_evidence(pos, "close_intent", order=close_body, expected_exit_reason=exit_reason, local_request_time=time.time())
     resp = _ig_live_post("/positions/otc", close_body, version="1", close=True)
     _live_capture_evidence(pos, "close_response", response=resp, expected_exit_reason=exit_reason)
@@ -10571,6 +10576,21 @@ def _live_partial_tp_exit(signals: dict) -> None:
             return
 
         remaining_sz = round(ig_sz - half_sz, 4)
+        # Allocation release needs its own durable broker residual certificate.
+        # Missing identity fields preserve the full reservation without changing TP.
+        try:
+            from winner_accounting import confirm_allocation_reduction
+            residual_row = next(row for row in _ptp_rows
+                                if row["position"]["dealId"] == deal_id)
+            certificate = confirm_allocation_reduction(
+                _live["open_position"], residual_row, confirm, deal_ref, ig_sz)
+            _live["open_position"]["allocation_confirmation"] = certificate
+            _live["open_position"]["allocation_observed_quantity"] = remaining_sz
+            _live_observe("allocation_released_confirmed_partial", signals, pos,
+                          {"allocation_confirmation": certificate})
+        except (ValueError, TypeError, KeyError, StopIteration):
+            _live_observe("allocation_retained_unresolved_partial", signals, pos,
+                          {"reason": "residual_identity_evidence_incomplete"})
         _live_capture_active("before_partial_quantity_change")
         _live["open_position"].pop("partial_exit_pending", None)
         _live["open_position"].setdefault("original_ig_size", ig_sz)
@@ -11894,8 +11914,10 @@ def _live_check_pyramid_entry(signals: dict, regime: str) -> None:
         capital = max(0., _live.get("balance_total", 0.) - _live.get("skimmed_total", 0.))
         allocation = campaign_allocation(primary, _live.get("pyramid_legs", []),
                                         lambda price: _live_campaign_unit(sym, price),
-                                        capital * _live_tier_risk_pct(capital))
+                                        capital * _live_tier_risk_pct(capital),
+                                        pending=_live.get("pyramid_entry_pending"))
         decision["remaining_capacity"] = allocation["remaining_allocation"]
+        decision["allocation"] = allocation
     except Exception as exc:
         decision["capacity_error"] = str(exc)
     try:
@@ -11922,7 +11944,14 @@ def _live_check_pyramid_entry(signals: dict, regime: str) -> None:
             decision["reason"] = "instrument_pause"
             return
         atr, fallback = _compute_atr_5m(sym)
-        if atr is not None and atr > 0 and mid * (sig.get("spread_pct", 0.) or 0.) / 100. / atr > _spread_atr_threshold(sym, fallback):
+        ratio = mid * (sig.get("spread_pct", 0.) or 0.) / 100. / atr if atr is not None and atr > 0 else None
+        decision.update(spread_atr=ratio, atr_native=atr,
+                        spread_atr_threshold=_spread_atr_threshold(sym, fallback),
+                        spread_atr_fallback=fallback)
+        # Only certified profitable continuation may reach the dollar-cost gate.
+        # Every other addon retains the existing ratio veto.
+        if (ratio is not None and ratio > decision["spread_atr_threshold"]
+                and decision.get("protection_state") != "profit_protected"):
             decision["reason"] = "spread_atr_gate"
             return
         # Both account and instrument defensive conditions use the same campaign
@@ -12044,9 +12073,11 @@ def _live_add_pyramid_leg(signals: dict, decision=None) -> None:
         positive(_live_min_deal.get(sym))
         _campaign = campaign_allocation(
             primary, _live.get("pyramid_legs", []),
-            lambda price: _live_campaign_unit(sym, price), _tier_budget)
+            lambda price: _live_campaign_unit(sym, price), _tier_budget,
+            pending=_live.get("pyramid_entry_pending"))
         _addon_budget = _campaign["remaining_allocation"]
         decision["remaining_capacity"] = _addon_budget
+        decision["allocation"] = _campaign
     except (ValueError, TypeError, KeyError, OverflowError) as exc:
         decision["reason_detail"] = str(exc)
         _live_log(f"[PYRAMID] {sym}: accounting unavailable -- {exc}")
@@ -12155,6 +12186,45 @@ def _live_add_pyramid_leg(signals: dict, decision=None) -> None:
     decision.update(proposed_allocation=actual_notional / lev,
                     proposed_notional=actual_notional, proposed_leverage=lev,
                     proposed_quantity=ig_size)
+    if _f50_active:
+        # ATR is context, not spendable capital. Use actual spread plus the
+        # existing stop/slippage/commission reserves inside the unchanged F50.
+        try:
+            from continuation_economics import spread_economics, verify_inventory
+            from campaign_telemetry import executable
+            entry_px, _ = executable(sig, "short" if dirn == "long" else "long")
+            spread = abs(entry_px - evidence["exit_price"])
+            economics = spread_economics(
+                evidence, spread=spread, spread_pct=spread / positive(mid) * 100.,
+                history=list(_spread_hist.get(sym, [])), min_readings=SPREAD_MIN_READINGS,
+                anomaly_factor=SPREAD_ALERT_FACTOR, stop_distance=_f50_stop_native,
+                quantity=ig_size, min_deal=_f50_min_deal)
+            decision["continuation_economics"] = economics
+            if not economics["allowed"]:
+                decision["reason"] = economics["reason"]
+                return
+            verify_inventory(old_legs, _ig_live_get("/positions", version="2"), INSTRUMENTS)
+            decision["broker_inventory_verified"] = True
+            # Re-read evidence after inventory: no pending amendment can finance entry.
+            checked = _live_defensive_scaling_evidence(signals)
+            if checked != evidence:
+                raise ValueError("continuation_protection_changed")
+            if (not _live_trade_guard() or any(_ls_deal_closed(leg["deal_id"]) for leg in old_legs)
+                    or _live.get("pyramid_entry_pending") or _live.get("orphan_suspected")
+                    or _live.get("manual_review_required") or primary.get("partial_exit_pending")):
+                raise ValueError("continuation_authority_or_campaign_changed")
+            atr, fallback = _compute_atr_5m(sym)
+            ratio = spread / atr if atr is not None and atr > 0 else None
+            threshold = _spread_atr_threshold(sym, fallback)
+            decision.update(spread_atr=ratio, atr_native=atr, spread_atr_threshold=threshold,
+                            continuation_spread_reason=("low_atr_continuation_admission"
+                                if ratio is not None and ratio > threshold
+                                else "continuation_economics_admission"),
+                            estimated_floor_after_costs=economics["protected_floor_after"])
+        except Exception as exc:
+            decision.update(reason="protected_continuation_economic_rejection",
+                            reason_detail=str(exc))
+            return
     stop_pct = max(_sim_get_dynamic_stop(sym), _sim_get_spread_floor(sym))
     tp_pct   = _sim_get_tp(sym, dirn, primary.get("conviction", 5))
     decision["tp_source"] = "SIM_PRIOR"
@@ -13211,6 +13281,17 @@ def _live_reconcile_positions() -> None:
     import math
     known = [item for item in [_live.get("open_position"), *_live.get("pyramid_legs", [])] if item]
     known_ids = {item.get("deal_id") for item in known}
+    for leg in known:
+        matches = [row["position"] for row in ig_positions
+                   if row["position"]["dealId"] == leg.get("deal_id")]
+        if len(matches) == 1:
+            try:
+                observed = float(matches[0]["size"])
+                if math.isfinite(observed) and observed > 0:
+                    leg["allocation_observed_quantity"] = max(
+                        float(leg.get("ig_size", 0.)), observed)
+            except (KeyError, TypeError, ValueError):
+                pass  # No release on incomplete broker evidence.
     primary = _live.get("open_position")
     group = ((INSTRUMENTS.get(primary.get("instrument")),
               "BUY" if primary.get("direction") == "long" else "SELL") if primary else None)

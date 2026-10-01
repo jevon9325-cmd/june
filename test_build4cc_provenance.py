@@ -169,7 +169,7 @@ def _formula_env():
 
 
 def test_tp_and_stop_formulas_are_economically_invariant():
-    pre = subprocess.check_output(["git", "show", "HEAD:june.py"], text=True)
+    pre = subprocess.check_output(["git", "show", "HEAD:june.py"], text=True, encoding="utf-8")
     post = SOURCE
     names = {"_sim_get_tp", "_sim_get_dynamic_stop"}
     pre_ns = _extract(pre, names); post_ns = _extract(post, names)
