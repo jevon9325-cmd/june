@@ -7036,13 +7036,47 @@ def _htf_self_calibrate():
 _live_evidence_journal = None
 
 
+def _live_ledger_retention(account, deal_id):
+    """Redis retention policy (repair/redis-retention-0dfab7b), DEFAULT-OFF.
+
+    Returns True ONLY when releasing the deal's redundant Redis ledger field is
+    safe: the deal is terminally settled (CONFIRMED in the durable settlement
+    registry) AND its lifecycle evidence is durably archived in local SQLite
+    (archive-before-removal). Fail-closed: any uncertainty returns False so the
+    Redis recovery field is retained. Enabled only when JUNE_LEDGER_RETENTION is
+    truthy, so a deploy changes NOTHING until an operator explicitly turns it on.
+    """
+    if os.environ.get("JUNE_LEDGER_RETENTION", "").strip().lower() not in ("1", "true", "yes", "on"):
+        return False
+    try:
+        registry = _live_settlement_registry()
+        if account != registry.account:
+            return False
+        record = registry.get("deal:" + deal_id)
+        # Terminal settlement = broker-confirmed economics durably recorded.
+        if not record or record.get("settlement_state") != "CONFIRMED":
+            return False
+        # Archive-before-removal: the lifecycle evidence must be durably present
+        # (forwarded=1) in the local SQLite journal for THIS deal.
+        import sqlite3 as _sq
+        path = _live_evidence_capture().path
+        with _sq.connect("file:" + str(path).replace("\\", "/") + "?mode=ro", uri=True) as _db:
+            durable = _db.execute(
+                "SELECT COUNT(*) FROM evidence WHERE forwarded=1 AND payload LIKE ?",
+                ('%"deal_id":"' + deal_id + '"%',)).fetchone()[0]
+        return durable > 0
+    except Exception:
+        return False  # never let housekeeping raise; keep the field
+
+
 def _live_evidence_capture():
     """Lazy local journal; constructing it performs no broker/Redis writes."""
     global _live_evidence_journal
     if _live_evidence_journal is None:
         _live_evidence_journal = EvidenceCapture(
             os.environ.get("JUNE_EVIDENCE_PATH", os.path.join(os.path.dirname(__file__), ".broker-evidence.sqlite3")),
-            lambda account: PendingCloseStore(_redis(), account), _live_log)
+            lambda account: PendingCloseStore(_redis(), account), _live_log,
+            retention=_live_ledger_retention)
     return _live_evidence_journal
 
 

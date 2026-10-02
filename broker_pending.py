@@ -343,6 +343,54 @@ class PendingCloseStore:
         raw = self.client.hget(self.key, self._field(deal_id))
         return _entry_view(json.loads(raw)) if raw is not None else None
 
+    def prune_settled(self, deal_id, durable_archive_present):
+        """Fail-closed removal of ONE redundant trade:<deal> recovery field.
+
+        Redis retention repair (repair/redis-retention-0dfab7b). The ledger is a
+        HOT degraded-mode recovery mirror of the authoritative local SQLite
+        evidence journal. Once a deal's lifecycle evidence is durably archived in
+        SQLite (the caller asserts this via `durable_archive_present`, having
+        confirmed the row(s) exist with forwarded=1 AND the deal is terminally
+        settled), the per-deal Redis field is pure redundant history and may be
+        released to bound unbounded growth.
+
+        Safety invariants (all fail-closed):
+          * Removes ONLY the single `trade:<deal>` field — never claim fields
+            (opening:/entry_reference:/realization:/cost:/consumer:) which carry
+            exactly-once identity, never another deal, never the whole key.
+          * NEVER removes anything unless `durable_archive_present` is exactly
+            True (archive-before-removal; a missing/unknown/false archive keeps
+            the field — partial or failed archival cannot cause deletion).
+          * NEVER removes a field still carrying unresolved recovery state: an
+            opening without a completed/settled record, a pending partial, or an
+            identity quarantine are all retained.
+          * Idempotent: absent field -> no-op, returns False.
+          * HDEL is targeted; it cannot manufacture or alter settlement, P&L,
+            performance delivery, position or protection evidence (it only drops
+            a field already proven redundant with durable SQLite).
+
+        Returns True iff a redundant field was released, else False.
+        """
+        if durable_archive_present is not True:
+            return False
+        field = self._field(deal_id)
+        raw = self.client.hget(self.key, field)
+        if raw is None:
+            return False
+        try:
+            entry = json.loads(raw)
+        except (ValueError, TypeError):
+            return False  # unparseable -> never delete, keep for review
+        # Retain anything still operationally unresolved. A terminally settled
+        # deal has an opening and no pending-partial / identity quarantine.
+        if not isinstance(entry, dict):
+            return False
+        if entry.get('identity_quarantine'):
+            return False
+        if (entry.get('partial_exit_pending')):
+            return False
+        return bool(self.client.hdel(self.key, field))
+
     def get_projection(self, consumer):
         """Audit-only view. Never return an old aggregate as certified value.
 

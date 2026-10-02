@@ -17,9 +17,17 @@ from broker_pending import _json
 
 
 class EvidenceCapture:
-    def __init__(self, path, store_factory, report):
+    def __init__(self, path, store_factory, report, retention=None):
         self.path, self.store_factory, self.report = str(path), store_factory, report
         self.volatile = {}  # Never silently evict evidence after both sinks fail.
+        # Redis retention repair (repair/redis-retention-0dfab7b). OPTIONAL and
+        # DEFAULT-OFF: when retention is None, behaviour is byte-for-byte the
+        # prior unbounded mirror. When supplied, it is a callable
+        # retention(deal_id) -> bool that returns True ONLY when the deal is
+        # terminally settled AND its lifecycle evidence is durably archived in
+        # this local SQLite journal (archive-before-removal). It never performs
+        # I/O that could gate a protective exit and never raises into replay.
+        self.retention = retention
 
     def _report(self, message):
         try:
@@ -149,6 +157,52 @@ class EvidenceCapture:
                         db.execute('UPDATE evidence SET forwarded=1 WHERE id=?', (event_id,))
         except Exception as exc:
             self._report('EVIDENCE REPLAY PENDING: ' + type(exc).__name__ + '; retained for retry')
+        self._prune_settled_ledger(limit)
+
+    def _prune_settled_ledger(self, limit):
+        """OPTIONAL, DEFAULT-OFF, fail-closed release of redundant Redis ledger
+        fields (repair/redis-retention-0dfab7b).
+
+        Does nothing unless a retention policy was injected. For a bounded number
+        of durably-archived (forwarded=1) deals, ask the policy whether the deal
+        is terminally settled AND durably archived here; only then release the
+        single redundant trade:<deal> Redis field via PendingCloseStore
+        .prune_settled (which independently fail-closes). Any error is swallowed:
+        memory housekeeping must never block or corrupt the evidence path.
+        """
+        if self.retention is None:
+            return
+        try:
+            with closing(self._connect()) as db:
+                rows = db.execute(
+                    'SELECT DISTINCT payload FROM evidence WHERE forwarded=1 '
+                    'ORDER BY rowid DESC LIMIT ?', (max(1, limit) * 20,)).fetchall()
+            seen = set()
+            released = 0
+            for (raw,) in rows:
+                try:
+                    event = json.loads(raw)
+                except (ValueError, TypeError):
+                    continue
+                account, deal = event.get('account_id'), event.get('deal_id')
+                if not account or not deal or deal in seen:
+                    continue
+                seen.add(deal)
+                try:
+                    durable_settled = bool(self.retention(account, deal))
+                except Exception:
+                    durable_settled = False  # policy failure -> keep (fail-closed)
+                if not durable_settled:
+                    continue
+                try:
+                    if self.store_factory(account).prune_settled(deal, True):
+                        released += 1
+                except Exception:
+                    continue  # Redis failure -> keep; retry a later cycle
+                if released >= max(1, limit):
+                    break
+        except Exception as exc:
+            self._report('LEDGER RETENTION PENDING: ' + type(exc).__name__ + '; no field released')
 
     def retained(self):
         """Explicit forensic enumeration, not called on a risk/update path."""
