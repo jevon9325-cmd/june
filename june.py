@@ -13525,12 +13525,37 @@ def _live_broker_close_evidence(pos, inventory):
     # evidence; do not follow an arbitrary broker-supplied URL.
     if ((response.get("metadata") or {}).get("paging") or {}).get("next"):
         return None
+    # This account can expose a UTC-dated activity in a wider window while
+    # omitting it from the equivalent narrow timestamp filter. Keep the narrow
+    # fast path, but retry a padded bounded window before declaring evidence
+    # missing. Padding discovers evidence only: exact deal/account/epic and
+    # parsed UTC event bounds below remain mandatory before accepting closure.
+    if not activities:
+        response = _ig_live_get("/history/activity", params={
+            "from": _recon_iso(max(entry - 24 * 3600, now - 48 * 3600)),
+            "to": _recon_iso(now + 24 * 3600),
+            "detailed": "true", "pageSize": 500}, version="3")
+        activities = response.get("activities") if isinstance(response, dict) else None
+        if not isinstance(activities, list):
+            return None
+        if ((response.get("metadata") or {}).get("paging") or {}).get("next"):
+            return None
+    from datetime import datetime, timezone
     matches = []
     for activity in activities:
         if not isinstance(activity, dict) or activity.get("status") != "ACCEPTED":
             continue
         if activity.get("epic") != INSTRUMENTS.get(pos.get("instrument")):
             continue
+        try:
+            observed = datetime.fromisoformat(activity["date"].replace("Z", "+00:00"))
+            if observed.tzinfo is None:
+                observed = observed.replace(tzinfo=timezone.utc)
+            event_time = observed.timestamp()
+        except (KeyError, TypeError, ValueError, AttributeError):
+            continue
+        if not entry - 60 <= event_time <= now:
+            continue  # expanded query bounds never establish a future/old close
         details = activity.get("details") or {}
         if any(isinstance(action, dict) and action.get("actionType") == "POSITION_CLOSED"
                and action.get("affectedDealId") == deal

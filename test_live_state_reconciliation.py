@@ -1,5 +1,6 @@
 """SILVER broker-stop closure with missed LS and pending stop acknowledgement."""
 import ast, copy, json, time
+from datetime import datetime, timezone
 from pathlib import Path
 import pytest
 
@@ -18,7 +19,8 @@ def setup(rows=None, activities=None, closed=False):
            'balance_day_start':122.57,'cb_active':False,'risk_epoch':{'baseline':122.57},
            'kill_switch':False,'settled_primary_keys':[]}
     inventory={'positions':[] if rows is None else rows}
-    activity={'status':'ACCEPTED','epic':'SILVER_EPIC','details':{'actions':[
+    activity={'date':datetime.fromtimestamp(time.time()-300,timezone.utc).isoformat(),
+              'status':'ACCEPTED','epic':'SILVER_EPIC','details':{'actions':[
         {'actionType':'POSITION_CLOSED','affectedDealId':deal}]}}
     data={'activities':[activity] if activities is None else activities}
     saves=[]; settlements=[]; requests=[]; evidence=[]
@@ -176,3 +178,35 @@ def test_real_canonical_settlement_and_performance_are_exactly_once(closed):
     s['open_position']=original;s['settled_primary_keys']=[]
     ns['_live_reconcile_positions']()
     assert s['open_position'] is None and len(rows)==1 and len(perf)==int(closed)
+
+
+def test_live_gold_shape_narrow_empty_wider_contains_exact_accepted_close():
+    ns,s,inv,acts,saves,settles,req,_=setup()
+    calls=[]
+    def get(path,**kw):
+        if path=='/positions':return inv
+        calls.append(kw['params'])
+        return {'activities':[]} if len(calls)==1 else acts
+    ns['_ig_live_get']=get
+    proof=ns['_live_broker_close_evidence'](s['open_position'],inv)
+    assert proof and proof['activity']==acts['activities'][0]
+    assert len(calls)==2
+    assert int(calls[1]['from'])<int(calls[0]['from'])
+    assert int(calls[1]['to'])>int(calls[0]['to'])
+    ns['_live_reconcile_positions']()
+    assert s['open_position'] is None and len(settles)==1
+
+
+@pytest.mark.parametrize('offset',[3600,-86400])
+def test_padded_query_cannot_certify_future_or_pre_entry_close(offset):
+    ns,s,inv,acts,saves,settles,req,_=setup()
+    acts['activities'][0]['date']=datetime.fromtimestamp(time.time()+offset,timezone.utc).isoformat()
+    assert ns['_live_broker_close_evidence'](s['open_position'],inv) is None
+
+
+def test_padded_history_page_missing_or_truncated_retains_tracking():
+    for second in (None,{'activities':[]}, {'activities':[], 'metadata':{'paging':{'next':'more'}}}):
+        ns,s,inv,acts,saves,settles,req,_=setup()
+        responses=iter([{'activities':[]},second])
+        ns['_ig_live_get']=lambda *a,**kw:next(responses)
+        assert ns['_live_broker_close_evidence'](s['open_position'],inv) is None
