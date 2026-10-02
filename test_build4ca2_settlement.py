@@ -28,7 +28,7 @@ def _ns(*, equity_cfd=None, redis_mock=None):
     observe_calls = []
 
     ns = dict(
-        _live=live, json=json,
+        _live=live, json=json, INSTRUMENTS={"GOLD":"GOLD_EPIC","SPX500":"SPX_EPIC"},
         time=SimpleNamespace(time=lambda: 100000.0),
         _live_lot_sizes={}, _LIVE_LOT_SIZE_FX=1.0,
         _live_equity_cfd=(equity_cfd or set()),
@@ -172,11 +172,12 @@ def test_mark_settled_blocks_future_close_double_record():
 
 # ── Adaptive-consumer feed rules ───────────────────────────────────────────────
 
-def test_confirmed_feeds_perf_record_once():
+def test_confirmed_economics_with_unknown_authority_do_not_train():
     ns = _ns()
     ns["_live_settle_primary_exit"](_pos(), "x", source="s", confirmed_pnl=-1.0)
-    assert len(ns["_perf_calls"]) == 1
-    assert ns["_perf_calls"][0]["won"] is False
+    assert len(ns["_perf_calls"]) == 0
+    assert _last(ns)["dollar_pnl"] == -1.0
+    assert _last(ns)["exit_authority"] == "UNKNOWN"
 
 
 def test_provisional_does_not_feed_perf_record():

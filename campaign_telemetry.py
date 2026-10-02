@@ -37,7 +37,10 @@ FIELDS = ("deal_id", "deal_ref", "instrument", "direction", "fill_price", "ig_si
           "entry_time", "original_notional", "partial_dollar_pnl", "partial_exit_done",
           "partial_exit_pending", "stop_pct", "tp_pct", "peak_pnl_pct", "dple_effective_sl",
           "intended_stop_level", "acknowledged_stop_level", "broker_stop_level",
-          "defensive_stop_level", "defensive_soft_sl", "defensive_stop_active", "stop_sync", "leg_index")
+          "defensive_stop_level", "defensive_soft_sl", "defensive_stop_active", "stop_sync", "leg_index",
+          "exit_authority", "exit_authority_schema", "exit_authority_evidence",
+          "exit_authority_conflict", "operator_intervention", "strategy_learning_eligible",
+          "accounting_eligible", "exit_authority_legs", "close_intents")
 
 
 class Store:
@@ -92,6 +95,11 @@ class Store:
         legs = [p for p in [state.get("open_position"), *state.get("pyramid_legs", [])] if p]
         if position and not any(p.get("deal_id") == position.get("deal_id") for p in legs):
             legs.append(position)
+        # Late settlement/provenance belongs to the original deal's campaign,
+        # even if a newer primary is already open in the current state.
+        late_outcome = event in ("settlement_confirmed", "exit_authority_resolved") and position
+        if late_outcome:
+            legs = [position]
         opening_account = ((legs[0].get("broker_entry_evidence") or {}).get("account_id")
                            if legs else None)
         account_basis = "retained_opening_account_evidence" if opening_account else "current_session_only"
@@ -102,6 +110,30 @@ class Store:
         db = self.connect()
         try:
             with db:
+                if late_outcome:
+                    from exit_authority import contract, learning_eligible, identity as evidence_identity
+                    deal = position.get("deal_id")
+                    prior = db.execute("SELECT c.id,c.data FROM links l JOIN campaigns c ON c.id=l.campaign WHERE l.account=? AND l.deal=?",
+                                       (account_key, deal)).fetchone()
+                    if prior:
+                        cid, raw = prior
+                        data = json.loads(raw)
+                        if details.get("exit_authority_schema"):
+                            authorities = data.setdefault("exit_authorities_by_deal", {})
+                            authorities[deal] = contract(details)
+                            data["operator_intervention"] = any(a.get("operator_intervention") for a in authorities.values())
+                            data["strategy_learning_eligible"] = all(learning_eligible(a) for a in authorities.values())
+                            data["accounting_eligible"] = True
+                        pnl = number(details.get("dollar_pnl"))
+                        if event == "settlement_confirmed" and pnl is not None:
+                            data.setdefault("realized_by_deal", {})[deal] = pnl
+                            if deal not in data.setdefault("closed_deals", []):
+                                data["closed_deals"].append(deal)
+                        self.event(db, cid, now, event, details,
+                                   evidence_identity([deal, details]))
+                        db.execute("UPDATE campaigns SET updated=?,data=? WHERE id=?", (now, json.dumps(data), cid))
+                        self.prune(db, now)
+                        return
                 if event == "global_mode_transition":
                     # Account events share the existing bounded event store.
                     # NULL campaign is intentional: transitions can occur flat.
@@ -167,8 +199,16 @@ class Store:
                     if partial is not None and key not in data.get("closed_deals", []):
                         data["realized_by_deal"][key] = partial
                 event_leg = (position or primary).get("deal_id") or (position or primary).get("deal_ref")
-                if event == "leg_closed":
-                    pnl = number(details.get("realized_pnl"))
+                from exit_authority import contract
+                if details.get("exit_authority_schema"):
+                    from exit_authority import learning_eligible
+                    authorities = data.setdefault("exit_authorities_by_deal", {})
+                    authorities[event_leg] = contract(details)
+                    data["operator_intervention"] = any(a.get("operator_intervention") for a in authorities.values())
+                    data["strategy_learning_eligible"] = all(learning_eligible(a) for a in authorities.values())
+                    data["accounting_eligible"] = True
+                if event in ("leg_closed", "primary_settled", "settlement_confirmed"):
+                    pnl = number(details.get("realized_pnl", details.get("dollar_pnl")))
                     if pnl is None and position and number(details.get("exit_price")) is not None:
                         try:
                             sign = 1 if position["direction"] == "long" else -1
@@ -316,6 +356,7 @@ class Store:
         poll: the row id hashes (campaign, bucketed timestamp, leg/quantity/price
         fingerprint) so a repeated call in the same poll cannot duplicate.
         """
+        from exit_authority import contract
         legs = [p for p in [state.get("open_position"), *state.get("pyramid_legs", [])] if p]
         if not legs:
             return
@@ -344,7 +385,7 @@ class Store:
                 addon_qty += qty or 0.0
             else:
                 primary_qty += qty or 0.0
-            leg_rows.append(dict(
+            leg_row = dict(
                 deal_id=leg.get("deal_id"), leg_index=leg.get("leg_index"),
                 fill_price=fill, ig_size=qty, open_pnl=open_pnl,
                 intended_stop_level=leg.get("intended_stop_level"),
@@ -352,7 +393,9 @@ class Store:
                 broker_stop_level=leg.get("broker_stop_level"),
                 defensive_soft_sl=leg.get("defensive_soft_sl"),
                 dple_effective_sl=leg.get("dple_effective_sl"),
-                stop_sync_status=(leg.get("stop_sync") or {}).get("status")))
+                stop_sync_status=(leg.get("stop_sync") or {}).get("status"))
+            leg_row.update(contract(leg))
+            leg_rows.append(leg_row)
         realized = number(context.get("realized_pnl_known_to_june"))
         payload = dict(
             schema=self.PATH_SCHEMA_VERSION, account=account_key, observed_at=now,

@@ -56,11 +56,17 @@ def close_harness(direction="long", symbol="GOLD"):
 
 class LiveAccountingTests(unittest.TestCase):
     def partial(self, ns, price):
-        ns["_live_confirm_deal"].return_value = {"dealStatus": "ACCEPTED", "level": price}
+        ns["_live_confirm_deal"].return_value = {"dealStatus": "ACCEPTED", "level": price,
+            "dealReference": "fixture-partial", "affectedDeals": [
+                {"dealId": "fixture-deal", "status": "PARTIALLY_CLOSED"}]}
+        ns["_ig_live_post"].return_value = {"dealReference": "fixture-partial"}
         ns["_live_partial_tp_exit"]({ns["_live"]["open_position"]["instrument"]: {"price": price}})
 
     def residual(self, ns, price):
-        ns["_live_confirm_deal"].return_value = {"dealStatus": "ACCEPTED", "level": price}
+        ns["_live_confirm_deal"].return_value = {"dealStatus": "ACCEPTED", "level": price,
+            "dealReference": "fixture-final", "affectedDeals": [
+                {"dealId": "fixture-deal", "status": "FULLY_CLOSED"}]}
+        ns["_ig_live_post"].return_value = {"dealReference": "fixture-final"}
         ns["_ig_live_get"].return_value = {"positions": []}
         ns["_live_close_position"]("dple_trail", {"GOLD": {"price": price}})
 

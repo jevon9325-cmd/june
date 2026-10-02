@@ -18,6 +18,11 @@ class FakeRedis:
     def get(self, key): return self.data.get(key)
     def set(self, key, value, **kwargs): self.data[key] = value
     def setex(self, key, ttl, value): self.data[key] = value
+    def eval(self, script, count, key, marker, previous, stats, oid):
+        if marker in self.data: return 0
+        if self.data.get(key, '') != previous: return -1
+        self.data[key], self.data[marker] = stats, oid
+        return 1
 
 
 def load_helpers():

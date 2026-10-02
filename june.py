@@ -6812,14 +6812,17 @@ def _record_evidence_class(record: dict, default=_EVIDENCE_LEGACY_LIVE) -> str:
 
 def _confirmed_outcome_record(record: dict) -> bool:
     """Only explicit broker-confirmed, non-null outcomes train confirmed-live planes."""
-    return (_record_evidence_class(record) == _EVIDENCE_BROKER_CONFIRMED
+    from exit_authority import learning_eligible
+    return (learning_eligible(record)
+            and _record_evidence_class(record) == _EVIDENCE_BROKER_CONFIRMED
             and record.get("dollar_pnl") is not None)
 
 
 def _performance_learning_rows(records: list) -> list:
     """Backward-compatible rows: confirmed plus explicit legacy, never unresolved."""
+    from exit_authority import learning_eligible
     return [r for r in (records or [])
-            if _record_evidence_class(r) in (_EVIDENCE_BROKER_CONFIRMED, _EVIDENCE_LEGACY_LIVE)
+            if learning_eligible(r) and _record_evidence_class(r) in (_EVIDENCE_BROKER_CONFIRMED, _EVIDENCE_LEGACY_LIVE)
             and r.get("dollar_pnl") is not None]
 
 
@@ -6896,7 +6899,7 @@ def _compute_htf_alignment(sym, direction):
 
 def _live_write_htf_event(sym, direction, htf_bias, htf_move_pct, entry_price,
                           evidence_class=_EVIDENCE_SIM_PRIOR,
-                          deal_id=None, settlement_identity=None):
+                          deal_id=None, settlement_identity=None, outcome=None):
     """Write an HTF event with explicit evidence provenance."""
     try:
         rec = json.dumps({
@@ -6909,6 +6912,7 @@ def _live_write_htf_event(sym, direction, htf_bias, htf_move_pct, entry_price,
             "evidence_class": _evidence_class(evidence_class),
             "deal_id": deal_id,
             "settlement_identity": settlement_identity,
+            **__import__("exit_authority").contract(outcome or {}),
         })
         _r = _redis()
         _r.lpush(_HTF_EVENTS_KEY, rec)
@@ -7047,6 +7051,16 @@ def _live_capture_evidence(position, event, **details) -> None:
     if not position:
         return
     try:
+        from exit_authority import capture, contract
+        position.setdefault("exit_authority_epic", INSTRUMENTS.get(position.get("instrument")))
+        capture(position, event, details)
+        # The close path may work from a detached copy. Persist the linked intent
+        # on the tracked deal as well before submission/clearing.
+        for tracked in [_live.get("open_position"), *_live.get("pyramid_legs", [])]:
+            if tracked and tracked.get("deal_id") == position.get("deal_id"):
+                tracked.update(contract(position))
+        if event in ("close_intent", "close_response", "close_confirmation_observed"):
+            _live_save_state()
         _live_evidence_capture().capture(
             position, event, session_account=_live_sess.get("account_id"),
             current_role="add_on" if "leg_index" in position else "primary", details=details)
@@ -7072,6 +7086,11 @@ def _live_observe(event, signals=None, position=None, details=None):
     """Experimental telemetry is best effort and never participates in decisions."""
     try:
         from campaign_telemetry import default_store
+        from exit_authority import contract
+        if event == "leg_closed" and position and "exit_authority_schema" not in position:
+            from exit_authority import classify
+            classify(position)
+        details = {**contract(position or {}), **(details or {})}
         default_store().observe(
             _live, signals if signals is not None else _current_cycle_signals_snap,
             account=_live_sess.get("account_id"), now=time.time(), unit=_live_campaign_unit,
@@ -7278,6 +7297,9 @@ def _live_b1_material_change(failure: dict, current: dict, now=None) -> tuple:
 
 def _live_b1_record_failure(pos: dict, exit_record: dict, source: str) -> None:
     """Persist the latest negative/unknown primary stop-loss thesis failure once."""
+    from exit_authority import learning_eligible
+    if not learning_eligible(exit_record):
+        return
     if not pos or exit_record.get("exit_reason") != "stop_loss":
         return
     pnl = exit_record.get("dollar_pnl")
@@ -7888,6 +7910,10 @@ def _live_reconcile_provisional_settlements() -> None:
         _live_log(f"[RECON] durable history unavailable: {exc}")
         return
 
+    from exit_authority import learning_eligible, contract, refresh_confirmed_authorities
+    refresh_confirmed_authorities(raw_list, _rh, _LIVE_TRADE_HIST_KEY, _ig_live_get,
+                                 account=globals().get("_live_sess", {}).get("account_id"),
+                                 now=now, observe=_live_observe)
     # ---- Phase A31.7: replay perf-consumer for CONFIRMED-but-not-yet-fed records ----
     # (Covers the crash window between CONFIRMED persist and perf_record.)
     _record_class_fn = globals().get("_record_evidence_class")
@@ -7898,7 +7924,8 @@ def _live_reconcile_provisional_settlements() -> None:
             continue
         _rec_class = (_record_class_fn(rec) if _record_class_fn is not None
                       else rec.get("evidence_class"))
-        if (_rec_class == "BROKER_CONFIRMED_LIVE"
+        if (learning_eligible(rec)
+                and _rec_class == "BROKER_CONFIRMED_LIVE"
                 and rec.get("settlement_state") == "CONFIRMED"
                 and rec.get("reconciled")
                 and rec.get("dollar_pnl") is not None and not rec.get("perf_fed")):
@@ -7909,7 +7936,7 @@ def _live_reconcile_provisional_settlements() -> None:
                     campaign_id=rec.get("campaign_id"), deal_id=rec.get("deal_id"),
                     settlement_identity=rec.get("settlement_identity") or (f"deal:{rec.get('deal_id')}" if rec.get("deal_id") else None),
                     settlement_state="CONFIRMED", evidence_class="BROKER_CONFIRMED_LIVE",
-                    pnl_source=rec.get("pnl_source"), exit_reason=rec.get("exit_reason"))
+                    pnl_source=rec.get("pnl_source"), exit_reason=rec.get("exit_reason"), outcome=rec)
             except Exception:
                 continue  # try again next cycle; perf_fed stays False (no double-feed)
             rec["perf_fed"] = True
@@ -7984,6 +8011,10 @@ def _live_reconcile_provisional_settlements() -> None:
                             params={"from": _from, "to": _to, "detailed": "true",
                                     "pageSize": 500}, version="3")
         _acts = (_act or {}).get("activities", []) if isinstance(_act, dict) else []
+        # Exact broker redelivery is one observation. Conflicting rows stay
+        # distinct and the existing settlement ambiguity contract still applies.
+        _acts = list({json.dumps(a, sort_keys=True): a for a in _acts
+                      if isinstance(a, dict)}.values())
 
         # B4SI: delegate matching + partial/final aggregation to the pure
         # settlement_reconcile module. It no longer vetoes on a partial action
@@ -8029,6 +8060,9 @@ def _live_reconcile_provisional_settlements() -> None:
                 or _cur.get("settlement_state") != "PROVISIONAL"
                 or _cur.get("dollar_pnl") is not None):
             continue
+        from exit_authority import classify
+        if "exit_authority_schema" in _cur:
+            classify(_cur, _acts)
         _cur["dollar_pnl"]        = round(_pnl, 4)
         _cur["exit_price"]        = _clvl
         _cur["settlement_state"]  = "CONFIRMED"
@@ -8049,12 +8083,13 @@ def _live_reconcile_provisional_settlements() -> None:
             continue
         # Feed adaptive consumer exactly once; mark perf_fed durably.
         try:
-            _live_perf_record(
-                sym, _pnl > 0, None, pnl_dollar=_pnl,
-                campaign_id=_cur.get("campaign_id"), deal_id=deal_id,
-                settlement_identity=_cur.get("settlement_identity") or f"deal:{deal_id}",
-                settlement_state="CONFIRMED", evidence_class="BROKER_CONFIRMED_LIVE",
-                pnl_source=_cur.get("pnl_source"), exit_reason=_cur.get("exit_reason"))
+            if learning_eligible(_cur):
+                _live_perf_record(
+                    sym, _pnl > 0, None, pnl_dollar=_pnl,
+                    campaign_id=_cur.get("campaign_id"), deal_id=deal_id,
+                    settlement_identity=_cur.get("settlement_identity") or f"deal:{deal_id}",
+                    settlement_state="CONFIRMED", evidence_class="BROKER_CONFIRMED_LIVE",
+                    pnl_source=_cur.get("pnl_source"), exit_reason=_cur.get("exit_reason"), outcome=_cur)
             _cur["perf_fed"] = True
             _rh.lset(_LIVE_TRADE_HIST_KEY, idx, json.dumps(_cur))
         except Exception as exc:
@@ -8062,11 +8097,11 @@ def _live_reconcile_provisional_settlements() -> None:
         _live_log(f"[RECON] CONFIRMED {sym} {dirn} deal={deal_id} P&L ${_pnl:+.4f} "
                   f"via {_match_label} ({_evidence_path}, {_n_tx} broker txn(s) aggregated, "
                   f"was PROVISIONAL/UNKNOWN)")
-        _live_observe("settlement_confirmed", None, None,
+        _live_observe("settlement_confirmed", None, _cur,
                       {"deal_id": deal_id, "instrument": sym, "dollar_pnl": round(_pnl, 4),
                        "prior_state": "PROVISIONAL", "match": _match_label,
                        "evidence_path": _evidence_path, "tx_count": _n_tx,
-                       "B4CA31": True})
+                       "B4CA31": True, **contract(_cur)})
 
     # B4SI: refresh the in-memory trade_history snapshot from the durable list so
     # stale PROVISIONAL copies pick up economics already finalized durably. This
@@ -8848,7 +8883,7 @@ def _live_perf_record(sym: str, won: bool, sar, pnl_dollar: float = 0.0,
                       excluded_defect_id: str = None, campaign_id=None,
                       deal_id=None, settlement_identity=None,
                       settlement_state=None, evidence_class=None,
-                      pnl_source=None, exit_reason=None) -> None:
+                      pnl_source=None, exit_reason=None, outcome=None) -> None:
     """Update rolling per-instrument performance stats in Redis.
     Each record carries epoch timestamp and dollar P&L.
     Severity tiers keyed to % of current balance lost:
@@ -8859,6 +8894,9 @@ def _live_perf_record(sym: str, won: bool, sar, pnl_dollar: float = 0.0,
     Called only after a confirmed IG position close. Provisional/UNKNOWN rows are
     never outcome-training observations.
     """
+    from exit_authority import learning_eligible, contract
+    if not learning_eligible(outcome):
+        return
     _cls = _evidence_class(evidence_class, settlement_state=settlement_state,
                            pnl=pnl_dollar, default=_EVIDENCE_LEGACY_LIVE)
     if _cls in (_EVIDENCE_SIM_PRIOR, _EVIDENCE_PROVISIONAL, _EVIDENCE_UNKNOWN):
@@ -8900,13 +8938,16 @@ def _live_perf_record(sym: str, won: bool, sar, pnl_dollar: float = 0.0,
             "pnl_source": pnl_source,
             "exit_reason": exit_reason,
             "observation_id": _observation_id,
+            **contract(outcome or {}),
             **({"excluded_defect_id": excluded_defect_id} if excluded_defect_id else {}),
         })
         keep = max(_PERF_BLOCK_WINDOW, _PERF_BLOCK_HARD_MIN_TRADES)
         if len(trades) > keep:
             trades = trades[-keep:]
         stats["trades"] = trades
-        r.set(key, json.dumps(stats))
+        from exit_authority import commit_performance
+        if not commit_performance(r, key, raw, stats, _observation_id):
+            return
 
         # ── Recency filter ─────────────────────────────────────────────────────────────────────────
         cutoff = time.time() - (_PERF_BLOCK_RECENCY_DAYS * 86400)
@@ -9002,6 +9043,7 @@ def _live_perf_record(sym: str, won: bool, sar, pnl_dollar: float = 0.0,
 
     except Exception as exc:
         _live_log(f"[perf_record] {sym}: Redis error — {exc}")
+        raise  # durable settlement dispatcher retries failed delivery
 
 def _live_has_boost(combo: str) -> bool:
     """Live-specific boost tracking — separate from sim's boost_expiry."""
@@ -9716,6 +9758,9 @@ def _live_settle_primary_exit(pos: dict, exit_reason: str, source: str,
     """
     if not pos:
         return
+    from exit_authority import classify, contract, learning_eligible
+    pos.setdefault("exit_authority_epic", INSTRUMENTS.get(pos.get("instrument")))
+    classify(pos)
     # Idempotency: at most one settlement per broker exit.
     if _live_already_settled(pos):
         return
@@ -9791,6 +9836,7 @@ def _live_settle_primary_exit(pos: dict, exit_reason: str, source: str,
         "max_adverse_excursion_pct":   pos.get("max_adverse_excursion_pct", 0.0),
         "max_adverse_excursion_r":     pos.get("max_adverse_excursion_r", 0.0),
     }
+    rec.update(contract(pos))
     if exit_reason == "stop_loss":
         _b1_record = globals().get("_live_b1_record_failure")
         if _b1_record is not None:
@@ -9815,7 +9861,8 @@ def _live_settle_primary_exit(pos: dict, exit_reason: str, source: str,
     except Exception:
         pass
     # Feed adaptive consumers ONCE, and ONLY on CONFIRMED P&L (never train on UNKNOWN).
-    if settlement_state == "CONFIRMED" and dollar_pnl is not None:
+    if (settlement_state == "CONFIRMED" and dollar_pnl is not None
+            and learning_eligible(rec)):
         _sar = (signals or {}).get(sym, {}).get("spread_atr_ratio")
         try:
             _perf_id = f"deal:{deal_id}" if deal_id else None
@@ -9826,18 +9873,18 @@ def _live_settle_primary_exit(pos: dict, exit_reason: str, source: str,
                               deal_id=deal_id, settlement_identity=_perf_id,
                               settlement_state="CONFIRMED",
                               evidence_class="BROKER_CONFIRMED_LIVE",
-                              pnl_source=pnl_provenance, exit_reason=exit_reason)
+                              pnl_source=pnl_provenance, exit_reason=exit_reason, outcome=rec)
             if pos.get("htf_bias") not in (None, "unknown"):
                 _live_write_htf_event(
                     sym, dirn, pos.get("htf_bias"), 0.0, fill_px,
                     evidence_class="BROKER_CONFIRMED_LIVE",
-                    deal_id=deal_id, settlement_identity=_perf_id)
+                    deal_id=deal_id, settlement_identity=_perf_id, outcome=rec)
         except Exception as _pexc:
             _live_log(f"[SETTLE] perf_record failed (non-fatal): {_pexc}")
     _live_observe("primary_settled", signals, pos, {
         "settlement_state": settlement_state, "settlement_source": source,
         "pnl_provenance": pnl_provenance, "dollar_pnl": dollar_pnl,
-        "exit_reason": exit_reason, "B4CA2": True})
+        "exit_reason": exit_reason, "B4CA2": True, **contract(rec)})
     _live_log(
         f"[SETTLE] {sym} {dirn} {settlement_state} via {source} | "
         + (f"P&L ${dollar_pnl:+.4f}" if dollar_pnl is not None else "P&L UNKNOWN (provisional)")
@@ -9910,7 +9957,8 @@ def _live_close_position(exit_reason: str, signals: dict) -> None:
             # before this close scan fired. Mirror the same cooldowns the normal
             # stop_loss close path sets -- without this, the entry gate is bypassed
             # every time a broker stop fires faster than the bot's exit scan.
-            if exit_reason == "stop_loss":
+            from exit_authority import learning_eligible
+            if exit_reason == "stop_loss" and learning_eligible(pos):
                 _sl_exp = time.time() + 10 * 60
                 _live.setdefault("pause_expiry", {})[_sim_combo_key(sym, dirn)] = _sl_exp
                 _live_log(f"⏸️ [SAME-DIR COOLDOWN] {sym} {dirn} blocked for 10m (broker-stop path). Opposing direction remains active.")
@@ -9928,7 +9976,7 @@ def _live_close_position(exit_reason: str, signals: dict) -> None:
                             f"⛔️ [DEFENSIVE] {sym}: NORMAL -> DEFENSIVE "
                             f"({_so_ct[sym]} stop-outs today >= {_LIVE_DEF_INSTR_STOPOUTS})"
                         )
-            elif exit_reason == "pyramid_leg_sl_close_primary":
+            elif exit_reason == "pyramid_leg_sl_close_primary" and learning_eligible(pos):
                 # Pyramid-SL primary closure counts toward per-instrument defensive,
                 # same as a direct stop_loss. No same-dir/all-dir cooldown.
                 _so_ct = _live.setdefault("instrument_stopouts_today", {})
@@ -9962,7 +10010,10 @@ def _live_close_position(exit_reason: str, signals: dict) -> None:
     if _live.get("open_position"):
         _live["open_position"]["scaling_history_complete"] = False
         _live_save_state()
-    _live_capture_evidence(pos, "close_intent", order=close_body, expected_exit_reason=exit_reason, local_request_time=time.time())
+    from exit_authority import capture as _authority_capture
+    _authority_details = dict(order=close_body, expected_exit_reason=exit_reason, local_request_time=time.time())
+    _authority_capture(pos, "close_intent", _authority_details)
+    _live_capture_evidence(pos, "close_intent", **_authority_details)
     resp = _ig_live_post("/positions/otc", close_body, version="1", close=True)
     _live_capture_evidence(pos, "close_response", response=resp, expected_exit_reason=exit_reason)
     if not resp:
@@ -9974,6 +10025,11 @@ def _live_close_position(exit_reason: str, signals: dict) -> None:
     _live_capture_evidence(pos, "close_confirmation_observed", response=resp, confirmation=confirm, expected_exit_reason=exit_reason)
 
     if confirm and confirm.get("dealStatus") == "ACCEPTED":
+        from exit_authority import capture, classify, contract, learning_eligible
+        # Explicit linkage independent of best-effort journal availability.
+        capture(pos, "close_response", {"response": resp})
+        capture(pos, "close_confirmation_observed", {"response": resp, "confirmation": confirm})
+        classify(pos)
         _close_inventory = _ig_live_get("/positions", version="2")
         _close_rows = _close_inventory.get("positions") if isinstance(_close_inventory, dict) else None
         _close_valid = isinstance(_close_rows, list) and all(
@@ -10034,8 +10090,11 @@ def _live_close_position(exit_reason: str, signals: dict) -> None:
             "reversal_exit_trigger_source": (pos.get("reversal_exit_trigger_source")
                                              if exit_reason == "reversal" else None),
         }
+        trade_rec.update(contract(pos))
         trade_rec["deal_id"] = deal_id  # B4CA2: identity for cross-path dedup
         trade_rec["settlement_state"] = "CONFIRMED"
+        trade_rec["reconciled"] = True
+        trade_rec["perf_fed"] = False
         trade_rec["settlement_source"] = "june_managed_close"
         trade_rec["tp_source"] = pos.get("tp_source", "SIM_PRIOR")
         trade_rec["stop_source"] = pos.get("stop_source", "SIM_PRIOR+CURRENT_MARKET_SPREAD_FLOOR")
@@ -10066,7 +10125,7 @@ def _live_close_position(exit_reason: str, signals: dict) -> None:
             pass
 
         # Re-entry observation: record this reversal exit for re-entry detection
-        if exit_reason == "reversal":
+        if exit_reason == "reversal" and learning_eligible(trade_rec):
             try:
                 _live_reversal_exits[sym] = {
                     "exit_epoch":    int(time.time()),
@@ -10094,74 +10153,78 @@ def _live_close_position(exit_reason: str, signals: dict) -> None:
             _live["short_trades"] = _live.get("short_trades", 0) + 1
             if won: _live["short_wins"] = _live.get("short_wins", 0) + 1
 
-        _live_update_streak(sym, dirn, won)
-        _htf_b_c = pos.get("htf_bias", "unknown")
-        if _htf_b_c not in ("unknown", None):
-            _live_write_htf_event(sym, dirn, _htf_b_c, 0.0, fill_px,
-                                  evidence_class="BROKER_CONFIRMED_LIVE",
-                                  deal_id=deal_id,
-                                  settlement_identity=f"deal:{deal_id}" if deal_id else None)
-        _live_perf_record(sym, won, sig.get("spread_atr_ratio"), pnl_dollar=complete_dollar,
-                          entry_sar=pos.get("entry_sar"), persistence_confirmed=pos.get("persistence_confirmed"),
-                          campaign_id=pos.get("campaign_id") or pos.get("rolling_campaign_id"),
-                          deal_id=deal_id, settlement_identity=f"deal:{deal_id}" if deal_id else None,
-                          settlement_state="CONFIRMED", evidence_class="BROKER_CONFIRMED_LIVE",
-                          pnl_source="confirmed_fill_estimate", exit_reason=exit_reason)
-        _sim_15m_record(sym, dirn, pos.get("entry_change_15m") or 0.0, won,
-                        evidence_class="BROKER_CONFIRMED_LIVE")
-        # Live phase stat update — only counted when above balance gate
-        if _live.get("balance", 0.0) >= _LIVE_PHASE_GATE_BAL:
-            _live["live_phase_trades"]  = _live.get("live_phase_trades", 0) + 1
-            _live["live_phase_wins"]    = _live.get("live_phase_wins", 0) + int(won)
-            _live["live_phase_losses"]  = _live.get("live_phase_losses", 0) + int(not won)
-            if won:
-                _live["live_phase_consec_losses"] = 0
-            else:
-                _live["live_phase_consec_losses"] = _live.get("live_phase_consec_losses", 0) + 1
-            if _live.get("live_phase_entry_balance") is None:
-                _live["live_phase_entry_balance"] = _live.get("balance", 0.0)
-            _live_check_phase()
-        # After stop_loss: block the stopped direction for 10 min (same-dir cooldown)
-        # and block ALL directions on this instrument for 15 min (instrument cooldown).
-        # Prevents an immediate direction-flip into the same noise that stopped us out.
-        if exit_reason == "stop_loss":
-            _sl_exp = time.time() + 10 * 60
-            _live.setdefault("pause_expiry", {})[_sim_combo_key(sym, dirn)] = _sl_exp
-            _live_log(f"⏸️ [SAME-DIR COOLDOWN] {sym} {dirn} blocked for 10m. Opposing direction remains active.")
-            _instr_exp = time.time() + 15 * 60
-            _live.setdefault("instrument_cooldown", {})[sym] = _instr_exp
-            _live_log(f"⏸️ [INSTRUMENT COOLDOWN] {sym} all-direction blocked for 15m after stop-out")
-            # Track stop-outs per instrument for per-instrument defensive mode
-            _so_ct = _live.setdefault("instrument_stopouts_today", {})
-            _so_ct[sym] = _so_ct.get(sym, 0) + 1
-            if _so_ct[sym] >= _LIVE_DEF_INSTR_STOPOUTS:
-                _imd = _live.setdefault("instrument_mode", {})
-                if _imd.get(sym) != "defensive":
-                    _imd[sym] = "defensive"
-                    _live.setdefault("instrument_mode_entered_at", {})[sym] = time.time()
-                    _live_log(
-                        f"⛔️ [DEFENSIVE] {sym}: NORMAL -> DEFENSIVE "
-                        f"({_so_ct[sym]} stop-outs today >= {_LIVE_DEF_INSTR_STOPOUTS})"
-                    )
-        elif exit_reason == "pyramid_leg_sl_close_primary":
-            # Pyramid-SL primary closure counts toward per-instrument defensive,
-            # same as a direct stop_loss. No same-dir/all-dir cooldown.
-            _so_ct = _live.setdefault("instrument_stopouts_today", {})
-            _so_ct[sym] = _so_ct.get(sym, 0) + 1
-            if _so_ct[sym] >= _LIVE_DEF_INSTR_STOPOUTS:
-                _imd = _live.setdefault("instrument_mode", {})
-                if _imd.get(sym) != "defensive":
-                    _imd[sym] = "defensive"
-                    _live.setdefault("instrument_mode_entered_at", {})[sym] = time.time()
-                    _live_log(
-                        f"[DEFENSIVE] {sym}: NORMAL -> DEFENSIVE "
-                        f"({_so_ct[sym]} stop-outs today >= {_LIVE_DEF_INSTR_STOPOUTS}) "
-                        f"[pyramid_leg_sl_close_primary]"
-                    )
-        # Record wins on instruments in defensive mode (enables P&L recovery condition)
-        if won and (_live.get("instrument_mode") or {}).get(sym) == "defensive":
-            _live.setdefault("instrument_won_after_def", {})[sym] = 1
-            _live_log(f"📈 [DEFENSIVE] {sym}: win recorded in defensive mode (recovery pending)")
+        if learning_eligible(trade_rec):
+            _live_update_streak(sym, dirn, won)
+            _htf_b_c = pos.get("htf_bias", "unknown")
+            if _htf_b_c not in ("unknown", None):
+                _live_write_htf_event(sym, dirn, _htf_b_c, 0.0, fill_px,
+                                      evidence_class="BROKER_CONFIRMED_LIVE",
+                                      deal_id=deal_id,
+                                      settlement_identity=f"deal:{deal_id}" if deal_id else None, outcome=trade_rec)
+            try:
+                _live_perf_record(sym, won, sig.get("spread_atr_ratio"), pnl_dollar=complete_dollar,
+                                  entry_sar=pos.get("entry_sar"), persistence_confirmed=pos.get("persistence_confirmed"),
+                                  campaign_id=pos.get("campaign_id") or pos.get("rolling_campaign_id"),
+                                  deal_id=deal_id, settlement_identity=f"deal:{deal_id}" if deal_id else None,
+                                  settlement_state="CONFIRMED", evidence_class="BROKER_CONFIRMED_LIVE",
+                                  pnl_source="confirmed_fill_estimate", exit_reason=exit_reason, outcome=trade_rec)
+            except Exception as exc:
+                _live_log(f"[PERF DELIVERY] deferred to durable settlement replay: {type(exc).__name__}")
+            _sim_15m_record(sym, dirn, pos.get("entry_change_15m") or 0.0, won,
+                            evidence_class="BROKER_CONFIRMED_LIVE")
+            # Live phase stat update — only counted when above balance gate
+            if _live.get("balance", 0.0) >= _LIVE_PHASE_GATE_BAL:
+                _live["live_phase_trades"]  = _live.get("live_phase_trades", 0) + 1
+                _live["live_phase_wins"]    = _live.get("live_phase_wins", 0) + int(won)
+                _live["live_phase_losses"]  = _live.get("live_phase_losses", 0) + int(not won)
+                if won:
+                    _live["live_phase_consec_losses"] = 0
+                else:
+                    _live["live_phase_consec_losses"] = _live.get("live_phase_consec_losses", 0) + 1
+                if _live.get("live_phase_entry_balance") is None:
+                    _live["live_phase_entry_balance"] = _live.get("balance", 0.0)
+                _live_check_phase()
+            # After stop_loss: block the stopped direction for 10 min (same-dir cooldown)
+            # and block ALL directions on this instrument for 15 min (instrument cooldown).
+            # Prevents an immediate direction-flip into the same noise that stopped us out.
+            if exit_reason == "stop_loss":
+                _sl_exp = time.time() + 10 * 60
+                _live.setdefault("pause_expiry", {})[_sim_combo_key(sym, dirn)] = _sl_exp
+                _live_log(f"⏸️ [SAME-DIR COOLDOWN] {sym} {dirn} blocked for 10m. Opposing direction remains active.")
+                _instr_exp = time.time() + 15 * 60
+                _live.setdefault("instrument_cooldown", {})[sym] = _instr_exp
+                _live_log(f"⏸️ [INSTRUMENT COOLDOWN] {sym} all-direction blocked for 15m after stop-out")
+                # Track stop-outs per instrument for per-instrument defensive mode
+                _so_ct = _live.setdefault("instrument_stopouts_today", {})
+                _so_ct[sym] = _so_ct.get(sym, 0) + 1
+                if _so_ct[sym] >= _LIVE_DEF_INSTR_STOPOUTS:
+                    _imd = _live.setdefault("instrument_mode", {})
+                    if _imd.get(sym) != "defensive":
+                        _imd[sym] = "defensive"
+                        _live.setdefault("instrument_mode_entered_at", {})[sym] = time.time()
+                        _live_log(
+                            f"⛔️ [DEFENSIVE] {sym}: NORMAL -> DEFENSIVE "
+                            f"({_so_ct[sym]} stop-outs today >= {_LIVE_DEF_INSTR_STOPOUTS})"
+                        )
+            elif exit_reason == "pyramid_leg_sl_close_primary":
+                # Pyramid-SL primary closure counts toward per-instrument defensive,
+                # same as a direct stop_loss. No same-dir/all-dir cooldown.
+                _so_ct = _live.setdefault("instrument_stopouts_today", {})
+                _so_ct[sym] = _so_ct.get(sym, 0) + 1
+                if _so_ct[sym] >= _LIVE_DEF_INSTR_STOPOUTS:
+                    _imd = _live.setdefault("instrument_mode", {})
+                    if _imd.get(sym) != "defensive":
+                        _imd[sym] = "defensive"
+                        _live.setdefault("instrument_mode_entered_at", {})[sym] = time.time()
+                        _live_log(
+                            f"[DEFENSIVE] {sym}: NORMAL -> DEFENSIVE "
+                            f"({_so_ct[sym]} stop-outs today >= {_LIVE_DEF_INSTR_STOPOUTS}) "
+                            f"[pyramid_leg_sl_close_primary]"
+                        )
+            # Record wins on instruments in defensive mode (enables P&L recovery condition)
+            if won and (_live.get("instrument_mode") or {}).get(sym) == "defensive":
+                _live.setdefault("instrument_won_after_def", {})[sym] = 1
+                _live_log(f"📈 [DEFENSIVE] {sym}: win recorded in defensive mode (recovery pending)")
     else:
         _live_log(f"close_position: confirm failed or rejected for {sym} — check IG manually")
         _live_log(f"⚠️  close_position: ambiguous IG state for {sym} — running mid-cycle reconciliation")
@@ -10656,7 +10719,10 @@ def _live_partial_tp_exit(signals: dict) -> None:
         "timeInForce":   "FILL_OR_KILL",
         "dealId":        deal_id,
     }
-    _live_capture_evidence(pos, "close_intent", order=close_body, expected_exit_reason="partial_take_profit", local_request_time=time.time())
+    from exit_authority import capture as _authority_capture
+    _authority_details = dict(order=close_body, expected_exit_reason="partial_take_profit", local_request_time=time.time())
+    _authority_capture(pos, "close_intent", _authority_details)
+    _live_capture_evidence(pos, "close_intent", **_authority_details)
     _live_observe("partial_tp_requested", signals, pos)
     _live["open_position"]["partial_exit_pending"] = {
         "requested_size": half_sz, "original_size": ig_sz,
@@ -10729,6 +10795,11 @@ def _live_partial_tp_exit(signals: dict) -> None:
             _live_save_state()
             return
 
+        from exit_authority import capture, record_partial, contract
+        capture(pos, "close_response", {"response": resp})
+        capture(pos, "close_confirmation_observed", {"response": resp, "confirmation": confirm})
+        record_partial(pos)
+        _live["open_position"].update(contract(pos))
         remaining_sz = round(ig_sz - half_sz, 4)
         # Allocation release needs its own durable broker residual certificate.
         # Missing identity fields preserve the full reservation without changing TP.
@@ -11807,7 +11878,10 @@ def _live_close_addon_leg(leg: dict, exit_reason: str, signals: dict) -> None:
         "timeInForce":    "FILL_OR_KILL",
         "dealId":         deal_id,
     }
-    _live_capture_evidence(leg, "close_intent", order=close_body, expected_exit_reason=exit_reason, local_request_time=time.time())
+    from exit_authority import capture as _authority_capture
+    _authority_details = dict(order=close_body, expected_exit_reason=exit_reason, local_request_time=time.time())
+    _authority_capture(leg, "close_intent", _authority_details)
+    _live_capture_evidence(leg, "close_intent", **_authority_details)
     resp = _ig_live_post("/positions/otc", close_body, version="1", close=True)
     _live_capture_evidence(leg, "close_response", response=resp, expected_exit_reason=exit_reason)
     if not resp:
@@ -11817,6 +11891,10 @@ def _live_close_addon_leg(leg: dict, exit_reason: str, signals: dict) -> None:
     confirm  = _live_confirm_deal(deal_ref) if deal_ref else None
     _live_capture_evidence(leg, "close_confirmation_observed", response=resp, confirmation=confirm, expected_exit_reason=exit_reason)
     if confirm and confirm.get("dealStatus") == "ACCEPTED":
+        from exit_authority import capture, classify
+        capture(leg, "close_response", {"response": resp})
+        capture(leg, "close_confirmation_observed", {"response": resp, "confirmation": confirm})
+        classify(leg)
         _close_inventory = _ig_live_get("/positions", version="2")
         _close_rows = _close_inventory.get("positions") if isinstance(_close_inventory, dict) else None
         _close_valid = isinstance(_close_rows, list) and all(
@@ -13515,55 +13593,57 @@ def _live_broker_close_evidence(pos, inventory):
     entry = pos.get("entry_time")
     if not isinstance(entry, (int, float)) or not 0 < entry <= now:
         return None
-    response = _ig_live_get("/history/activity", params={
-        "from": _recon_iso(max(entry - 60, now - 24 * 3600)),
-        "to": _recon_iso(now), "detailed": "true", "pageSize": 500}, version="3")
-    activities = response.get("activities") if isinstance(response, dict) else None
-    if not isinstance(activities, list):
-        return None
-    # Never certify a truncated or ambiguous history page. Retry with future
-    # evidence; do not follow an arbitrary broker-supplied URL.
-    if ((response.get("metadata") or {}).get("paging") or {}).get("next"):
-        return None
-    # This account can expose a UTC-dated activity in a wider window while
-    # omitting it from the equivalent narrow timestamp filter. Keep the narrow
-    # fast path, but retry a padded bounded window before declaring evidence
-    # missing. Padding discovers evidence only: exact deal/account/epic and
-    # parsed UTC event bounds below remain mandatory before accepting closure.
-    if not activities:
+    from datetime import datetime, timezone
+    def matching_closes(activities):
+        matches = []
+        for activity in activities:
+            if not isinstance(activity, dict) or activity.get("status") != "ACCEPTED":
+                continue
+            if activity.get("epic") != INSTRUMENTS.get(pos.get("instrument")):
+                continue
+            try:
+                observed = datetime.fromisoformat(activity["date"].replace("Z", "+00:00"))
+                if observed.tzinfo is None:
+                    observed = observed.replace(tzinfo=timezone.utc)
+                event_time = observed.timestamp()
+            except (KeyError, TypeError, ValueError, AttributeError):
+                continue
+            if not entry - 60 <= event_time <= now:
+                continue  # expanded query bounds never establish a future/old close
+            details = activity.get("details") or {}
+            if any(isinstance(action, dict) and action.get("actionType") == "POSITION_CLOSED"
+                   and action.get("affectedDealId") == deal
+                   for action in details.get("actions") or []):
+                if activity not in matches:
+                    matches.append(activity)
+        return matches
+
+    # Query success is not target evidence. The narrow response can contain
+    # unrelated/old activity while omitting this deal's close; match it first.
+    # At most one padded retry, only when no unique authoritative close exists.
+    windows = (
+        (max(entry - 60, now - 24 * 3600), now),
+        (max(entry - 24 * 3600, now - 48 * 3600), now + 24 * 3600),
+    )
+    matches = []
+    for start_time, end_time in windows:
         response = _ig_live_get("/history/activity", params={
-            "from": _recon_iso(max(entry - 24 * 3600, now - 48 * 3600)),
-            "to": _recon_iso(now + 24 * 3600),
+            "from": _recon_iso(start_time), "to": _recon_iso(end_time),
             "detailed": "true", "pageSize": 500}, version="3")
         activities = response.get("activities") if isinstance(response, dict) else None
         if not isinstance(activities, list):
             return None
+        # A truncated/unavailable response cannot certify closure. Never follow
+        # a broker-supplied next URL or conceal ambiguity by retrying another page.
         if ((response.get("metadata") or {}).get("paging") or {}).get("next"):
             return None
-    from datetime import datetime, timezone
-    matches = []
-    for activity in activities:
-        if not isinstance(activity, dict) or activity.get("status") != "ACCEPTED":
-            continue
-        if activity.get("epic") != INSTRUMENTS.get(pos.get("instrument")):
-            continue
-        try:
-            observed = datetime.fromisoformat(activity["date"].replace("Z", "+00:00"))
-            if observed.tzinfo is None:
-                observed = observed.replace(tzinfo=timezone.utc)
-            event_time = observed.timestamp()
-        except (KeyError, TypeError, ValueError, AttributeError):
-            continue
-        if not entry - 60 <= event_time <= now:
-            continue  # expanded query bounds never establish a future/old close
-        details = activity.get("details") or {}
-        if any(isinstance(action, dict) and action.get("actionType") == "POSITION_CLOSED"
-               and action.get("affectedDealId") == deal
-               for action in details.get("actions") or []):
+        for activity in matching_closes(activities):
             if activity not in matches:
                 matches.append(activity)
-    if len(matches) == 1:
-        return {"source": "REST.absent+activity.POSITION_CLOSED", "activity": matches[0]}
+        if len(matches) == 1:
+            return {"source": "REST.absent+activity.POSITION_CLOSED", "activity": matches[0]}
+        # Keep genuine conflicting final closes across windows: wider evidence
+        # cannot erase affirmative contradictory evidence from the narrow query.
     return None
 
 
@@ -13615,6 +13695,9 @@ def _live_reconcile_positions() -> None:
     if primary:
         proof = _live_broker_close_evidence(primary, data)
         if proof:
+            from exit_authority import classify
+            primary.setdefault("exit_authority_epic", INSTRUMENTS.get(primary.get("instrument")))
+            classify(primary, [proof["activity"]] if proof.get("activity") else [])
             _live_capture_evidence(primary, "authoritative_broker_close", **proof,
                                    broker_positions_response=data)
             pnl = proof.get("pnl") or {}
@@ -13649,6 +13732,13 @@ def _live_reconcile_positions() -> None:
             try:
                 observed = float(matches[0]["size"])
                 if math.isfinite(observed) and observed > 0:
+                    if observed < float(leg.get("ig_size", 0.)) - 1e-5:
+                        from exit_authority import identity, UNKNOWN
+                        partial_key = identity([leg.get("deal_id"), observed, "unexplained_reduction"])
+                        legs = leg.setdefault("exit_authority_legs", [])
+                        if not any(l["identity"] == partial_key for l in legs):
+                            legs.append({"identity": partial_key, "authority": UNKNOWN,
+                                         "source": "broker_inventory_unexplained_reduction"})
                     leg["allocation_observed_quantity"] = max(
                         float(leg.get("ig_size", 0.)), observed)
             except (KeyError, TypeError, ValueError):

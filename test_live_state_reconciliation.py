@@ -172,12 +172,13 @@ def test_real_canonical_settlement_and_performance_are_exactly_once(closed):
     record=json.loads(rows[0])
     assert record['settlement_state']==('CONFIRMED' if closed else 'PROVISIONAL')
     assert record['dollar_pnl']==(.156 if closed else None)
-    assert len(perf)==int(closed)
+    assert record["exit_authority"] == "UNKNOWN"
+    assert len(perf)==0
     # Crash/restart reintroduces an old active snapshot: durable settlement history
     # prevents economic duplication, explicit broker proof clears tracking again.
     s['open_position']=original;s['settled_primary_keys']=[]
     ns['_live_reconcile_positions']()
-    assert s['open_position'] is None and len(rows)==1 and len(perf)==int(closed)
+    assert s['open_position'] is None and len(rows)==1 and len(perf)==0
 
 
 def test_live_gold_shape_narrow_empty_wider_contains_exact_accepted_close():

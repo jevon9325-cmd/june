@@ -1,0 +1,285 @@
+{
+  "observed_utc": "2026-10-02T06:20:28.525839+00:00",
+  "position": {
+    "deal_id": "DIAAAAR9L7ZFJBA",
+    "instrument": "OIL",
+    "direction": "short",
+    "ig_size": 0.04,
+    "entry_time": 1790921362.5600955,
+    "notional": 405.17199999999997,
+    "fill_price": 10132.7,
+    "stop_sync": {
+      "target": 10127.74926,
+      "deal_id": "DIAAAAR9L7ZFJBA",
+      "status": "pending",
+      "attempted_at": 1790922007.2750044,
+      "deal_ref": "UT56BRUQNPJTYNV"
+    },
+    "broker_entry_evidence": {
+      "deal_id": "DIAAAAR9L7ZFJBA",
+      "account_id": "HT2Q8",
+      "account_evidence": {
+        "order": {
+          "account_id": "HT2Q8",
+          "currency": "USD",
+          "source": "IG.session.currentAccountId",
+          "verified": true
+        },
+        "confirmation": {
+          "account_id": "HT2Q8",
+          "currency": "USD",
+          "source": "IG.session.currentAccountId",
+          "verified": true
+        }
+      }
+    }
+  },
+  "inventory": {
+    "positions": []
+  },
+  "narrow": {
+    "activities": [
+      {
+        "date": "2026-10-02T05:18:49",
+        "epic": "CC.D.LCO.BMU.IP",
+        "period": "-",
+        "dealId": "DIAAAAR9L2K7LAK",
+        "channel": "PUBLIC_WEB_API",
+        "type": "POSITION",
+        "status": "ACCEPTED",
+        "description": "Position opened: 9L2K7LAK",
+        "details": {
+          "dealReference": "6SGF63493ZJTYNV",
+          "actions": [
+            {
+              "actionType": "POSITION_OPENED",
+              "affectedDealId": "DIAAAAR9L2K7LAK"
+            }
+          ],
+          "marketName": "Oil - Brent Crude ($1)",
+          "goodTillDate": null,
+          "currency": "USD",
+          "size": 0.03,
+          "direction": "BUY",
+          "level": 10147.8,
+          "stopLevel": 10119.8,
+          "stopDistance": 28,
+          "guaranteedStop": false,
+          "trailingStopDistance": null,
+          "trailingStep": null,
+          "limitLevel": null,
+          "limitDistance": null
+        }
+      },
+      {
+        "date": "2026-10-02T05:13:06",
+        "epic": "CC.D.LCO.BMU.IP",
+        "period": "-",
+        "dealId": "DIAAAAR9L2NLCAH",
+        "channel": "SYSTEM",
+        "type": "POSITION",
+        "status": "ACCEPTED",
+        "description": "Position/s closed: 9LZWEAA6",
+        "details": {
+          "dealReference": null,
+          "actions": [
+            {
+              "actionType": "POSITION_CLOSED",
+              "affectedDealId": "DIAAAAR9LZWEAA6"
+            }
+          ],
+          "marketName": "Oil - Brent Crude ($1)",
+          "goodTillDate": null,
+          "currency": "USD",
+          "size": 0.02,
+          "direction": "BUY",
+          "level": 10134.1,
+          "stopLevel": 10132.2907,
+          "stopDistance": -4.8093,
+          "guaranteedStop": false,
+          "trailingStopDistance": null,
+          "trailingStep": null,
+          "limitLevel": null,
+          "limitDistance": null
+        }
+      },
+      {
+        "date": "2026-10-02T05:12:47",
+        "epic": "CC.D.LCO.BMU.IP",
+        "period": "-",
+        "dealId": "DIAAAAR9L2MHWBC",
+        "channel": "PUBLIC_WEB_API",
+        "type": "EDIT_STOP_AND_LIMIT",
+        "status": "ACCEPTED",
+        "description": "Stop/Limit amended: 9LZWEAA6",
+        "details": {
+          "dealReference": "BHHWYYUE3V6TYNV",
+          "actions": [
+            {
+              "actionType": "STOP_LIMIT_AMENDED",
+              "affectedDealId": "DIAAAAR9LZWEAA6"
+            }
+          ],
+          "marketName": "Oil - Brent Crude ($1)",
+          "goodTillDate": null,
+          "currency": "USD",
+          "size": 0.02,
+          "direction": "SELL",
+          "level": 10137.1,
+          "stopLevel": 10132.2907,
+          "stopDistance": -4.8093,
+          "guaranteedStop": false,
+          "trailingStopDistance": null,
+          "trailingStep": null,
+          "limitLevel": null,
+          "limitDistance": null
+        }
+      },
+      {
+        "date": "2026-10-02T05:12:47",
+        "epic": "CC.D.LCO.BMU.IP",
+        "period": "-",
+        "dealId": "DIAAAAR9L2EG6AN",
+        "channel": "PUBLIC_WEB_API",
+        "type": "EDIT_STOP_AND_LIMIT",
+        "status": "ACCEPTED",
+        "description": "Stop/Limit amended: 9LZWEAA6",
+        "details": {
+          "dealReference": "CCZVWVDS2Z6TYNV",
+          "actions": [
+            {
+              "actionType": "STOP_LIMIT_AMENDED",
+              "affectedDealId": "DIAAAAR9LZWEAA6"
+            }
+          ],
+          "marketName": "Oil - Brent Crude ($1)",
+          "goodTillDate": null,
+          "currency": "USD",
+          "size": 0.02,
+          "direction": "SELL",
+          "level": 10137.1,
+          "stopLevel": 10132.29982,
+          "stopDistance": -4.80018,
+          "guaranteedStop": false,
+          "trailingStopDistance": null,
+          "trailingStep": null,
+          "limitLevel": null,
+          "limitDistance": null
+        }
+      }
+    ],
+    "metadata": {
+      "paging": {
+        "size": 4,
+        "next": null
+      }
+    }
+  },
+  "wider": {
+    "activities": [
+      {
+        "date": "2026-10-02T06:13:54",
+        "epic": "CC.D.LCO.BMU.IP",
+        "period": "-",
+        "dealId": "DIAAAAR9L7HMNAH",
+        "channel": "SYSTEM",
+        "type": "POSITION",
+        "status": "ACCEPTED",
+        "description": "Position/s closed: 9L7ZFJBA",
+        "details": {
+          "dealReference": null,
+          "actions": [
+            {
+              "actionType": "POSITION_CLOSED",
+              "affectedDealId": "DIAAAAR9L7ZFJBA"
+            }
+          ],
+          "marketName": "Oil - Brent Crude ($1)",
+          "goodTillDate": null,
+          "currency": "USD",
+          "size": 0.04,
+          "direction": "BUY",
+          "level": 10128.1,
+          "stopLevel": 10127.74926,
+          "stopDistance": -4.95074,
+          "guaranteedStop": false,
+          "trailingStopDistance": null,
+          "trailingStep": null,
+          "limitLevel": null,
+          "limitDistance": null
+        }
+      },
+      {
+        "date": "2026-10-02T06:12:50",
+        "epic": "CC.D.LCO.BMU.IP",
+        "period": "-",
+        "dealId": "DIAAAAR9L79WLAZ",
+        "channel": "PUBLIC_WEB_API",
+        "type": "EDIT_STOP_AND_LIMIT",
+        "status": "ACCEPTED",
+        "description": "Stop/Limit amended: 9L7ZFJBA",
+        "details": {
+          "dealReference": "UT56BRUQNPJTYNV",
+          "actions": [
+            {
+              "actionType": "STOP_LIMIT_AMENDED",
+              "affectedDealId": "DIAAAAR9L7ZFJBA"
+            }
+          ],
+          "marketName": "Oil - Brent Crude ($1)",
+          "goodTillDate": null,
+          "currency": "USD",
+          "size": 0.04,
+          "direction": "SELL",
+          "level": 10132.7,
+          "stopLevel": 10127.74926,
+          "stopDistance": -4.95074,
+          "guaranteedStop": false,
+          "trailingStopDistance": null,
+          "trailingStep": null,
+          "limitLevel": null,
+          "limitDistance": null
+        }
+      },
+      {
+        "date": "2026-10-02T06:09:22",
+        "epic": "CC.D.LCO.BMU.IP",
+        "period": "-",
+        "dealId": "DIAAAAR9L7ZFJBA",
+        "channel": "PUBLIC_WEB_API",
+        "type": "POSITION",
+        "status": "ACCEPTED",
+        "description": "Position opened: 9L7ZFJBA",
+        "details": {
+          "dealReference": "GZAR9M88GWNTYNV",
+          "actions": [
+            {
+              "actionType": "POSITION_OPENED",
+              "affectedDealId": "DIAAAAR9L7ZFJBA"
+            }
+          ],
+          "marketName": "Oil - Brent Crude ($1)",
+          "goodTillDate": null,
+          "currency": "USD",
+          "size": 0.04,
+          "direction": "SELL",
+          "level": 10132.7,
+          "stopLevel": 10160.7,
+          "stopDistance": 28,
+          "guaranteedStop": false,
+          "trailingStopDistance": null,
+          "trailingStep": null,
+          "limitLevel": null,
+          "limitDistance": null
+        }
+      }
+    ],
+    "metadata": {
+      "paging": {
+        "size": 239,
+        "next": null
+      }
+    }
+  },
+  "full_wider_activity_count": 239
+}

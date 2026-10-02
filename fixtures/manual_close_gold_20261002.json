@@ -1,0 +1,63 @@
+{
+    "activities":  [
+                       {
+                           "date":  "2026-10-02T04:47:57",
+                           "epic":  "CS.D.CFDGOLD.BMU.IP",
+                           "period":  "-",
+                           "dealId":  "DIAAAAR9LYCE4BA",
+                           "channel":  "MOBILE",
+                           "type":  "POSITION",
+                           "status":  "ACCEPTED",
+                           "description":  "Position/s closed: 9LXBQHBA",
+                           "details":  {
+                                           "dealReference":  "CHET9H9ACC589V",
+                                           "actions":  [
+                                                           {
+                                                               "actionType":  "POSITION_CLOSED",
+                                                               "affectedDealId":  "DIAAAAR9LXBQHBA"
+                                                           }
+                                                       ],
+                                           "marketName":  "Spot Gold ($1)",
+                                           "goodTillDate":  null,
+                                           "currency":  "USD",
+                                           "size":  0.08,
+                                           "direction":  "BUY",
+                                           "level":  4182.9,
+                                           "stopLevel":  4188.44,
+                                           "stopDistance":  6,
+                                           "guaranteedStop":  false,
+                                           "trailingStopDistance":  null,
+                                           "trailingStep":  null,
+                                           "limitLevel":  null,
+                                           "limitDistance":  null
+                                       }
+                       }
+                   ],
+    "position":  {
+                     "fill_price":  4182.44,
+                     "deal_id":  "DIAAAAR9LXBQHBA",
+                     "entry_time":  1790916021.6787264,
+                     "ig_size":  0.08,
+                     "broker_entry_evidence":  {
+                                                   "account_evidence":  {
+                                                                            "order":  {
+                                                                                          "account_id":  "HT2Q8",
+                                                                                          "currency":  "USD",
+                                                                                          "source":  "IG.session.currentAccountId",
+                                                                                          "verified":  true
+                                                                                      },
+                                                                            "confirmation":  {
+                                                                                                 "account_id":  "HT2Q8",
+                                                                                                 "currency":  "USD",
+                                                                                                 "source":  "IG.session.currentAccountId",
+                                                                                                 "verified":  true
+                                                                                             }
+                                                                        },
+                                                   "account_id":  "HT2Q8",
+                                                   "deal_id":  "DIAAAAR9LXBQHBA"
+                                               },
+                     "direction":  "short",
+                     "exit_authority_epic":  "CS.D.CFDGOLD.BMU.IP",
+                     "instrument":  "GOLD"
+                 }
+}
