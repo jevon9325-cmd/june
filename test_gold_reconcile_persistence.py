@@ -51,8 +51,11 @@ def test_stale_branch_requires_broker_absence_before_finalize():
     end = SOURCE.index("def _apply_defect_quarantine", start)
     body = SOURCE[start:end]
     assert "if not ig_positions and june_pos:" in body
-    assert "_live_finalize_reconciled_stale_primary()" in body
-    assert body.index("_live_settle_primary_exit") < body.index("_live_finalize_reconciled_stale_primary")
+    assert "_live_finalize_reconciled_stale_primary()" not in body
+    assert 'awaiting authoritative close evidence' in body
+    whole = SOURCE[SOURCE.index("def _live_reconcile_positions"):end]
+    assert whole.index("_live_broker_close_evidence") < whole.index("_live_settle_primary_exit")
+    assert whole.index("_live_settle_primary_exit") < whole.index("_live_finalize_reconciled_stale_primary")
 
 
 def test_canonical_settlement_is_idempotent_by_deal_and_durable_history():
@@ -98,7 +101,8 @@ def test_reconciliation_clears_only_after_positions_absence():
     body = SOURCE[SOURCE.index("def _live_reconcile_positions"):SOURCE.index("def _apply_defect_quarantine")]
     assert "ig_positions = data.get(\"positions\")" in body
     assert "if not ig_positions and june_pos:" in body
-    assert "position_absence_observed" in body
+    assert "authoritative_broker_close" in body
+    assert "_live_broker_close_evidence" in body
 
 
 def test_broker_side_disappearance_does_not_create_b1_stop_loss_failure():

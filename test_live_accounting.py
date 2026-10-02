@@ -46,6 +46,10 @@ def close_harness(direction="long", symbol="GOLD"):
                  "_sim_15m_record", "_live_check_phase",
                  "_live_settle_gen2_reservation", '_live_settle_primary_exit', '_live_mark_settled', '_ls_confirmed_pnl'):
         ns[name] = Mock()
+    # These tests isolate order accounting; broker lifecycle proofs are exercised
+    # independently by test_live_state_reconciliation.
+    ns['_live_broker_close_evidence'] = Mock(return_value=None)
+    ns['_live_poll_position_reconciliation'] = Mock()
     exec(compile(ast.Module(body=functions, type_ignores=[]), "extracted_june_closes", "exec"), ns)
     return ns
 

@@ -13340,6 +13340,7 @@ def _run_live_step_observed(signals: dict) -> None:
     # Periodic balance and P&L refresh (every 5 minutes, not every cycle)
     _live_poll_balance()
     _live_poll_pnl()
+    _live_poll_position_reconciliation()
     _live_reconcile_provisional_settlements()  # B4CA3 broker-truth reconciliation
 
     # Skim check after P&L update
@@ -13468,13 +13469,99 @@ def _live_finalize_reconciled_stale_primary() -> None:
     """
     _live_capture_active("before_primary_clear")
     _live["open_position"] = None
-    try:
-        from rolling_build4a import b4a_clear_campaign_rolling_state as _b4a_clr
-        _b4a_clr(_live, reason="stale_state_cleared_at_startup")
-    except Exception:
-        pass
-    _live.pop("manual_review_required", None)  # cascade fully resolved — unblock closes
+    if not _live.get("pyramid_legs") and not _live.get("pyramid_entry_pending"):
+        try:
+            from rolling_build4a import b4a_clear_campaign_rolling_state as _b4a_clr
+            _b4a_clr(_live, reason="broker_confirmed_primary_closed")
+        except Exception:
+            pass
+        if not _live.get("recovery_unresolved_positions") and not _live.get("orphan_suspected"):
+            _live.pop("manual_review_required", None)
     _live_save_state()
+
+
+def _live_broker_close_evidence(pos, inventory):
+    """Explicit deal closure, never inferred from account margin or absence alone.
+
+    LS FULLY_CLOSED is primary authority (including REST cache lag). When LS
+    missed a broker-managed close, require valid REST absence AND a matching
+    accepted final-close activity. Activity identifies the original affected deal,
+    not the amendment/closing deal ID. Lifecycle proof is not economic finality.
+    """
+    deal = pos.get("deal_id")
+    if not deal:
+        return None
+    if _ls_deal_closed(deal):
+        return {"source": "LS.FULLY_CLOSED", "pnl": _ls_confirmed_pnl(deal)}
+    rows = inventory.get("positions") if isinstance(inventory, dict) else None
+    if not isinstance(rows, list) or any(
+            not isinstance(row, dict) or not isinstance(row.get("position"), dict)
+            or not row["position"].get("dealId") for row in rows):
+        return None
+    if any(row["position"]["dealId"] == deal for row in rows):
+        return None
+    # Session identity must still match the original opening account. A recovered
+    # position without verified provenance remains unresolved for operator review.
+    opening = pos.get("broker_entry_evidence") or {}
+    account = _live_sess.get("account_id")
+    proofs = opening.get("account_evidence") or {}
+    if (not account or opening.get("account_id") != account
+            or opening.get("deal_id") != deal
+            or any((proofs.get(k) or {}).get("verified") is not True
+                   or (proofs.get(k) or {}).get("account_id") != account
+                   for k in ("order", "confirmation"))):
+        return None
+    now = time.time()
+    entry = pos.get("entry_time")
+    if not isinstance(entry, (int, float)) or not 0 < entry <= now:
+        return None
+    response = _ig_live_get("/history/activity", params={
+        "from": _recon_iso(max(entry - 60, now - 24 * 3600)),
+        "to": _recon_iso(now), "detailed": "true", "pageSize": 500}, version="3")
+    activities = response.get("activities") if isinstance(response, dict) else None
+    if not isinstance(activities, list):
+        return None
+    # Never certify a truncated or ambiguous history page. Retry with future
+    # evidence; do not follow an arbitrary broker-supplied URL.
+    if ((response.get("metadata") or {}).get("paging") or {}).get("next"):
+        return None
+    matches = []
+    for activity in activities:
+        if not isinstance(activity, dict) or activity.get("status") != "ACCEPTED":
+            continue
+        if activity.get("epic") != INSTRUMENTS.get(pos.get("instrument")):
+            continue
+        details = activity.get("details") or {}
+        if any(isinstance(action, dict) and action.get("actionType") == "POSITION_CLOSED"
+               and action.get("affectedDealId") == deal
+               for action in details.get("actions") or []):
+            if activity not in matches:
+                matches.append(activity)
+    if len(matches) == 1:
+        return {"source": "REST.absent+activity.POSITION_CLOSED", "activity": matches[0]}
+    return None
+
+
+def _live_poll_position_reconciliation() -> None:
+    """Bounded read-only broker refresh while holding, independent of exit triggers.
+
+    Never sends orders. A pending stop confirm is not an inventory refresh.
+    Failures retain tracking and protective exit management continues normally.
+    """
+    if not (_live.get("open_position") or _live.get("orphan_suspected")
+            or _live.get("recovery_unresolved_positions")):
+        return
+    now = time.time()
+    last = _live.get("position_reconciled_at", 0)
+    if 0 <= now - last < 60:
+        return
+    _live["position_reconciled_at"] = now
+    try:
+        _live_reconcile_positions()
+        _live_save_state()  # includes broker stop acknowledgement transitions
+    except Exception as exc:
+        _live["orphan_suspected"] = True
+        _live_log(f"Position reconciliation unavailable: {type(exc).__name__}; tracking retained")
 
 
 def _live_reconcile_positions() -> None:
@@ -13499,6 +13586,32 @@ def _live_reconcile_positions() -> None:
         return
     _recon_consecutive_404_with_deposit = 0
     _live.pop("orphan_suspected", None)
+    primary = _live.get("open_position")
+    if primary:
+        proof = _live_broker_close_evidence(primary, data)
+        if proof:
+            _live_capture_evidence(primary, "authoritative_broker_close", **proof,
+                                   broker_positions_response=data)
+            pnl = proof.get("pnl") or {}
+            _live_settle_primary_exit(primary, "broker_side_disappearance",
+                                     source=proof["source"], confirmed_pnl=pnl.get("profit"),
+                                     confirmed_exit_price=pnl.get("level"), signals=None)
+            # Retain addons for their existing independent exit/settlement path;
+            # never wipe rolling reservations or pending submissions with them.
+            remaining_known = {leg.get("deal_id") for leg in _live.get("pyramid_legs", [])}
+            if any(row["position"]["dealId"] not in remaining_known | {primary.get("deal_id")}
+                   for row in ig_positions):
+                _live["orphan_suspected"] = True
+                _live["manual_review_required"] = True
+            _live_finalize_reconciled_stale_primary()
+            _live_log(f"Broker-confirmed primary cleared: {primary.get('deal_id')} [{proof['source']}]")
+            return
+    if primary and not any(row["position"]["dealId"] == primary.get("deal_id")
+                           for row in ig_positions):
+        _live["orphan_suspected"] = True
+        _live_log("Reconciliation: absent primary awaiting authoritative close evidence; tracking retained")
+        _live_save_state()
+        return
     # Validate fields needed to manage newly discovered deals. Unknown historical
     # origin is fine; inventing direction, quantity or an incompatible pyramid is not.
     import math
@@ -13786,24 +13899,10 @@ def _live_reconcile_positions() -> None:
 
     # Stale: June state has position but IG shows nothing
     if not ig_positions and june_pos:
-        _live_capture_evidence(june_pos, "position_absence_observed", observation_source="reconciliation.flat_check", broker_positions_response=_evidence_positions_response)
-        sym     = june_pos.get("instrument", "?")
-        deal_id = june_pos.get("deal_id", "?")
-        # B4CA2_WIRED: settle the disappeared primary before clearing state.
-        _b4ca2_lspnl = _ls_confirmed_pnl(deal_id) if deal_id and deal_id != '?' else None
-        _live_settle_primary_exit(
-            june_pos, "broker_side_disappearance", source="reconciliation.flat_check",
-            confirmed_pnl=(_b4ca2_lspnl.get('profit') if _b4ca2_lspnl else None),
-            confirmed_exit_price=(_b4ca2_lspnl.get('level') if _b4ca2_lspnl else None),
-            signals=None)
-        _live_log("=" * 58)
-        _live_log("** STALE STATE CLEARED **")
-        _live_log(f"   June state: {sym} {june_pos.get('direction','?').upper()} deal={deal_id}")
-        _live_log(f"   IG reports: no open positions")
-        _live_log(f"   Action    : open_position cleared -- June is now flat")
-        _live_log(f"   Likely    : position closed in IG app or before this restart")
-        _live_log("=" * 58)
-        _live_finalize_reconciled_stale_primary()
+        _live["orphan_suspected"] = True
+        _live_log("Reconciliation: absent primary awaiting authoritative close evidence; tracking retained")
+        _live_save_state()
+        return
 
 
 def _apply_defect_quarantine() -> None:

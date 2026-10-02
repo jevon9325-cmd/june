@@ -284,10 +284,11 @@ class RuntimeTests(CaptureTests):
         ns = self.runtime()
         extract({'_live_reconcile_positions', '_live_finalize_reconciled_stale_primary'}, ns)
         ns['_ig_live_get'].return_value = {'positions': []}
+        ns['_live_broker_close_evidence'].return_value = {'source': 'LS.FULLY_CLOSED'}
         ns['_live_reconcile_positions']()
         self.assertIsNone(ns['_live']['open_position'])
         rows = self.rows()
-        self.assertTrue(any(r['event'] == 'position_absence_observed' for r in rows))
+        self.assertTrue(any(r['event'] == 'authoritative_broker_close' for r in rows))
         self.journal.replay()
         self.assertIsNone(self.factory('fixture-account').get_entry('fixture-deal')['record'])
 
