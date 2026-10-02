@@ -72,8 +72,12 @@ class Store:
             CREATE TABLE IF NOT EXISTS samples(
                 id INTEGER PRIMARY KEY, campaign TEXT REFERENCES campaigns(id) ON DELETE CASCADE,
                 at REAL, payload TEXT);
+            CREATE TABLE IF NOT EXISTS path(
+                id TEXT PRIMARY KEY, campaign TEXT REFERENCES campaigns(id) ON DELETE CASCADE,
+                at REAL, payload TEXT);
             CREATE INDEX IF NOT EXISTS event_campaign ON events(campaign,at);
             CREATE INDEX IF NOT EXISTS sample_campaign ON samples(campaign,at);
+            CREATE INDEX IF NOT EXISTS path_campaign ON path(campaign,at);
         """)
 
     def prune(self, db, now):
@@ -294,6 +298,119 @@ class Store:
                 self.prune(db, now)
         finally:
             db.close()
+
+    # ── Durable per-campaign price-path recorder (winner-starvation-d78de77) ──
+    # Observation-only. Writes ONE bounded, versioned, deduplicated row per open
+    # campaign per successful poll into a dedicated `path` table. Never calls the
+    # broker, never mutates trading state, never returns a decision. Any failure is
+    # swallowed by the caller (_live_record_path). Retention/caps mirror samples.
+    PATH_SCHEMA_VERSION = 1
+
+    def record_path(self, state, signals, *, account, now, unit, context=None):
+        """Append a durable per-campaign path row.
+
+        `context` carries poll-time quantities the ordinary sample lacks:
+        ATR/fallback, signal/conviction, allocation consumed/remaining, F50
+        economics, pyramid trigger status, and the last pyramid decision/reason.
+        All values are June estimates, never broker-certified. Idempotent within a
+        poll: the row id hashes (campaign, bucketed timestamp, leg/quantity/price
+        fingerprint) so a repeated call in the same poll cannot duplicate.
+        """
+        legs = [p for p in [state.get("open_position"), *state.get("pyramid_legs", [])] if p]
+        if not legs:
+            return
+        primary = legs[0]
+        identity = primary.get("deal_id") or primary.get("deal_ref")
+        if not identity:
+            return
+        context = dict(context or {})
+        account_key = account or "account_unavailable"
+        inst = primary.get("instrument")
+        dirn = primary.get("direction")
+        sig = (signals or {}).get(inst, {}) if signals else {}
+        px, source = executable(sig, dirn) if dirn in ("long", "short") else (None, "missing")
+        leg_rows, primary_qty, addon_qty, unrealized = [], 0.0, 0.0, 0.0
+        for leg in legs:
+            fill, qty = number(leg.get("fill_price")), number(leg.get("ig_size"))
+            sign = 1 if leg.get("direction") == "long" else -1
+            open_pnl = None
+            if fill and qty and px is not None and fill > 0:
+                try:
+                    open_pnl = sign * (px - fill) / fill * qty * unit(leg["instrument"], fill)
+                    unrealized += open_pnl
+                except Exception:
+                    open_pnl = None
+            if leg.get("leg_index"):
+                addon_qty += qty or 0.0
+            else:
+                primary_qty += qty or 0.0
+            leg_rows.append(dict(
+                deal_id=leg.get("deal_id"), leg_index=leg.get("leg_index"),
+                fill_price=fill, ig_size=qty, open_pnl=open_pnl,
+                intended_stop_level=leg.get("intended_stop_level"),
+                acknowledged_stop_level=leg.get("acknowledged_stop_level"),
+                broker_stop_level=leg.get("broker_stop_level"),
+                defensive_soft_sl=leg.get("defensive_soft_sl"),
+                dple_effective_sl=leg.get("dple_effective_sl"),
+                stop_sync_status=(leg.get("stop_sync") or {}).get("status")))
+        realized = number(context.get("realized_pnl_known_to_june"))
+        payload = dict(
+            schema=self.PATH_SCHEMA_VERSION, account=account_key, observed_at=now,
+            campaign_hint=identity, instrument=inst, direction=dirn,
+            executable_bid=number(sig.get("bid")), executable_offer=number(sig.get("offer")),
+            mid=number(sig.get("price")), executable_price=px, executable_basis=source,
+            spread_pct=number(sig.get("spread_pct")),
+            quote_timestamp=sig.get("timestamp") or sig.get("price_timestamp"),
+            primary_fill=number(primary.get("fill_price")),
+            primary_quantity=primary_qty, addon_quantity=addon_qty, legs=leg_rows,
+            unrealized_local_pnl=unrealized, realized_pnl_known_to_june=realized,
+            # context fields (poll-time, estimate-only):
+            atr_5m=number(context.get("atr_5m")), atr_fallback=context.get("atr_fallback"),
+            signal_conviction=context.get("conviction"), signal_direction=sig.get("direction"),
+            global_mode=state.get("global_mode", "normal"),
+            instrument_mode=(state.get("instrument_mode") or {}).get(inst, "normal"),
+            allocation_consumed=number(context.get("allocation_consumed")),
+            allocation_remaining=number(context.get("allocation_remaining")),
+            f50_protected_before=number(context.get("f50_protected_before")),
+            f50_legal_ig=number(context.get("f50_legal_ig")),
+            pyramid_trigger_pct=number(context.get("pyramid_trigger_pct")),
+            pyramid_threshold_reached=context.get("pyramid_threshold_reached"),
+            pyramid_decision=context.get("pyramid_decision"),
+            pyramid_reason=context.get("pyramid_reason"),
+            protection_fingerprint_present=bool(context),
+            costs_status="PROVISIONAL", economics_basis="June_estimates_not_broker_certified_net")
+        # Idempotency: bucket timestamp to the poll cadence and fingerprint the
+        # path-defining fields, so a duplicate call in the same poll is ignored but
+        # genuine subsequent polls (new price/quantity/stop state) are retained.
+        fingerprint = json.dumps([
+            identity, round(now, 0),
+            [(r["deal_id"], r["ig_size"], r["fill_price"], r["acknowledged_stop_level"],
+              r["stop_sync_status"]) for r in leg_rows],
+            payload["mid"], payload["executable_price"]], sort_keys=True)
+        row_id = hashlib.sha256(fingerprint.encode()).hexdigest()
+        db = self.connect()
+        try:
+            with db:
+                found = db.execute("SELECT campaign FROM links WHERE account=? AND deal=?",
+                                   (account_key, identity)).fetchone()
+                cid = found[0] if found else hashlib.sha256(
+                    json.dumps([account_key, identity]).encode()).hexdigest()
+                # The campaign row is created by the ordinary sample observe that runs
+                # earlier in the same poll. If it is somehow absent, link the path row
+                # to a NULL campaign rather than violating the FK — the row is still
+                # usable (it carries campaign_hint) and nothing crashes.
+                exists = db.execute("SELECT 1 FROM campaigns WHERE id=?", (cid,)).fetchone()
+                db.execute("INSERT OR IGNORE INTO path(id,campaign,at,payload) VALUES(?,?,?,?)",
+                           (row_id, cid if exists else None, now, json.dumps(payload)))
+                self.prune_path(db, now)
+        finally:
+            db.close()
+
+    def prune_path(self, db, now):
+        db.execute("DELETE FROM path WHERE at < ?", (now - self.retention,))
+        db.execute(
+            "DELETE FROM path WHERE rowid IN (SELECT rowid FROM path ORDER BY at DESC,rowid DESC LIMIT -1 OFFSET ?)",
+            (self.sample_cap,))
 
     @staticmethod
     def event(db, cid, now, kind, payload, token):

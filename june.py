@@ -7081,6 +7081,49 @@ def _live_observe(event, signals=None, position=None, details=None):
         logging.warning("CAMPAIGN TELEMETRY GAP: %s; trading continues", type(exc).__name__)
 
 
+def _live_record_path(signals=None) -> None:
+    """OBSERVATION-ONLY durable per-campaign price-path recorder (winner-starvation
+    -d78de77). Writes one bounded, versioned, deduplicated row per open campaign
+    per successful poll so future causal analysis no longer depends on final
+    extrema. Makes NO broker call, changes NO trading decision, and is fully
+    exception-swallowed — it can never block or veto the polling loop.
+    """
+    try:
+        primary = _live.get("open_position")
+        if not primary:
+            return
+        sym = primary.get("instrument")
+        sig = (signals if signals is not None else _current_cycle_signals_snap) or {}
+        # Poll-time context the ordinary sample lacks; all best-effort, estimate-only.
+        atr5, fallback = (None, None)
+        try:
+            atr5, fallback = _compute_atr_5m(sym)
+        except Exception:
+            pass
+        # Last pyramid decision stashed by _live_add_pyramid_leg (decision-neutral).
+        last_dec = _live.get("last_pyramid_decision") or {}
+        context = {
+            "atr_5m": atr5, "atr_fallback": fallback,
+            "conviction": primary.get("conviction"),
+            "allocation_consumed": last_dec.get("allocation_consumed"),
+            "allocation_remaining": last_dec.get("remaining_capacity"),
+            "f50_protected_before": last_dec.get("f50_protected_before"),
+            "f50_legal_ig": last_dec.get("f50_legal_ig"),
+            "pyramid_trigger_pct": _PYRAMID_PROFIT_GATE_PCT,
+            "pyramid_threshold_reached": last_dec.get("threshold_reached"),
+            "pyramid_decision": last_dec.get("decision"),
+            "pyramid_reason": last_dec.get("reason"),
+            "realized_pnl_known_to_june": last_dec.get("realized_pnl_known_to_june"),
+        }
+        from campaign_telemetry import default_store
+        default_store().record_path(
+            _live, sig, account=_live_sess.get("account_id"),
+            now=time.time(), unit=_live_campaign_unit, context=context)
+    except Exception as exc:
+        import logging
+        logging.warning("CAMPAIGN PATH GAP: %s; trading continues", type(exc).__name__)
+
+
 # ── Build 4C-B1: thesis-aware same-direction post-loss re-entry ──────────────
 _B1_THESIS_SCHEMA_VERSION = 1
 _B1_FAILURE_MAX_AGE_SECS  = 14 * 24 * 3600
@@ -12023,10 +12066,20 @@ def _live_check_pyramid_entry(signals: dict, regime: str) -> None:
     try:
         from winner_accounting import campaign_allocation
         capital = max(0., _live.get("balance_total", 0.) - _live.get("skimmed_total", 0.))
+        # Allocation integrity repair (winner-starvation-d78de77): same one-MINDEAL
+        # continuation reservation as the admission path, so telemetry and decision
+        # agree. mid/min_deal are best-effort here; fall back to 0.0 (prior behaviour).
+        try:
+            _preval_unit_alloc = (float(_live_min_deal.get(sym, 0.0))
+                                  * _live_campaign_unit(sym, mid)
+                                  / float(primary.get("leverage") or 1.0)) if mid > 0 else 0.0
+        except Exception:
+            _preval_unit_alloc = 0.0
         allocation = campaign_allocation(primary, _live.get("pyramid_legs", []),
                                         lambda price: _live_campaign_unit(sym, price),
                                         capital * _live_tier_risk_pct(capital),
-                                        pending=_live.get("pyramid_entry_pending"))
+                                        pending=_live.get("pyramid_entry_pending"),
+                                        reserve_continuation=_preval_unit_alloc)
         decision["remaining_capacity"] = allocation["remaining_allocation"]
         decision["allocation"] = allocation
     except Exception as exc:
@@ -12074,6 +12127,22 @@ def _live_check_pyramid_entry(signals: dict, regime: str) -> None:
         decision.update(decision="reject", reason="addon_evidence_unavailable", error=type(exc).__name__)
     finally:
         _live_observe("pyramid_decision", signals, primary, decision)
+        # Stash a trimmed, decision-NEUTRAL snapshot for the durable path recorder
+        # (_live_record_path). This copies diagnostic fields only; it changes no
+        # trading decision, order, size, gate or threshold.
+        try:
+            _alloc = decision.get("allocation") or {}
+            _live["last_pyramid_decision"] = {
+                "decision": decision.get("decision"), "reason": decision.get("reason"),
+                "remaining_capacity": decision.get("remaining_capacity"),
+                "allocation_consumed": _alloc.get("consumed_allocation"),
+                "f50_protected_before": decision.get("f50_protected_before"),
+                "f50_legal_ig": decision.get("f50_legal_ig"),
+                "threshold_reached": (decision.get("primary_return") is not None
+                                      and decision.get("primary_return", 0) >= _PYRAMID_PROFIT_GATE_PCT),
+                "observed_at": time.time()}
+        except Exception:
+            pass
 
 
 def _live_defensive_scaling_evidence(signals):
@@ -12181,11 +12250,18 @@ def _live_add_pyramid_leg(signals: dict, decision=None) -> None:
     try:
         pos_sz = positive(primary.get("pos_size"))
         lev = positive(primary.get("leverage"))
-        positive(_live_min_deal.get(sym))
+        _min_deal_q = positive(_live_min_deal.get(sym))
+        # Allocation integrity repair (winner-starvation-d78de77): the per-leg
+        # leverage-basis allocation of ONE legal MINDEAL continuation unit, so a
+        # primary whose MINDEAL/rounding overrun exceeds its risk-ceiling
+        # reservation cannot falsely zero continuation capacity. This changes NO
+        # fresh-entry sizing/risk; validate_addon still gates real margin.
+        _mindeal_unit_alloc = _min_deal_q * _live_campaign_unit(sym, mid) / lev
         _campaign = campaign_allocation(
             primary, _live.get("pyramid_legs", []),
             lambda price: _live_campaign_unit(sym, price), _tier_budget,
-            pending=_live.get("pyramid_entry_pending"))
+            pending=_live.get("pyramid_entry_pending"),
+            reserve_continuation=_mindeal_unit_alloc)
         _addon_budget = _campaign["remaining_allocation"]
         decision["remaining_capacity"] = _addon_budget
         decision["allocation"] = _campaign
@@ -13234,6 +13310,14 @@ def _live_shadow_evaluate_blocked(signals: dict, regime: str) -> None:
 
 def run_live_step(signals: dict) -> None:
     _live_observe("sample", signals, details={"pyramid_trigger": _PYRAMID_PROFIT_GATE_PCT})
+    # Durable per-campaign path recorder (observation-only; see _live_record_path).
+    # Runs AFTER the sample observe so the campaign row exists. Double-guarded: the
+    # helper swallows its own errors, and this call site also swallows any
+    # resolution/attribute error, so the recorder can NEVER affect the step.
+    try:
+        _live_record_path(signals)
+    except Exception:
+        pass
     try:
         return _run_live_step_observed(signals)
     finally:

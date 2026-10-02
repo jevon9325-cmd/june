@@ -50,18 +50,33 @@ def confirm_allocation_reduction(leg, broker_row, confirmation, reference, befor
                 confirmation_reference=reference, status="confirmed_residual")
 
 
-def campaign_allocation(primary, addons, unit_at_price, tier_budget, *, pending=None):
+def campaign_allocation(primary, addons, unit_at_price, tier_budget, *, pending=None,
+                        reserve_continuation=0.0):
     """Release only certified reductions, retaining larger plausible exposure.
 
     Rounded primary exposure above its reservation also consumes capacity.
     Legacy addons inherit primary leverage, as the original opening path did.
     Unresolved orders consume all remaining capacity until reconciled. No profit
     or F50 credit is created by releasing an allocation reservation.
+
+    `reserve_continuation` (allocation integrity repair, winner-starvation-d78de77):
+    the allocation (per-leg leverage basis) cost of ONE legal MINDEAL continuation
+    unit. When > 0, a validly-admitted primary whose MINDEAL/rounding-enlarged
+    exposure exceeds its risk-ceiling reservation no longer cannibalises the
+    continuation slice merely because of that rounding overrun. ONLY the primary's
+    rounding overrun above its reservation is shielded, and ONLY up to the one
+    reserved MINDEAL unit, and ONLY while the primary's own reservation plus that
+    one unit still fit inside the legal campaign budget. Nothing here changes the
+    primary's real exposure, the fresh-entry sizing, the tier risk %, or the
+    authoritative real-margin check in validate_addon (which still gates admission
+    against available equity). It corrects a capacity-accounting overrun only;
+    reserve_continuation=0.0 preserves the exact prior behaviour.
     """
     lev = positive(primary.get("leverage"))
     reserved = positive(primary.get("pos_size"))
     rows, seen = [], set()
     consumed = 0.0
+    primary_rounding_overrun = 0.0
     for index, leg in enumerate([primary, *addons]):
         identity = leg.get("deal_id")
         if not identity or identity in seen:
@@ -98,6 +113,8 @@ def campaign_allocation(primary, addons, unit_at_price, tier_budget, *, pending=
                 reserved *= min(1., quantity / original)
                 reason = ("allocation_released_confirmed_partial" if quantity < original
                           else "allocation_retained_larger_exposure")
+            if allocation > reserved:
+                primary_rounding_overrun = allocation - reserved
             allocation = max(reserved, allocation)
         else:
             reason = "allocation_active_addon"
@@ -105,6 +122,22 @@ def campaign_allocation(primary, addons, unit_at_price, tier_budget, *, pending=
         rows.append(dict(deal_id=identity, quantity=quantity,
                          actual_notional=actual, consumed_allocation=allocation, reason=reason))
     budget = positive(tier_budget)
+    # Allocation integrity repair: shield exactly one reserved MINDEAL continuation
+    # unit from the primary's MINDEAL/rounding overrun. Applied ONLY when
+    #   (a) a continuation unit was requested (reserve_continuation > 0),
+    #   (b) the primary's risk-ceiling RESERVATION plus that one unit still fit the
+    #       legal campaign budget (reserved + reserve_continuation <= budget), so a
+    #       legitimately budget-filling primary is never granted phantom capacity, and
+    #   (c) the shield never exceeds the actual rounding overrun it is offsetting
+    #       nor the one reserved unit.
+    # It refunds only the rounding artifact; it cannot manufacture capacity beyond
+    # the overrun, cannot exceed one MINDEAL unit, and does not touch real margin
+    # (validate_addon still gates admission against available equity).
+    continuation_shield = 0.0
+    reserve_continuation = float(reserve_continuation or 0.0)
+    if (not pending and reserve_continuation > 0.0 and primary_rounding_overrun > 0.0
+            and reserved + reserve_continuation <= budget + 1e-9):
+        continuation_shield = min(primary_rounding_overrun, reserve_continuation)
     pending_notional, pending_quantity = 0., 0.
     pending_reserve = max(0., budget - consumed) if pending else 0.
     if pending:
@@ -117,10 +150,17 @@ def campaign_allocation(primary, addons, unit_at_price, tier_budget, *, pending=
                 pending_notional = max(pending_notional, positive(pending[key]))
         pending_reserve = max(pending_reserve, pending_notional / lev)
     consumed += pending_reserve
+    # remaining is grossed back up only by the shielded rounding overrun. consumed
+    # is reported UNSHIELDED (the primary really did deploy that exposure); only the
+    # continuation-capacity view is corrected, so downstream risk accounting that
+    # reads consumed_allocation stays conservative.
+    remaining = max(0., budget - consumed + continuation_shield)
     return dict(legs=rows, quantity=sum(row["quantity"] for row in rows) + pending_quantity,
                 actual_notional=sum(row["actual_notional"] for row in rows) + pending_notional,
-                consumed_allocation=consumed, remaining_allocation=max(0., budget - consumed),
+                consumed_allocation=consumed, remaining_allocation=remaining,
                 pending_reservation=pending_reserve,
+                primary_rounding_overrun=primary_rounding_overrun,
+                continuation_shield=continuation_shield,
                 reason="allocation_retained_pending_exposure" if pending else rows[0]["reason"])
 
 
