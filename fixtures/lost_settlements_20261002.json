@@ -1,0 +1,1755 @@
+{
+  "source": "Read-only production evidence Oct 2 2026; broker history retained by prior audit; no credentials",
+  "account": "HT2Q8",
+  "settlements": [
+    {
+      "instrument": "OIL",
+      "direction": "short",
+      "deal_id": "DIAAAAR9NPGYTAY",
+      "entry_price": 9890.5,
+      "exit_price": null,
+      "ig_size": 0.02,
+      "notional": 197.88,
+      "pnl_pct": null,
+      "dollar_pnl": null,
+      "partial_dollar_pnl": 0.0,
+      "commission": 0.0,
+      "pnl_source": "unknown_pending_reconciliation",
+      "tp_source": "SIM_PRIOR",
+      "stop_source": "SIM_PRIOR+CURRENT_MARKET_SPREAD_FLOOR",
+      "settlement_state": "PROVISIONAL",
+      "settlement_source": "REST.absent+activity.POSITION_CLOSED",
+      "hold_min": 3.6,
+      "exit_epoch": 1790935338,
+      "exit_reason": "broker_side_disappearance",
+      "conviction": 1,
+      "reconciled": false,
+      "evidence_class": "PROVISIONAL",
+      "settlement_identity": "deal:DIAAAAR9NPGYTAY",
+      "campaign_id": null,
+      "B4CA2": true,
+      "thesis_key": "{\"change_15m\":-0.16,\"change_5m\":-0.18,\"conv_band\":\"low\",\"direction\":\"short\",\"exhaustion\":\"clear\",\"htf\":\"bear\",\"instrument\":\"OIL\",\"macro\":\"neutral\",\"regime\":\"neutral\",\"sub_session\":\"pre_nyse\",\"v\":1}",
+      "thesis_snapshot": {
+        "schema": 1,
+        "instrument": "OIL",
+        "direction": "short",
+        "entry_price": 9893.8,
+        "conviction": 1,
+        "regime": "neutral",
+        "session": "day",
+        "sub_session": "pre_nyse",
+        "htf_bias": "bear",
+        "htf_move": -0.015826,
+        "exhaustion": 0.0,
+        "macro_scale": 0.8,
+        "claudia_dir": 0,
+        "macro_note": "neutral",
+        "atr5": 17.226667,
+        "change_5m": -0.1796,
+        "change_15m": -0.1604,
+        "spread_atr_ratio": 0.6499,
+        "persistence_confirmed": true,
+        "gate_mode": "relaxed",
+        "rel_score": -0.303,
+        "evidence_classes": {
+          "conviction": "MIXED_SIM_PRIOR_LIVE_STATS",
+          "htf": "CURRENT_MARKET",
+          "exhaustion": "CURRENT_MARKET",
+          "macro": "CURRENT_EXTERNAL_DIRECTIVE",
+          "atr_price_reset": "CURRENT_MARKET",
+          "session": "CURRENT_CLOCK"
+        },
+        "thesis_key": "{\"change_15m\":-0.16,\"change_5m\":-0.18,\"conv_band\":\"low\",\"direction\":\"short\",\"exhaustion\":\"clear\",\"htf\":\"bear\",\"instrument\":\"OIL\",\"macro\":\"neutral\",\"regime\":\"neutral\",\"sub_session\":\"pre_nyse\",\"v\":1}"
+      },
+      "max_favorable_excursion_pct": 0.000637,
+      "max_favorable_excursion_r": 0.2514,
+      "max_adverse_excursion_pct": 0.000404,
+      "max_adverse_excursion_r": 0.1596,
+      "exit_authority": "UNKNOWN",
+      "exit_authority_schema": 1,
+      "exit_authority_evidence": [
+        {
+          "authority": "UNKNOWN",
+          "source": "IG.activity.SYSTEM",
+          "broker_reference": null,
+          "broker_close_id": "DIAAAAR9NPSKMAH",
+          "activity_identity": "c562bbc2a5eb1d81a4badddcdaeabae1863d56fbbbfe2aa7a443f30fc74cc96a",
+          "intent_id": null,
+          "identity": "activity:c562bbc2a5eb1d81a4badddcdaeabae1863d56fbbbfe2aa7a443f30fc74cc96a"
+        }
+      ],
+      "exit_authority_conflict": false,
+      "operator_intervention": false,
+      "strategy_learning_eligible": false,
+      "accounting_eligible": true,
+      "exit_authority_legs": [],
+      "exit_authority_identity": "deal:DIAAAAR9NPGYTAY",
+      "exit_authority_epic": "CC.D.LCO.BMU.IP",
+      "entry_time": 1790935123.1307776,
+      "broker_entry_evidence": {
+        "schema_version": 1,
+        "source": "june.accepted_entry_path",
+        "identity_status": "pending_broker_opening",
+        "identity_issues": [],
+        "account_id": "HT2Q8",
+        "account_evidence": {
+          "order": {
+            "account_id": "HT2Q8",
+            "currency": "USD",
+            "source": "IG.session.currentAccountId",
+            "verified": true
+          },
+          "confirmation": {
+            "account_id": "HT2Q8",
+            "currency": "USD",
+            "source": "IG.session.currentAccountId",
+            "verified": true
+          }
+        },
+        "instrument": "OIL",
+        "role": "primary",
+        "deal_id": "DIAAAAR9NPGYTAY",
+        "deal_reference": "BXFWH2XT3FETYNV",
+        "broker_direction": "SELL",
+        "broker_quantity": 0.02,
+        "broker_level": 9890.5,
+        "broker_opened_utc": null,
+        "confirmation_utc": null,
+        "missing_for_reconciliation": [
+          "exact_broker_opening_utc",
+          "verified_transaction_instrument_name",
+          "verified_position_currency_and_unit_semantics"
+        ],
+        "submitted_order": {
+          "epic": "CC.D.LCO.BMU.IP",
+          "expiry": "-",
+          "direction": "SELL",
+          "size": 0.02,
+          "orderType": "MARKET",
+          "timeInForce": "FILL_OR_KILL",
+          "guaranteedStop": false,
+          "forceOpen": true,
+          "currencyCode": "USD",
+          "stopDistance": 25
+        },
+        "opening_response": {
+          "dealReference": "BXFWH2XT3FETYNV"
+        },
+        "accepted_confirmation": {
+          "date": "2026-10-02T09:58:42.7",
+          "status": "OPEN",
+          "reason": "SUCCESS",
+          "dealStatus": "ACCEPTED",
+          "epic": "CC.D.LCO.BMU.IP",
+          "expiry": "-",
+          "dealReference": "BXFWH2XT3FETYNV",
+          "dealId": "DIAAAAR9NPGYTAY",
+          "affectedDeals": [
+            {
+              "dealId": "DIAAAAR9NPGYTAY",
+              "status": "OPENED"
+            }
+          ],
+          "level": 9890.5,
+          "size": 0.02,
+          "direction": "SELL",
+          "stopLevel": 9915.5,
+          "limitLevel": null,
+          "stopDistance": null,
+          "limitDistance": null,
+          "guaranteedStop": false,
+          "trailingStop": false,
+          "profit": null,
+          "profitCurrency": null
+        },
+        "broker_market_snapshot": {
+          "source": "IG.markets.instrument",
+          "epic": "CC.D.LCO.BMU.IP",
+          "fields": {
+            "name": "Oil - Brent Crude ($1)",
+            "epic": "CC.D.LCO.BMU.IP",
+            "type": "COMMODITIES",
+            "lotSize": 1.0,
+            "contractSize": "1",
+            "unit": "CONTRACTS",
+            "onePipMeans": "1",
+            "valueOfOnePip": "1.00",
+            "currencies": [
+              {
+                "code": "$.",
+                "name": "USD",
+                "symbol": "$",
+                "baseExchangeRate": 1.0,
+                "exchangeRate": 0.77,
+                "isDefault": true
+              }
+            ]
+          }
+        },
+        "local_context": {
+          "entry_time": 1790935123.1307776,
+          "conviction": 1
+        }
+      },
+      "stop_sync": {
+        "target": 9885.68744,
+        "deal_id": "DIAAAAR9NPGYTAY",
+        "status": "pending",
+        "attempted_at": 1790935268.8486109
+      },
+      "broker_stop_level": 9915.5
+    },
+    {
+      "instrument": "OIL",
+      "direction": "long",
+      "deal_id": "DIAAAAR9NRACEAN",
+      "entry_price": 9925.9,
+      "exit_price": null,
+      "ig_size": 0.05,
+      "notional": 496.6,
+      "pnl_pct": null,
+      "dollar_pnl": null,
+      "partial_dollar_pnl": 0.0,
+      "commission": 0.0,
+      "pnl_source": "unknown_pending_reconciliation",
+      "tp_source": "SIM_PRIOR",
+      "stop_source": "SIM_PRIOR+CURRENT_MARKET_SPREAD_FLOOR",
+      "settlement_state": "PROVISIONAL",
+      "settlement_source": "REST.absent+activity.POSITION_CLOSED",
+      "hold_min": 11.7,
+      "exit_epoch": 1790936473,
+      "exit_reason": "broker_side_disappearance",
+      "conviction": 5,
+      "reconciled": false,
+      "evidence_class": "PROVISIONAL",
+      "settlement_identity": "deal:DIAAAAR9NRACEAN",
+      "campaign_id": null,
+      "B4CA2": true,
+      "thesis_key": "{\"change_15m\":0.25,\"change_5m\":0.29,\"conv_band\":\"mid\",\"direction\":\"long\",\"exhaustion\":\"clear\",\"htf\":\"bear\",\"instrument\":\"OIL\",\"macro\":\"neutral\",\"regime\":\"neutral\",\"sub_session\":\"pre_nyse\",\"v\":1}",
+      "thesis_snapshot": {
+        "schema": 1,
+        "instrument": "OIL",
+        "direction": "long",
+        "entry_price": 9931.9,
+        "conviction": 5,
+        "regime": "neutral",
+        "session": "day",
+        "sub_session": "pre_nyse",
+        "htf_bias": "bear",
+        "htf_move": -0.006427,
+        "exhaustion": 1.3784,
+        "macro_scale": 0.8,
+        "claudia_dir": 0,
+        "macro_note": "neutral",
+        "atr5": 15.96,
+        "change_5m": 0.2888,
+        "change_15m": 0.2503,
+        "spread_atr_ratio": 0.3647,
+        "persistence_confirmed": true,
+        "gate_mode": "strict",
+        "rel_score": 0.667,
+        "evidence_classes": {
+          "conviction": "MIXED_SIM_PRIOR_LIVE_STATS",
+          "htf": "CURRENT_MARKET",
+          "exhaustion": "CURRENT_MARKET",
+          "macro": "CURRENT_EXTERNAL_DIRECTIVE",
+          "atr_price_reset": "CURRENT_MARKET",
+          "session": "CURRENT_CLOCK"
+        },
+        "thesis_key": "{\"change_15m\":0.25,\"change_5m\":0.29,\"conv_band\":\"mid\",\"direction\":\"long\",\"exhaustion\":\"clear\",\"htf\":\"bear\",\"instrument\":\"OIL\",\"macro\":\"neutral\",\"regime\":\"neutral\",\"sub_session\":\"pre_nyse\",\"v\":1}"
+      },
+      "max_favorable_excursion_pct": 0.001783,
+      "max_favorable_excursion_r": 0.7031,
+      "max_adverse_excursion_pct": 0.001199,
+      "max_adverse_excursion_r": 0.4727,
+      "exit_authority": "UNKNOWN",
+      "exit_authority_schema": 1,
+      "exit_authority_evidence": [
+        {
+          "authority": "UNKNOWN",
+          "source": "IG.activity.SYSTEM",
+          "broker_reference": null,
+          "broker_close_id": "DIAAAAR9NRJSMAH",
+          "activity_identity": "e1d07f86a83c3702f48874e2465b3e534a5627c9bbaa8fa213513774ec8a27f7",
+          "intent_id": null,
+          "identity": "activity:e1d07f86a83c3702f48874e2465b3e534a5627c9bbaa8fa213513774ec8a27f7"
+        }
+      ],
+      "exit_authority_conflict": false,
+      "operator_intervention": false,
+      "strategy_learning_eligible": false,
+      "accounting_eligible": true,
+      "close_intents": [
+        {
+          "id": "132a95d6d63791a37a999c5b165e2ba2c67b4d35fe7ab7c6c84d171d02d64288",
+          "deal_id": "DIAAAAR9NRACEAN",
+          "order": {
+            "direction": "SELL",
+            "size": 0.025,
+            "orderType": "MARKET",
+            "timeInForce": "FILL_OR_KILL",
+            "dealId": "DIAAAAR9NRACEAN"
+          },
+          "reason": "partial_take_profit",
+          "at": 1790936331.207785,
+          "deal_reference": "FYJ62RNB85JTYNV",
+          "confirmation": {
+            "date": "2026-10-02T10:18:51.536",
+            "status": null,
+            "reason": "SIZE_INCREMENT",
+            "dealStatus": "REJECTED",
+            "epic": "CC.D.LCO.BMU.IP",
+            "expiry": null,
+            "dealReference": "FYJ62RNB85JTYNV",
+            "dealId": "DIAAAAR9NS8BEA5",
+            "affectedDeals": [],
+            "level": null,
+            "size": null,
+            "direction": "SELL",
+            "stopLevel": null,
+            "limitLevel": null,
+            "stopDistance": null,
+            "limitDistance": null,
+            "guaranteedStop": false,
+            "trailingStop": false,
+            "profit": null,
+            "profitCurrency": null,
+            "_june_account_evidence": {
+              "account_id": "HT2Q8",
+              "currency": "USD",
+              "source": "IG.session.currentAccountId",
+              "verified": true
+            }
+          }
+        },
+        {
+          "id": "b6b59159f18b04e2716c1d15c1fcc37d9fed5d43c210803b120636054f773fd3",
+          "deal_id": "DIAAAAR9NRACEAN",
+          "order": {
+            "direction": "SELL",
+            "size": 0.025,
+            "orderType": "MARKET",
+            "timeInForce": "FILL_OR_KILL",
+            "dealId": "DIAAAAR9NRACEAN"
+          },
+          "reason": "partial_take_profit",
+          "at": 1790936402.3767793,
+          "deal_reference": "KEVXYCG2JU2TYNV",
+          "confirmation": {
+            "date": "2026-10-02T10:20:02.732",
+            "status": null,
+            "reason": "SIZE_INCREMENT",
+            "dealStatus": "REJECTED",
+            "epic": "CC.D.LCO.BMU.IP",
+            "expiry": null,
+            "dealReference": "KEVXYCG2JU2TYNV",
+            "dealId": "DIAAAAR9NTAV4A2",
+            "affectedDeals": [],
+            "level": null,
+            "size": null,
+            "direction": "SELL",
+            "stopLevel": null,
+            "limitLevel": null,
+            "stopDistance": null,
+            "limitDistance": null,
+            "guaranteedStop": false,
+            "trailingStop": false,
+            "profit": null,
+            "profitCurrency": null,
+            "_june_account_evidence": {
+              "account_id": "HT2Q8",
+              "currency": "USD",
+              "source": "IG.session.currentAccountId",
+              "verified": true
+            }
+          }
+        }
+      ],
+      "exit_authority_legs": [],
+      "exit_authority_identity": "deal:DIAAAAR9NRACEAN",
+      "exit_authority_epic": "CC.D.LCO.BMU.IP",
+      "entry_time": 1790935772.2583933,
+      "broker_entry_evidence": {
+        "schema_version": 1,
+        "source": "june.accepted_entry_path",
+        "identity_status": "pending_broker_opening",
+        "identity_issues": [],
+        "account_id": "HT2Q8",
+        "account_evidence": {
+          "order": {
+            "account_id": "HT2Q8",
+            "currency": "USD",
+            "source": "IG.session.currentAccountId",
+            "verified": true
+          },
+          "confirmation": {
+            "account_id": "HT2Q8",
+            "currency": "USD",
+            "source": "IG.session.currentAccountId",
+            "verified": true
+          }
+        },
+        "instrument": "OIL",
+        "role": "primary",
+        "deal_id": "DIAAAAR9NRACEAN",
+        "deal_reference": "3UTRBKFZNQATYNV",
+        "broker_direction": "BUY",
+        "broker_quantity": 0.05,
+        "broker_level": 9925.9,
+        "broker_opened_utc": null,
+        "confirmation_utc": null,
+        "missing_for_reconciliation": [
+          "exact_broker_opening_utc",
+          "verified_transaction_instrument_name",
+          "verified_position_currency_and_unit_semantics"
+        ],
+        "submitted_order": {
+          "epic": "CC.D.LCO.BMU.IP",
+          "expiry": "-",
+          "direction": "BUY",
+          "size": 0.05,
+          "orderType": "MARKET",
+          "timeInForce": "FILL_OR_KILL",
+          "guaranteedStop": false,
+          "forceOpen": true,
+          "currencyCode": "USD",
+          "stopDistance": 25
+        },
+        "opening_response": {
+          "dealReference": "3UTRBKFZNQATYNV"
+        },
+        "accepted_confirmation": {
+          "date": "2026-10-02T10:09:31.814",
+          "status": "OPEN",
+          "reason": "SUCCESS",
+          "dealStatus": "ACCEPTED",
+          "epic": "CC.D.LCO.BMU.IP",
+          "expiry": "-",
+          "dealReference": "3UTRBKFZNQATYNV",
+          "dealId": "DIAAAAR9NRACEAN",
+          "affectedDeals": [
+            {
+              "dealId": "DIAAAAR9NRACEAN",
+              "status": "OPENED"
+            }
+          ],
+          "level": 9925.9,
+          "size": 0.05,
+          "direction": "BUY",
+          "stopLevel": 9900.9,
+          "limitLevel": null,
+          "stopDistance": null,
+          "limitDistance": null,
+          "guaranteedStop": false,
+          "trailingStop": false,
+          "profit": null,
+          "profitCurrency": null
+        },
+        "broker_market_snapshot": {
+          "source": "IG.markets.instrument",
+          "epic": "CC.D.LCO.BMU.IP",
+          "fields": {
+            "name": "Oil - Brent Crude ($1)",
+            "epic": "CC.D.LCO.BMU.IP",
+            "type": "COMMODITIES",
+            "lotSize": 1.0,
+            "contractSize": "1",
+            "unit": "CONTRACTS",
+            "onePipMeans": "1",
+            "valueOfOnePip": "1.00",
+            "currencies": [
+              {
+                "code": "$.",
+                "name": "USD",
+                "symbol": "$",
+                "baseExchangeRate": 1.0,
+                "exchangeRate": 0.77,
+                "isDefault": true
+              }
+            ]
+          }
+        },
+        "local_context": {
+          "entry_time": 1790935772.2583933,
+          "conviction": 5
+        }
+      },
+      "stop_sync": {
+        "target": 9934.74904,
+        "deal_id": "DIAAAAR9NRACEAN",
+        "status": "acknowledged",
+        "attempted_at": 1790936332.3035877,
+        "acknowledged_via": "broker_position_snapshot",
+        "acknowledged_stop_level": 9934.74904,
+        "acknowledged_at": 1790936401.822441
+      },
+      "acknowledged_stop_level": 9934.74904,
+      "broker_stop_level": 9934.74904
+    },
+    {
+      "instrument": "SILVER",
+      "direction": "short",
+      "deal_id": "DIAAAAR9NUQ6WAL",
+      "entry_price": 6085.4,
+      "exit_price": null,
+      "ig_size": 0.02,
+      "notional": 121.72,
+      "pnl_pct": null,
+      "dollar_pnl": null,
+      "partial_dollar_pnl": 0.0,
+      "commission": 0.0,
+      "pnl_source": "unknown_pending_reconciliation",
+      "tp_source": "SIM_PRIOR",
+      "stop_source": "SIM_PRIOR+CURRENT_MARKET_SPREAD_FLOOR",
+      "settlement_state": "PROVISIONAL",
+      "settlement_source": "REST.absent+activity.POSITION_CLOSED",
+      "hold_min": 4.7,
+      "exit_epoch": 1790936900,
+      "exit_reason": "broker_side_disappearance",
+      "conviction": 1,
+      "reconciled": false,
+      "evidence_class": "PROVISIONAL",
+      "settlement_identity": "deal:DIAAAAR9NUQ6WAL",
+      "campaign_id": null,
+      "B4CA2": true,
+      "thesis_key": "{\"change_15m\":-0.25,\"change_5m\":-0.17,\"conv_band\":\"low\",\"direction\":\"short\",\"exhaustion\":\"elevated\",\"htf\":\"neutral\",\"instrument\":\"SILVER\",\"macro\":\"conflict\",\"regime\":\"neutral\",\"sub_session\":\"pre_nyse\",\"v\":1}",
+      "thesis_snapshot": {
+        "schema": 1,
+        "instrument": "SILVER",
+        "direction": "short",
+        "entry_price": 6086.2,
+        "conviction": 1,
+        "regime": "neutral",
+        "session": "day",
+        "sub_session": "pre_nyse",
+        "htf_bias": "neutral",
+        "htf_move": -0.002219,
+        "exhaustion": 3.1499,
+        "macro_scale": 0.5,
+        "claudia_dir": 1,
+        "macro_note": "conflict",
+        "atr5": 10.54,
+        "change_5m": -0.1673,
+        "change_15m": -0.2475,
+        "spread_atr_ratio": 1.3527,
+        "persistence_confirmed": true,
+        "gate_mode": "relaxed",
+        "rel_score": null,
+        "evidence_classes": {
+          "conviction": "MIXED_SIM_PRIOR_LIVE_STATS",
+          "htf": "CURRENT_MARKET",
+          "exhaustion": "CURRENT_MARKET",
+          "macro": "CURRENT_EXTERNAL_DIRECTIVE",
+          "atr_price_reset": "CURRENT_MARKET",
+          "session": "CURRENT_CLOCK"
+        },
+        "thesis_key": "{\"change_15m\":-0.25,\"change_5m\":-0.17,\"conv_band\":\"low\",\"direction\":\"short\",\"exhaustion\":\"elevated\",\"htf\":\"neutral\",\"instrument\":\"SILVER\",\"macro\":\"conflict\",\"regime\":\"neutral\",\"sub_session\":\"pre_nyse\",\"v\":1}"
+      },
+      "max_favorable_excursion_pct": 0.000427,
+      "max_favorable_excursion_r": 0.254,
+      "max_adverse_excursion_pct": 0.000953,
+      "max_adverse_excursion_r": 0.5667,
+      "exit_authority": "UNKNOWN",
+      "exit_authority_schema": 1,
+      "exit_authority_evidence": [
+        {
+          "authority": "UNKNOWN",
+          "source": "IG.activity.SYSTEM",
+          "broker_reference": null,
+          "broker_close_id": "DIAAAAR9NU3QGAH",
+          "activity_identity": "d2a139f42e4d9c36df0f6058e3e033b147cf4de9cdee048394ae685d0f4c9656",
+          "intent_id": null,
+          "identity": "activity:d2a139f42e4d9c36df0f6058e3e033b147cf4de9cdee048394ae685d0f4c9656"
+        }
+      ],
+      "exit_authority_conflict": false,
+      "operator_intervention": false,
+      "strategy_learning_eligible": false,
+      "accounting_eligible": true,
+      "exit_authority_legs": [],
+      "exit_authority_identity": "deal:DIAAAAR9NUQ6WAL",
+      "exit_authority_epic": "CS.D.CFDSILVER.BMU.IP",
+      "entry_time": 1790936619.6597996,
+      "broker_entry_evidence": {
+        "schema_version": 1,
+        "source": "june.accepted_entry_path",
+        "identity_status": "pending_broker_opening",
+        "identity_issues": [],
+        "account_id": "HT2Q8",
+        "account_evidence": {
+          "order": {
+            "account_id": "HT2Q8",
+            "currency": "USD",
+            "source": "IG.session.currentAccountId",
+            "verified": true
+          },
+          "confirmation": {
+            "account_id": "HT2Q8",
+            "currency": "USD",
+            "source": "IG.session.currentAccountId",
+            "verified": true
+          }
+        },
+        "instrument": "SILVER",
+        "role": "primary",
+        "deal_id": "DIAAAAR9NUQ6WAL",
+        "deal_reference": "ST6T4FTVDA6TYNV",
+        "broker_direction": "SELL",
+        "broker_quantity": 0.02,
+        "broker_level": 6085.4,
+        "broker_opened_utc": null,
+        "confirmation_utc": null,
+        "missing_for_reconciliation": [
+          "exact_broker_opening_utc",
+          "verified_transaction_instrument_name",
+          "verified_position_currency_and_unit_semantics"
+        ],
+        "submitted_order": {
+          "epic": "CS.D.CFDSILVER.BMU.IP",
+          "expiry": "-",
+          "direction": "SELL",
+          "size": 0.02,
+          "orderType": "MARKET",
+          "timeInForce": "FILL_OR_KILL",
+          "guaranteedStop": false,
+          "forceOpen": true,
+          "currencyCode": "USD",
+          "stopDistance": 10
+        },
+        "opening_response": {
+          "dealReference": "ST6T4FTVDA6TYNV"
+        },
+        "accepted_confirmation": {
+          "date": "2026-10-02T10:23:39.104",
+          "status": "OPEN",
+          "reason": "SUCCESS",
+          "dealStatus": "ACCEPTED",
+          "epic": "CS.D.CFDSILVER.BMU.IP",
+          "expiry": "-",
+          "dealReference": "ST6T4FTVDA6TYNV",
+          "dealId": "DIAAAAR9NUQ6WAL",
+          "affectedDeals": [
+            {
+              "dealId": "DIAAAAR9NUQ6WAL",
+              "status": "OPENED"
+            }
+          ],
+          "level": 6085.4,
+          "size": 0.02,
+          "direction": "SELL",
+          "stopLevel": 6095.4,
+          "limitLevel": null,
+          "stopDistance": null,
+          "limitDistance": null,
+          "guaranteedStop": false,
+          "trailingStop": false,
+          "profit": null,
+          "profitCurrency": null
+        },
+        "broker_market_snapshot": {
+          "source": "IG.markets.instrument",
+          "epic": "CS.D.CFDSILVER.BMU.IP",
+          "fields": {
+            "name": "Spot Silver ($1)",
+            "epic": "CS.D.CFDSILVER.BMU.IP",
+            "type": "CURRENCIES",
+            "lotSize": 1.0,
+            "contractSize": "1",
+            "unit": "CONTRACTS",
+            "onePipMeans": "1 Cents/Troy Ounce",
+            "valueOfOnePip": "1.00",
+            "currencies": [
+              {
+                "code": "$.",
+                "name": "USD",
+                "symbol": "$",
+                "baseExchangeRate": 1.0,
+                "exchangeRate": 0.77,
+                "isDefault": true
+              }
+            ]
+          }
+        },
+        "local_context": {
+          "entry_time": 1790936619.6597996,
+          "conviction": 1
+        }
+      },
+      "broker_stop_level": 6095.4
+    }
+  ],
+  "clear_events": [
+    {
+      "payload": {
+        "account_id": "HT2Q8",
+        "current_role": "primary",
+        "deal_id": "DIAAAAR9NPGYTAY",
+        "details": {},
+        "event": "before_primary_clear",
+        "observed_session_account": "HT2Q8",
+        "original_role": "primary",
+        "position": {
+          "accounting_eligible": true,
+          "allocation_observed_quantity": 0.02,
+          "breakeven_locked": true,
+          "broker_entry_evidence": {
+            "accepted_confirmation": {
+              "affectedDeals": [
+                {
+                  "dealId": "DIAAAAR9NPGYTAY",
+                  "status": "OPENED"
+                }
+              ],
+              "date": "2026-10-02T09:58:42.7",
+              "dealId": "DIAAAAR9NPGYTAY",
+              "dealReference": "BXFWH2XT3FETYNV",
+              "dealStatus": "ACCEPTED",
+              "direction": "SELL",
+              "epic": "CC.D.LCO.BMU.IP",
+              "expiry": "-",
+              "guaranteedStop": false,
+              "level": 9890.5,
+              "limitDistance": null,
+              "limitLevel": null,
+              "profit": null,
+              "profitCurrency": null,
+              "reason": "SUCCESS",
+              "size": 0.02,
+              "status": "OPEN",
+              "stopDistance": null,
+              "stopLevel": 9915.5,
+              "trailingStop": false
+            },
+            "account_evidence": {
+              "confirmation": {
+                "account_id": "HT2Q8",
+                "currency": "USD",
+                "source": "IG.session.currentAccountId",
+                "verified": true
+              },
+              "order": {
+                "account_id": "HT2Q8",
+                "currency": "USD",
+                "source": "IG.session.currentAccountId",
+                "verified": true
+              }
+            },
+            "account_id": "HT2Q8",
+            "broker_direction": "SELL",
+            "broker_level": 9890.5,
+            "broker_market_snapshot": {
+              "epic": "CC.D.LCO.BMU.IP",
+              "fields": {
+                "contractSize": "1",
+                "currencies": [
+                  {
+                    "baseExchangeRate": 1.0,
+                    "code": "$.",
+                    "exchangeRate": 0.77,
+                    "isDefault": true,
+                    "name": "USD",
+                    "symbol": "$"
+                  }
+                ],
+                "epic": "CC.D.LCO.BMU.IP",
+                "lotSize": 1.0,
+                "name": "Oil - Brent Crude ($1)",
+                "onePipMeans": "1",
+                "type": "COMMODITIES",
+                "unit": "CONTRACTS",
+                "valueOfOnePip": "1.00"
+              },
+              "source": "IG.markets.instrument"
+            },
+            "broker_opened_utc": null,
+            "broker_quantity": 0.02,
+            "confirmation_utc": null,
+            "deal_id": "DIAAAAR9NPGYTAY",
+            "deal_reference": "BXFWH2XT3FETYNV",
+            "identity_issues": [],
+            "identity_status": "pending_broker_opening",
+            "instrument": "OIL",
+            "local_context": {
+              "conviction": 1,
+              "entry_time": 1790935123.1307776
+            },
+            "missing_for_reconciliation": [
+              "exact_broker_opening_utc",
+              "verified_transaction_instrument_name",
+              "verified_position_currency_and_unit_semantics"
+            ],
+            "opening_response": {
+              "dealReference": "BXFWH2XT3FETYNV"
+            },
+            "role": "primary",
+            "schema_version": 1,
+            "source": "june.accepted_entry_path",
+            "submitted_order": {
+              "currencyCode": "USD",
+              "direction": "SELL",
+              "epic": "CC.D.LCO.BMU.IP",
+              "expiry": "-",
+              "forceOpen": true,
+              "guaranteedStop": false,
+              "orderType": "MARKET",
+              "size": 0.02,
+              "stopDistance": 25,
+              "timeInForce": "FILL_OR_KILL"
+            }
+          },
+          "broker_stop_level": 9915.5,
+          "claudia_pts": 0.0,
+          "conviction": 1,
+          "deal_id": "DIAAAAR9NPGYTAY",
+          "deal_ref": "BXFWH2XT3FETYNV",
+          "defensive_soft_sl": 9885.68744,
+          "defensive_stop_active": true,
+          "defensive_stop_level": 9885.68744,
+          "direction": "short",
+          "dple_effective_sl": 0.0003184228603205335,
+          "entry_change_15m": -0.1604,
+          "entry_sar": 0.6499,
+          "entry_time": 1790935123.1307776,
+          "entry_vol": 0.1796,
+          "exit_authority": "UNKNOWN",
+          "exit_authority_conflict": false,
+          "exit_authority_epic": "CC.D.LCO.BMU.IP",
+          "exit_authority_evidence": [
+            {
+              "activity_identity": "c562bbc2a5eb1d81a4badddcdaeabae1863d56fbbbfe2aa7a443f30fc74cc96a",
+              "authority": "UNKNOWN",
+              "broker_close_id": "DIAAAAR9NPSKMAH",
+              "broker_reference": null,
+              "identity": "activity:c562bbc2a5eb1d81a4badddcdaeabae1863d56fbbbfe2aa7a443f30fc74cc96a",
+              "intent_id": null,
+              "source": "IG.activity.SYSTEM"
+            }
+          ],
+          "exit_authority_identity": "deal:DIAAAAR9NPGYTAY",
+          "exit_authority_legs": [],
+          "exit_authority_schema": 1,
+          "fill_price": 9890.5,
+          "htf_bias": "bear",
+          "ig_size": 0.02,
+          "initial_sl_pct": 0.002533,
+          "instrument": "OIL",
+          "intended_stop_level": 9885.68744,
+          "leverage": 3,
+          "max_adverse_excursion_pct": 0.000404,
+          "max_adverse_excursion_r": 0.1596,
+          "max_favorable_excursion_pct": 0.000637,
+          "max_favorable_excursion_r": 0.2514,
+          "notional": 197.87599999999998,
+          "operator_intervention": false,
+          "peak_pnl_pct": 0.000636845720641067,
+          "persistence_confirmed": true,
+          "pos_size": 78.06,
+          "reversal_count": 0,
+          "scaling_history_complete": true,
+          "stop_dist": 25,
+          "stop_pct": 0.002533,
+          "stop_source": "SIM_PRIOR+CURRENT_MARKET_SPREAD_FLOOR",
+          "stop_sync": {
+            "attempted_at": 1790935268.8486109,
+            "deal_id": "DIAAAAR9NPGYTAY",
+            "status": "pending",
+            "target": 9885.68744
+          },
+          "strategy_learning_eligible": false,
+          "thesis_key": "{\"change_15m\":-0.16,\"change_5m\":-0.18,\"conv_band\":\"low\",\"direction\":\"short\",\"exhaustion\":\"clear\",\"htf\":\"bear\",\"instrument\":\"OIL\",\"macro\":\"neutral\",\"regime\":\"neutral\",\"sub_session\":\"pre_nyse\",\"v\":1}",
+          "thesis_snapshot": {
+            "atr5": 17.226667,
+            "change_15m": -0.1604,
+            "change_5m": -0.1796,
+            "claudia_dir": 0,
+            "conviction": 1,
+            "direction": "short",
+            "entry_price": 9893.8,
+            "evidence_classes": {
+              "atr_price_reset": "CURRENT_MARKET",
+              "conviction": "MIXED_SIM_PRIOR_LIVE_STATS",
+              "exhaustion": "CURRENT_MARKET",
+              "htf": "CURRENT_MARKET",
+              "macro": "CURRENT_EXTERNAL_DIRECTIVE",
+              "session": "CURRENT_CLOCK"
+            },
+            "exhaustion": 0.0,
+            "gate_mode": "relaxed",
+            "htf_bias": "bear",
+            "htf_move": -0.015826,
+            "instrument": "OIL",
+            "macro_note": "neutral",
+            "macro_scale": 0.8,
+            "persistence_confirmed": true,
+            "regime": "neutral",
+            "rel_score": -0.303,
+            "schema": 1,
+            "session": "day",
+            "spread_atr_ratio": 0.6499,
+            "sub_session": "pre_nyse",
+            "thesis_key": "{\"change_15m\":-0.16,\"change_5m\":-0.18,\"conv_band\":\"low\",\"direction\":\"short\",\"exhaustion\":\"clear\",\"htf\":\"bear\",\"instrument\":\"OIL\",\"macro\":\"neutral\",\"regime\":\"neutral\",\"sub_session\":\"pre_nyse\",\"v\":1}"
+          },
+          "tp_pct": 0.000827,
+          "tp_source": "SIM_PRIOR"
+        },
+        "provenance": "raw_local_snapshot_not_broker_history",
+        "schema_version": 1,
+        "status": "pending_evidence"
+      },
+      "observed_utc": "2026-10-02T10:02:18.514596+00:00"
+    },
+    {
+      "payload": {
+        "account_id": "HT2Q8",
+        "current_role": "primary",
+        "deal_id": "DIAAAAR9NRACEAN",
+        "details": {},
+        "event": "before_primary_clear",
+        "observed_session_account": "HT2Q8",
+        "original_role": "primary",
+        "position": {
+          "accounting_eligible": true,
+          "acknowledged_stop_level": 9934.74904,
+          "allocation_observed_quantity": 0.05,
+          "breakeven_locked": true,
+          "broker_entry_evidence": {
+            "accepted_confirmation": {
+              "affectedDeals": [
+                {
+                  "dealId": "DIAAAAR9NRACEAN",
+                  "status": "OPENED"
+                }
+              ],
+              "date": "2026-10-02T10:09:31.814",
+              "dealId": "DIAAAAR9NRACEAN",
+              "dealReference": "3UTRBKFZNQATYNV",
+              "dealStatus": "ACCEPTED",
+              "direction": "BUY",
+              "epic": "CC.D.LCO.BMU.IP",
+              "expiry": "-",
+              "guaranteedStop": false,
+              "level": 9925.9,
+              "limitDistance": null,
+              "limitLevel": null,
+              "profit": null,
+              "profitCurrency": null,
+              "reason": "SUCCESS",
+              "size": 0.05,
+              "status": "OPEN",
+              "stopDistance": null,
+              "stopLevel": 9900.9,
+              "trailingStop": false
+            },
+            "account_evidence": {
+              "confirmation": {
+                "account_id": "HT2Q8",
+                "currency": "USD",
+                "source": "IG.session.currentAccountId",
+                "verified": true
+              },
+              "order": {
+                "account_id": "HT2Q8",
+                "currency": "USD",
+                "source": "IG.session.currentAccountId",
+                "verified": true
+              }
+            },
+            "account_id": "HT2Q8",
+            "broker_direction": "BUY",
+            "broker_level": 9925.9,
+            "broker_market_snapshot": {
+              "epic": "CC.D.LCO.BMU.IP",
+              "fields": {
+                "contractSize": "1",
+                "currencies": [
+                  {
+                    "baseExchangeRate": 1.0,
+                    "code": "$.",
+                    "exchangeRate": 0.77,
+                    "isDefault": true,
+                    "name": "USD",
+                    "symbol": "$"
+                  }
+                ],
+                "epic": "CC.D.LCO.BMU.IP",
+                "lotSize": 1.0,
+                "name": "Oil - Brent Crude ($1)",
+                "onePipMeans": "1",
+                "type": "COMMODITIES",
+                "unit": "CONTRACTS",
+                "valueOfOnePip": "1.00"
+              },
+              "source": "IG.markets.instrument"
+            },
+            "broker_opened_utc": null,
+            "broker_quantity": 0.05,
+            "confirmation_utc": null,
+            "deal_id": "DIAAAAR9NRACEAN",
+            "deal_reference": "3UTRBKFZNQATYNV",
+            "identity_issues": [],
+            "identity_status": "pending_broker_opening",
+            "instrument": "OIL",
+            "local_context": {
+              "conviction": 5,
+              "entry_time": 1790935772.2583933
+            },
+            "missing_for_reconciliation": [
+              "exact_broker_opening_utc",
+              "verified_transaction_instrument_name",
+              "verified_position_currency_and_unit_semantics"
+            ],
+            "opening_response": {
+              "dealReference": "3UTRBKFZNQATYNV"
+            },
+            "role": "primary",
+            "schema_version": 1,
+            "source": "june.accepted_entry_path",
+            "submitted_order": {
+              "currencyCode": "USD",
+              "direction": "BUY",
+              "epic": "CC.D.LCO.BMU.IP",
+              "expiry": "-",
+              "forceOpen": true,
+              "guaranteedStop": false,
+              "orderType": "MARKET",
+              "size": 0.05,
+              "stopDistance": 25,
+              "timeInForce": "FILL_OR_KILL"
+            }
+          },
+          "broker_stop_level": 9934.74904,
+          "claudia_pts": 0.0,
+          "close_intents": [
+            {
+              "at": 1790936331.207785,
+              "confirmation": {
+                "_june_account_evidence": {
+                  "account_id": "HT2Q8",
+                  "currency": "USD",
+                  "source": "IG.session.currentAccountId",
+                  "verified": true
+                },
+                "affectedDeals": [],
+                "date": "2026-10-02T10:18:51.536",
+                "dealId": "DIAAAAR9NS8BEA5",
+                "dealReference": "FYJ62RNB85JTYNV",
+                "dealStatus": "REJECTED",
+                "direction": "SELL",
+                "epic": "CC.D.LCO.BMU.IP",
+                "expiry": null,
+                "guaranteedStop": false,
+                "level": null,
+                "limitDistance": null,
+                "limitLevel": null,
+                "profit": null,
+                "profitCurrency": null,
+                "reason": "SIZE_INCREMENT",
+                "size": null,
+                "status": null,
+                "stopDistance": null,
+                "stopLevel": null,
+                "trailingStop": false
+              },
+              "deal_id": "DIAAAAR9NRACEAN",
+              "deal_reference": "FYJ62RNB85JTYNV",
+              "id": "132a95d6d63791a37a999c5b165e2ba2c67b4d35fe7ab7c6c84d171d02d64288",
+              "order": {
+                "dealId": "DIAAAAR9NRACEAN",
+                "direction": "SELL",
+                "orderType": "MARKET",
+                "size": 0.025,
+                "timeInForce": "FILL_OR_KILL"
+              },
+              "reason": "partial_take_profit"
+            },
+            {
+              "at": 1790936402.3767793,
+              "confirmation": {
+                "_june_account_evidence": {
+                  "account_id": "HT2Q8",
+                  "currency": "USD",
+                  "source": "IG.session.currentAccountId",
+                  "verified": true
+                },
+                "affectedDeals": [],
+                "date": "2026-10-02T10:20:02.732",
+                "dealId": "DIAAAAR9NTAV4A2",
+                "dealReference": "KEVXYCG2JU2TYNV",
+                "dealStatus": "REJECTED",
+                "direction": "SELL",
+                "epic": "CC.D.LCO.BMU.IP",
+                "expiry": null,
+                "guaranteedStop": false,
+                "level": null,
+                "limitDistance": null,
+                "limitLevel": null,
+                "profit": null,
+                "profitCurrency": null,
+                "reason": "SIZE_INCREMENT",
+                "size": null,
+                "status": null,
+                "stopDistance": null,
+                "stopLevel": null,
+                "trailingStop": false
+              },
+              "deal_id": "DIAAAAR9NRACEAN",
+              "deal_reference": "KEVXYCG2JU2TYNV",
+              "id": "b6b59159f18b04e2716c1d15c1fcc37d9fed5d43c210803b120636054f773fd3",
+              "order": {
+                "dealId": "DIAAAAR9NRACEAN",
+                "direction": "SELL",
+                "orderType": "MARKET",
+                "size": 0.025,
+                "timeInForce": "FILL_OR_KILL"
+              },
+              "reason": "partial_take_profit"
+            }
+          ],
+          "conviction": 5,
+          "deal_id": "DIAAAAR9NRACEAN",
+          "deal_ref": "3UTRBKFZNQATYNV",
+          "defensive_soft_sl": 9934.74904,
+          "defensive_stop_active": true,
+          "defensive_stop_level": 9934.74904,
+          "direction": "long",
+          "dple_effective_sl": 0.000891508125207772,
+          "entry_change_15m": 0.2503,
+          "entry_sar": 0.3647,
+          "entry_time": 1790935772.2583933,
+          "entry_vol": 0.2888,
+          "exit_authority": "UNKNOWN",
+          "exit_authority_conflict": false,
+          "exit_authority_epic": "CC.D.LCO.BMU.IP",
+          "exit_authority_evidence": [
+            {
+              "activity_identity": "e1d07f86a83c3702f48874e2465b3e534a5627c9bbaa8fa213513774ec8a27f7",
+              "authority": "UNKNOWN",
+              "broker_close_id": "DIAAAAR9NRJSMAH",
+              "broker_reference": null,
+              "identity": "activity:e1d07f86a83c3702f48874e2465b3e534a5627c9bbaa8fa213513774ec8a27f7",
+              "intent_id": null,
+              "source": "IG.activity.SYSTEM"
+            }
+          ],
+          "exit_authority_identity": "deal:DIAAAAR9NRACEAN",
+          "exit_authority_legs": [],
+          "exit_authority_schema": 1,
+          "fill_price": 9925.9,
+          "htf_bias": "bear",
+          "ig_size": 0.05,
+          "initial_sl_pct": 0.002536,
+          "instrument": "OIL",
+          "intended_stop_level": 9934.74904,
+          "leverage": 6,
+          "max_adverse_excursion_pct": 0.001199,
+          "max_adverse_excursion_r": 0.4727,
+          "max_favorable_excursion_pct": 0.001783,
+          "max_favorable_excursion_r": 0.7031,
+          "notional": 496.595,
+          "operator_intervention": false,
+          "peak_pnl_pct": 0.001783016250415544,
+          "persistence_confirmed": true,
+          "pos_size": 78.09,
+          "reversal_count": 0,
+          "scaling_history_complete": true,
+          "stop_dist": 25,
+          "stop_pct": 0.002536,
+          "stop_source": "SIM_PRIOR+CURRENT_MARKET_SPREAD_FLOOR",
+          "stop_sync": {
+            "acknowledged_at": 1790936401.822441,
+            "acknowledged_stop_level": 9934.74904,
+            "acknowledged_via": "broker_position_snapshot",
+            "attempted_at": 1790936332.3035877,
+            "deal_id": "DIAAAAR9NRACEAN",
+            "status": "acknowledged",
+            "target": 9934.74904
+          },
+          "strategy_learning_eligible": false,
+          "thesis_key": "{\"change_15m\":0.25,\"change_5m\":0.29,\"conv_band\":\"mid\",\"direction\":\"long\",\"exhaustion\":\"clear\",\"htf\":\"bear\",\"instrument\":\"OIL\",\"macro\":\"neutral\",\"regime\":\"neutral\",\"sub_session\":\"pre_nyse\",\"v\":1}",
+          "thesis_snapshot": {
+            "atr5": 15.96,
+            "change_15m": 0.2503,
+            "change_5m": 0.2888,
+            "claudia_dir": 0,
+            "conviction": 5,
+            "direction": "long",
+            "entry_price": 9931.9,
+            "evidence_classes": {
+              "atr_price_reset": "CURRENT_MARKET",
+              "conviction": "MIXED_SIM_PRIOR_LIVE_STATS",
+              "exhaustion": "CURRENT_MARKET",
+              "htf": "CURRENT_MARKET",
+              "macro": "CURRENT_EXTERNAL_DIRECTIVE",
+              "session": "CURRENT_CLOCK"
+            },
+            "exhaustion": 1.3784,
+            "gate_mode": "strict",
+            "htf_bias": "bear",
+            "htf_move": -0.006427,
+            "instrument": "OIL",
+            "macro_note": "neutral",
+            "macro_scale": 0.8,
+            "persistence_confirmed": true,
+            "regime": "neutral",
+            "rel_score": 0.667,
+            "schema": 1,
+            "session": "day",
+            "spread_atr_ratio": 0.3647,
+            "sub_session": "pre_nyse",
+            "thesis_key": "{\"change_15m\":0.25,\"change_5m\":0.29,\"conv_band\":\"mid\",\"direction\":\"long\",\"exhaustion\":\"clear\",\"htf\":\"bear\",\"instrument\":\"OIL\",\"macro\":\"neutral\",\"regime\":\"neutral\",\"sub_session\":\"pre_nyse\",\"v\":1}"
+          },
+          "tp_pct": 0.001056,
+          "tp_source": "SIM_PRIOR"
+        },
+        "provenance": "raw_local_snapshot_not_broker_history",
+        "schema_version": 1,
+        "status": "pending_evidence"
+      },
+      "observed_utc": "2026-10-02T10:21:13.409243+00:00"
+    },
+    {
+      "payload": {
+        "account_id": "HT2Q8",
+        "current_role": "primary",
+        "deal_id": "DIAAAAR9NUQ6WAL",
+        "details": {},
+        "event": "before_primary_clear",
+        "observed_session_account": "HT2Q8",
+        "original_role": "primary",
+        "position": {
+          "accounting_eligible": true,
+          "allocation_observed_quantity": 0.02,
+          "broker_entry_evidence": {
+            "accepted_confirmation": {
+              "affectedDeals": [
+                {
+                  "dealId": "DIAAAAR9NUQ6WAL",
+                  "status": "OPENED"
+                }
+              ],
+              "date": "2026-10-02T10:23:39.104",
+              "dealId": "DIAAAAR9NUQ6WAL",
+              "dealReference": "ST6T4FTVDA6TYNV",
+              "dealStatus": "ACCEPTED",
+              "direction": "SELL",
+              "epic": "CS.D.CFDSILVER.BMU.IP",
+              "expiry": "-",
+              "guaranteedStop": false,
+              "level": 6085.4,
+              "limitDistance": null,
+              "limitLevel": null,
+              "profit": null,
+              "profitCurrency": null,
+              "reason": "SUCCESS",
+              "size": 0.02,
+              "status": "OPEN",
+              "stopDistance": null,
+              "stopLevel": 6095.4,
+              "trailingStop": false
+            },
+            "account_evidence": {
+              "confirmation": {
+                "account_id": "HT2Q8",
+                "currency": "USD",
+                "source": "IG.session.currentAccountId",
+                "verified": true
+              },
+              "order": {
+                "account_id": "HT2Q8",
+                "currency": "USD",
+                "source": "IG.session.currentAccountId",
+                "verified": true
+              }
+            },
+            "account_id": "HT2Q8",
+            "broker_direction": "SELL",
+            "broker_level": 6085.4,
+            "broker_market_snapshot": {
+              "epic": "CS.D.CFDSILVER.BMU.IP",
+              "fields": {
+                "contractSize": "1",
+                "currencies": [
+                  {
+                    "baseExchangeRate": 1.0,
+                    "code": "$.",
+                    "exchangeRate": 0.77,
+                    "isDefault": true,
+                    "name": "USD",
+                    "symbol": "$"
+                  }
+                ],
+                "epic": "CS.D.CFDSILVER.BMU.IP",
+                "lotSize": 1.0,
+                "name": "Spot Silver ($1)",
+                "onePipMeans": "1 Cents/Troy Ounce",
+                "type": "CURRENCIES",
+                "unit": "CONTRACTS",
+                "valueOfOnePip": "1.00"
+              },
+              "source": "IG.markets.instrument"
+            },
+            "broker_opened_utc": null,
+            "broker_quantity": 0.02,
+            "confirmation_utc": null,
+            "deal_id": "DIAAAAR9NUQ6WAL",
+            "deal_reference": "ST6T4FTVDA6TYNV",
+            "identity_issues": [],
+            "identity_status": "pending_broker_opening",
+            "instrument": "SILVER",
+            "local_context": {
+              "conviction": 1,
+              "entry_time": 1790936619.6597996
+            },
+            "missing_for_reconciliation": [
+              "exact_broker_opening_utc",
+              "verified_transaction_instrument_name",
+              "verified_position_currency_and_unit_semantics"
+            ],
+            "opening_response": {
+              "dealReference": "ST6T4FTVDA6TYNV"
+            },
+            "role": "primary",
+            "schema_version": 1,
+            "source": "june.accepted_entry_path",
+            "submitted_order": {
+              "currencyCode": "USD",
+              "direction": "SELL",
+              "epic": "CS.D.CFDSILVER.BMU.IP",
+              "expiry": "-",
+              "forceOpen": true,
+              "guaranteedStop": false,
+              "orderType": "MARKET",
+              "size": 0.02,
+              "stopDistance": 10,
+              "timeInForce": "FILL_OR_KILL"
+            }
+          },
+          "broker_stop_level": 6095.4,
+          "claudia_pts": 0.0,
+          "conviction": 1,
+          "deal_id": "DIAAAAR9NUQ6WAL",
+          "deal_ref": "ST6T4FTVDA6TYNV",
+          "direction": "short",
+          "entry_change_15m": -0.2475,
+          "entry_sar": 1.3527,
+          "entry_time": 1790936619.6597996,
+          "entry_vol": 0.1673,
+          "exit_authority": "UNKNOWN",
+          "exit_authority_conflict": false,
+          "exit_authority_epic": "CS.D.CFDSILVER.BMU.IP",
+          "exit_authority_evidence": [
+            {
+              "activity_identity": "d2a139f42e4d9c36df0f6058e3e033b147cf4de9cdee048394ae685d0f4c9656",
+              "authority": "UNKNOWN",
+              "broker_close_id": "DIAAAAR9NU3QGAH",
+              "broker_reference": null,
+              "identity": "activity:d2a139f42e4d9c36df0f6058e3e033b147cf4de9cdee048394ae685d0f4c9656",
+              "intent_id": null,
+              "source": "IG.activity.SYSTEM"
+            }
+          ],
+          "exit_authority_identity": "deal:DIAAAAR9NUQ6WAL",
+          "exit_authority_legs": [],
+          "exit_authority_schema": 1,
+          "fill_price": 6085.4,
+          "htf_bias": "neutral",
+          "ig_size": 0.02,
+          "initial_sl_pct": 0.001682,
+          "instrument": "SILVER",
+          "leverage": 3,
+          "max_adverse_excursion_pct": 0.000953,
+          "max_adverse_excursion_r": 0.5667,
+          "max_favorable_excursion_pct": 0.000427,
+          "max_favorable_excursion_r": 0.254,
+          "notional": 121.724,
+          "operator_intervention": false,
+          "peak_pnl_pct": 0.00042715627567616667,
+          "persistence_confirmed": true,
+          "pos_size": 42.24,
+          "reversal_count": 0,
+          "scaling_history_complete": true,
+          "stop_dist": 10,
+          "stop_pct": 0.001682,
+          "stop_source": "SIM_PRIOR+CURRENT_MARKET_SPREAD_FLOOR",
+          "strategy_learning_eligible": false,
+          "thesis_key": "{\"change_15m\":-0.25,\"change_5m\":-0.17,\"conv_band\":\"low\",\"direction\":\"short\",\"exhaustion\":\"elevated\",\"htf\":\"neutral\",\"instrument\":\"SILVER\",\"macro\":\"conflict\",\"regime\":\"neutral\",\"sub_session\":\"pre_nyse\",\"v\":1}",
+          "thesis_snapshot": {
+            "atr5": 10.54,
+            "change_15m": -0.2475,
+            "change_5m": -0.1673,
+            "claudia_dir": 1,
+            "conviction": 1,
+            "direction": "short",
+            "entry_price": 6086.2,
+            "evidence_classes": {
+              "atr_price_reset": "CURRENT_MARKET",
+              "conviction": "MIXED_SIM_PRIOR_LIVE_STATS",
+              "exhaustion": "CURRENT_MARKET",
+              "htf": "CURRENT_MARKET",
+              "macro": "CURRENT_EXTERNAL_DIRECTIVE",
+              "session": "CURRENT_CLOCK"
+            },
+            "exhaustion": 3.1499,
+            "gate_mode": "relaxed",
+            "htf_bias": "neutral",
+            "htf_move": -0.002219,
+            "instrument": "SILVER",
+            "macro_note": "conflict",
+            "macro_scale": 0.5,
+            "persistence_confirmed": true,
+            "regime": "neutral",
+            "rel_score": null,
+            "schema": 1,
+            "session": "day",
+            "spread_atr_ratio": 1.3527,
+            "sub_session": "pre_nyse",
+            "thesis_key": "{\"change_15m\":-0.25,\"change_5m\":-0.17,\"conv_band\":\"low\",\"direction\":\"short\",\"exhaustion\":\"elevated\",\"htf\":\"neutral\",\"instrument\":\"SILVER\",\"macro\":\"conflict\",\"regime\":\"neutral\",\"sub_session\":\"pre_nyse\",\"v\":1}"
+          },
+          "tp_pct": 0.001629,
+          "tp_source": "SIM_PRIOR"
+        },
+        "provenance": "raw_local_snapshot_not_broker_history",
+        "schema_version": 1,
+        "status": "pending_evidence"
+      },
+      "observed_utc": "2026-10-02T10:28:20.811196+00:00"
+    }
+  ],
+  "activities": [
+    {
+      "date": "2026-10-02T10:27:39",
+      "epic": "CS.D.CFDSILVER.BMU.IP",
+      "period": "-",
+      "dealId": "DIAAAAR9NU3QGAH",
+      "channel": "SYSTEM",
+      "type": "POSITION",
+      "status": "ACCEPTED",
+      "description": "Position/s closed: 9NUQ6WAL",
+      "details": {
+        "dealReference": null,
+        "actions": [
+          {
+            "actionType": "POSITION_CLOSED",
+            "affectedDealId": "DIAAAAR9NUQ6WAL"
+          }
+        ],
+        "marketName": "Spot Silver ($1)",
+        "goodTillDate": null,
+        "currency": "USD",
+        "size": 0.02,
+        "direction": "BUY",
+        "level": 6095.4,
+        "stopLevel": 6095.4,
+        "stopDistance": 10,
+        "guaranteedStop": false,
+        "trailingStopDistance": null,
+        "trailingStep": null,
+        "limitLevel": null,
+        "limitDistance": null
+      }
+    },
+    {
+      "date": "2026-10-02T10:23:39",
+      "epic": "CS.D.CFDSILVER.BMU.IP",
+      "period": "-",
+      "dealId": "DIAAAAR9NUQ6WAL",
+      "channel": "PUBLIC_WEB_API",
+      "type": "POSITION",
+      "status": "ACCEPTED",
+      "description": "Position opened: 9NUQ6WAL",
+      "details": {
+        "dealReference": "ST6T4FTVDA6TYNV",
+        "actions": [
+          {
+            "actionType": "POSITION_OPENED",
+            "affectedDealId": "DIAAAAR9NUQ6WAL"
+          }
+        ],
+        "marketName": "Spot Silver ($1)",
+        "goodTillDate": null,
+        "currency": "USD",
+        "size": 0.02,
+        "direction": "SELL",
+        "level": 6085.4,
+        "stopLevel": 6095.4,
+        "stopDistance": 10,
+        "guaranteedStop": false,
+        "trailingStopDistance": null,
+        "trailingStep": null,
+        "limitLevel": null,
+        "limitDistance": null
+      }
+    },
+    {
+      "date": "2026-10-02T10:20:19",
+      "epic": "CC.D.LCO.BMU.IP",
+      "period": "-",
+      "dealId": "DIAAAAR9NRJSMAH",
+      "channel": "SYSTEM",
+      "type": "POSITION",
+      "status": "ACCEPTED",
+      "description": "Position/s closed: 9NRACEAN",
+      "details": {
+        "dealReference": null,
+        "actions": [
+          {
+            "actionType": "POSITION_CLOSED",
+            "affectedDealId": "DIAAAAR9NRACEAN"
+          }
+        ],
+        "marketName": "Oil - Brent Crude ($1)",
+        "goodTillDate": null,
+        "currency": "USD",
+        "size": 0.05,
+        "direction": "SELL",
+        "level": 9934.5,
+        "stopLevel": 9934.74904,
+        "stopDistance": -8.84904,
+        "guaranteedStop": false,
+        "trailingStopDistance": null,
+        "trailingStep": null,
+        "limitLevel": null,
+        "limitDistance": null
+      }
+    },
+    {
+      "date": "2026-10-02T10:18:52",
+      "epic": "CC.D.LCO.BMU.IP",
+      "period": "-",
+      "dealId": "DIAAAAR9NSFF8AZ",
+      "channel": "PUBLIC_WEB_API",
+      "type": "EDIT_STOP_AND_LIMIT",
+      "status": "ACCEPTED",
+      "description": "Stop/Limit amended: 9NRACEAN",
+      "details": {
+        "dealReference": "5ZUPR6XF526TYNV",
+        "actions": [
+          {
+            "actionType": "STOP_LIMIT_AMENDED",
+            "affectedDealId": "DIAAAAR9NRACEAN"
+          }
+        ],
+        "marketName": "Oil - Brent Crude ($1)",
+        "goodTillDate": null,
+        "currency": "USD",
+        "size": 0.05,
+        "direction": "BUY",
+        "level": 9925.9,
+        "stopLevel": 9934.74904,
+        "stopDistance": -8.84904,
+        "guaranteedStop": false,
+        "trailingStopDistance": null,
+        "trailingStep": null,
+        "limitLevel": null,
+        "limitDistance": null
+      }
+    },
+    {
+      "date": "2026-10-02T10:18:50",
+      "epic": "CC.D.LCO.BMU.IP",
+      "period": "-",
+      "dealId": "DIAAAAR9NSU7QAL",
+      "channel": "PUBLIC_WEB_API",
+      "type": "EDIT_STOP_AND_LIMIT",
+      "status": "ACCEPTED",
+      "description": "Stop/Limit amended: 9NRACEAN",
+      "details": {
+        "dealReference": "SAGVCP9B32JTYNV",
+        "actions": [
+          {
+            "actionType": "STOP_LIMIT_AMENDED",
+            "affectedDealId": "DIAAAAR9NRACEAN"
+          }
+        ],
+        "marketName": "Oil - Brent Crude ($1)",
+        "goodTillDate": null,
+        "currency": "USD",
+        "size": 0.05,
+        "direction": "BUY",
+        "level": 9925.9,
+        "stopLevel": 9934.74903,
+        "stopDistance": -8.84903,
+        "guaranteedStop": false,
+        "trailingStopDistance": null,
+        "trailingStep": null,
+        "limitLevel": null,
+        "limitDistance": null
+      }
+    },
+    {
+      "date": "2026-10-02T10:09:31",
+      "epic": "CC.D.LCO.BMU.IP",
+      "period": "-",
+      "dealId": "DIAAAAR9NRACEAN",
+      "channel": "PUBLIC_WEB_API",
+      "type": "POSITION",
+      "status": "ACCEPTED",
+      "description": "Position opened: 9NRACEAN",
+      "details": {
+        "dealReference": "3UTRBKFZNQATYNV",
+        "actions": [
+          {
+            "actionType": "POSITION_OPENED",
+            "affectedDealId": "DIAAAAR9NRACEAN"
+          }
+        ],
+        "marketName": "Oil - Brent Crude ($1)",
+        "goodTillDate": null,
+        "currency": "USD",
+        "size": 0.05,
+        "direction": "BUY",
+        "level": 9925.9,
+        "stopLevel": 9900.9,
+        "stopDistance": 25,
+        "guaranteedStop": false,
+        "trailingStopDistance": null,
+        "trailingStep": null,
+        "limitLevel": null,
+        "limitDistance": null
+      }
+    },
+    {
+      "date": "2026-10-02T10:01:18",
+      "epic": "CC.D.LCO.BMU.IP",
+      "period": "-",
+      "dealId": "DIAAAAR9NPSKMAH",
+      "channel": "SYSTEM",
+      "type": "POSITION",
+      "status": "ACCEPTED",
+      "description": "Position/s closed: 9NPGYTAY",
+      "details": {
+        "dealReference": null,
+        "actions": [
+          {
+            "actionType": "POSITION_CLOSED",
+            "affectedDealId": "DIAAAAR9NPGYTAY"
+          }
+        ],
+        "marketName": "Oil - Brent Crude ($1)",
+        "goodTillDate": null,
+        "currency": "USD",
+        "size": 0.02,
+        "direction": "BUY",
+        "level": 9888.1,
+        "stopLevel": 9887.35063,
+        "stopDistance": -3.14937,
+        "guaranteedStop": false,
+        "trailingStopDistance": null,
+        "trailingStep": null,
+        "limitLevel": null,
+        "limitDistance": null
+      }
+    },
+    {
+      "date": "2026-10-02T10:01:08",
+      "epic": "CC.D.LCO.BMU.IP",
+      "period": "-",
+      "dealId": "DIAAAAR9NN7N5BA",
+      "channel": "PUBLIC_WEB_API",
+      "type": "EDIT_STOP_AND_LIMIT",
+      "status": "ACCEPTED",
+      "description": "Stop/Limit amended: 9NPGYTAY",
+      "details": {
+        "dealReference": "SUDW8J5VGZWTYNV",
+        "actions": [
+          {
+            "actionType": "STOP_LIMIT_AMENDED",
+            "affectedDealId": "DIAAAAR9NPGYTAY"
+          }
+        ],
+        "marketName": "Oil - Brent Crude ($1)",
+        "goodTillDate": null,
+        "currency": "USD",
+        "size": 0.02,
+        "direction": "SELL",
+        "level": 9890.5,
+        "stopLevel": 9887.35063,
+        "stopDistance": -3.14937,
+        "guaranteedStop": false,
+        "trailingStopDistance": null,
+        "trailingStep": null,
+        "limitLevel": null,
+        "limitDistance": null
+      }
+    },
+    {
+      "date": "2026-10-02T09:58:42",
+      "epic": "CC.D.LCO.BMU.IP",
+      "period": "-",
+      "dealId": "DIAAAAR9NPGYTAY",
+      "channel": "PUBLIC_WEB_API",
+      "type": "POSITION",
+      "status": "ACCEPTED",
+      "description": "Position opened: 9NPGYTAY",
+      "details": {
+        "dealReference": "BXFWH2XT3FETYNV",
+        "actions": [
+          {
+            "actionType": "POSITION_OPENED",
+            "affectedDealId": "DIAAAAR9NPGYTAY"
+          }
+        ],
+        "marketName": "Oil - Brent Crude ($1)",
+        "goodTillDate": null,
+        "currency": "USD",
+        "size": 0.02,
+        "direction": "SELL",
+        "level": 9890.5,
+        "stopLevel": 9915.5,
+        "stopDistance": 25,
+        "guaranteedStop": false,
+        "trailingStopDistance": null,
+        "trailingStep": null,
+        "limitLevel": null,
+        "limitDistance": null
+      }
+    }
+  ],
+  "transactions": [
+    {
+      "date": "2026-10-02",
+      "dateUtc": "2026-10-02T10:27:39",
+      "openDateUtc": "2026-10-02T10:23:39",
+      "instrumentName": "Spot Silver ($1)",
+      "period": "-",
+      "profitAndLoss": "$-0.20",
+      "transactionType": "DEAL",
+      "reference": "9NU3QGAH",
+      "openLevel": "6085.4",
+      "closeLevel": "6095.4",
+      "size": "-0.02",
+      "currency": "$",
+      "cashTransaction": false
+    },
+    {
+      "date": "2026-10-02",
+      "dateUtc": "2026-10-02T10:20:19",
+      "openDateUtc": "2026-10-02T10:09:31",
+      "instrumentName": "Oil - Brent Crude ($1)",
+      "period": "-",
+      "profitAndLoss": "$0.43",
+      "transactionType": "DEAL",
+      "reference": "9NRJSMAH",
+      "openLevel": "9925.9",
+      "closeLevel": "9934.5",
+      "size": "+0.05",
+      "currency": "$",
+      "cashTransaction": false
+    },
+    {
+      "date": "2026-10-02",
+      "dateUtc": "2026-10-02T10:01:18",
+      "openDateUtc": "2026-10-02T09:58:42",
+      "instrumentName": "Oil - Brent Crude ($1)",
+      "period": "-",
+      "profitAndLoss": "$0.05",
+      "transactionType": "DEAL",
+      "reference": "9NPSKMAH",
+      "openLevel": "9890.5",
+      "closeLevel": "9888.1",
+      "size": "-0.02",
+      "currency": "$",
+      "cashTransaction": false
+    }
+  ]
+}

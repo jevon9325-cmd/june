@@ -6,4 +6,5 @@ june.env
 *.log
 .DS_Store
 .broker-evidence.sqlite3*
+.settlements.sqlite3*
 campaign_telemetry.sqlite3*

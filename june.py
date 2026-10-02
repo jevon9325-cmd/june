@@ -7887,6 +7887,74 @@ def _recon_iso(epoch_sec):
     import datetime as _dt
     return _dt.datetime.utcfromtimestamp(int(epoch_sec)).strftime("%Y-%m-%dT%H:%M:%S")
 
+def _live_settlement_registry():
+    from settlement_discovery import SettlementRegistry
+    account = _live_sess.get("account_id")
+    if not account:
+        raise RuntimeError("Settlement discovery requires an authenticated account")
+    return SettlementRegistry(
+        os.environ.get("JUNE_SETTLEMENT_PATH", os.path.join(os.path.dirname(__file__), ".settlements.sqlite3")),
+        account)
+
+
+def _live_settlement_view(redis):
+    from settlement_discovery import SettlementView
+    registry = _live_settlement_registry()
+    # Preserve Redis-unavailable fail-safe. Empty history is a valid cache.
+    cached = redis.lrange(_LIVE_TRADE_HIST_KEY, 0, -1) or []
+    records = []
+    for raw in cached:
+        try:
+            rec = json.loads(raw)
+            if isinstance(rec, dict):
+                records.append(rec)
+        except (ValueError, TypeError):
+            continue
+    for rec in _live.get("trade_history", []) or []:
+        opening = rec.get("broker_entry_evidence") or {}
+        proofs = opening.get("account_evidence") or {}
+        if (opening.get("account_id") == registry.account
+                and all((proofs.get(k) or {}).get("verified") is True
+                        and (proofs.get(k) or {}).get("account_id") == registry.account
+                        for k in ("order", "confirmation"))):
+            records.append(rec)
+    # At bootstrap prefer retained terminal copies over stale provisional
+    # duplicates. Once registered, the compact record owns subsequent updates.
+    records.sort(key=lambda rec: (rec.get("settlement_state") != "CONFIRMED",
+                                  not bool(rec.get("perf_fed"))))
+    for rec in records:
+        try:
+            registry.put(rec, imported=True)
+        except (ValueError, TypeError):
+            continue
+    try:
+        registry.import_evidence(_live_evidence_capture().path)
+    except Exception as exc:
+        _live_log(f"[SETTLEMENT] legacy evidence import pending: {type(exc).__name__}")
+    return SettlementView(registry, redis, _LIVE_TRADE_HIST_KEY)
+
+
+def _live_persist_settlement(record):
+    # Accounting I/O must not gate protective exits. The existing local journal
+    # replays settlement_created if the independent compact registry write fails.
+    try:
+        _live_evidence_capture().capture(
+            record, "settlement_created", session_account=_live_sess.get("account_id"),
+            current_role="primary", details={"settlement": record})
+    except Exception as exc:
+        _live_log(f"[SETTLEMENT] evidence capture pending: {type(exc).__name__}")
+    try:
+        _live_settlement_registry().put(record)
+    except Exception as exc:
+        _live_log(f"[SETTLEMENT] durable discovery pending: {type(exc).__name__}")
+
+
+def _live_commit_performance(redis, key, previous, stats, observation_id):
+    from settlement_discovery import commit_performance_once
+    return commit_performance_once(_live_settlement_registry(), redis, key,
+                                   previous, stats, observation_id)
+
+
 def _live_reconcile_provisional_settlements() -> None:
     """B4CA3/B4CA31: promote eligible PROVISIONAL/UNKNOWN primary settlements to
     CONFIRMED using authoritative IG broker evidence. Read-only to the broker;
@@ -7905,9 +7973,12 @@ def _live_reconcile_provisional_settlements() -> None:
     now = time.time()
     try:
         _rh = _redis()
+        _view_fn = globals().get("_live_settlement_view")
+        if _view_fn is not None:
+            _rh = _view_fn(_rh)
         raw_list = _rh.lrange(_LIVE_TRADE_HIST_KEY, 0, -1) or []
     except Exception as exc:
-        _live_log(f"[RECON] durable history unavailable: {exc}")
+        _live_log(f"[RECON] settlement discovery unavailable: {exc}")
         return
 
     from exit_authority import learning_eligible, contract, refresh_confirmed_authorities
@@ -7924,7 +7995,7 @@ def _live_reconcile_provisional_settlements() -> None:
             continue
         _rec_class = (_record_class_fn(rec) if _record_class_fn is not None
                       else rec.get("evidence_class"))
-        if (learning_eligible(rec)
+        if (learning_eligible(rec) and not rec.get("discovery_learning_quarantined")
                 and _rec_class == "BROKER_CONFIRMED_LIVE"
                 and rec.get("settlement_state") == "CONFIRMED"
                 and rec.get("reconciled")
@@ -8075,7 +8146,7 @@ def _live_reconcile_provisional_settlements() -> None:
         _cur["recon_tx_count"]      = _n_tx
         _cur["reconciled_at"]     = int(now)
         _cur["recon_schema"]      = _RECON_SCHEMA_VERSION
-        _cur["perf_fed"]          = False   # will be fed just below; replayed if we crash first
+        _cur["perf_fed"]          = bool(_cur.get("discovery_learning_quarantined"))
         try:
             _rh.lset(_LIVE_TRADE_HIST_KEY, idx, json.dumps(_cur))
         except Exception as exc:
@@ -8083,7 +8154,7 @@ def _live_reconcile_provisional_settlements() -> None:
             continue
         # Feed adaptive consumer exactly once; mark perf_fed durably.
         try:
-            if learning_eligible(_cur):
+            if learning_eligible(_cur) and not _cur.get("discovery_learning_quarantined"):
                 _live_perf_record(
                     sym, _pnl > 0, None, pnl_dollar=_pnl,
                     campaign_id=_cur.get("campaign_id"), deal_id=deal_id,
@@ -8125,6 +8196,9 @@ def _live_refresh_trade_history_snapshot() -> None:
         return
     try:
         _rh = _redis()
+        _view_fn = globals().get("_live_settlement_view")
+        if _view_fn is not None:
+            _rh = _view_fn(_rh)
         raw_list = _rh.lrange(_LIVE_TRADE_HIST_KEY, 0, -1) or []
     except Exception:
         return
@@ -8166,6 +8240,9 @@ def _live_refresh_trade_history_snapshot() -> None:
         row["settlement_identity"] = match.get("settlement_identity") or row.get("settlement_identity")
         row["recon_evidence_path"] = match.get("recon_evidence_path", row.get("recon_evidence_path"))
         row["recon_tx_count"]      = match.get("recon_tx_count", row.get("recon_tx_count"))
+        from exit_authority import contract
+        row.update(contract(match))
+        row["perf_fed"] = match.get("perf_fed", False)
         row["snapshot_refreshed_from_durable"] = True
         changed = True
     if changed:
@@ -8946,7 +9023,8 @@ def _live_perf_record(sym: str, won: bool, sar, pnl_dollar: float = 0.0,
             trades = trades[-keep:]
         stats["trades"] = trades
         from exit_authority import commit_performance
-        if not commit_performance(r, key, raw, stats, _observation_id):
+        _commit_fn = globals().get("_live_commit_performance", commit_performance)
+        if not _commit_fn(r, key, raw, stats, _observation_id):
             return
 
         # ── Recency filter ─────────────────────────────────────────────────────────────────────────
@@ -9723,6 +9801,13 @@ def _live_already_settled(pos: dict) -> bool:
     # the durable Redis history for this deal_id as a second idempotency source.
     did = (pos or {}).get("deal_id") or ""
     if did:
+        _registry_fn = globals().get("_live_settlement_registry")
+        if _registry_fn is not None:
+            try:
+                if _registry_fn().get(f"deal:{did}") is not None:
+                    return True
+            except Exception as exc:
+                _live_log(f"[SETTLEMENT] identity lookup pending: {type(exc).__name__}")
         try:
             _rh = _redis()
             for _raw in _rh.lrange(_LIVE_TRADE_HIST_KEY, 0, 200):
@@ -9841,7 +9926,10 @@ def _live_settle_primary_exit(pos: dict, exit_reason: str, source: str,
         _b1_record = globals().get("_live_b1_record_failure")
         if _b1_record is not None:
             _b1_record(pos, rec, source)
-    # Append to live history + durable Redis list exactly once.
+    _persist_fn = globals().get("_live_persist_settlement")
+    if _persist_fn is not None:
+        _persist_fn(rec)
+    # Append to live history + Redis snapshot exactly once.
     hist = _live.setdefault("trade_history", [])
     hist.append(rec)
     if len(hist) > 50:
@@ -10107,6 +10195,9 @@ def _live_close_position(exit_reason: str, signals: dict) -> None:
         trade_rec["max_favorable_excursion_r"] = pos.get("max_favorable_excursion_r", 0.0)
         trade_rec["max_adverse_excursion_pct"] = pos.get("max_adverse_excursion_pct", 0.0)
         trade_rec["max_adverse_excursion_r"] = pos.get("max_adverse_excursion_r", 0.0)
+        _persist_fn = globals().get("_live_persist_settlement")
+        if _persist_fn is not None:
+            _persist_fn(trade_rec)
         if exit_reason == "stop_loss":
             _b1_record = globals().get("_live_b1_record_failure")
             if _b1_record is not None:
