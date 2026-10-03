@@ -7,6 +7,7 @@ import hashlib
 import json
 import math
 import sqlite3
+import os
 from pathlib import Path
 from winner_protection import effective
 
@@ -40,7 +41,8 @@ FIELDS = ("deal_id", "deal_ref", "instrument", "direction", "fill_price", "ig_si
           "defensive_stop_level", "defensive_soft_sl", "defensive_stop_active", "stop_sync", "leg_index",
           "exit_authority", "exit_authority_schema", "exit_authority_evidence",
           "exit_authority_conflict", "operator_intervention", "strategy_learning_eligible",
-          "accounting_eligible", "exit_authority_legs", "close_intents")
+          "accounting_eligible", "exit_authority_legs", "close_intents",
+          "leg_generation", "primary_deal_id", "parent_deal_id", "allocation_confirmation")
 
 
 class Store:
@@ -78,9 +80,13 @@ class Store:
             CREATE TABLE IF NOT EXISTS path(
                 id TEXT PRIMARY KEY, campaign TEXT REFERENCES campaigns(id) ON DELETE CASCADE,
                 at REAL, payload TEXT);
+            CREATE TABLE IF NOT EXISTS compounding_events(
+                id TEXT PRIMARY KEY, campaign TEXT REFERENCES campaigns(id) ON DELETE CASCADE,
+                at REAL, kind TEXT, payload TEXT);
             CREATE INDEX IF NOT EXISTS event_campaign ON events(campaign,at);
             CREATE INDEX IF NOT EXISTS sample_campaign ON samples(campaign,at);
             CREATE INDEX IF NOT EXISTS path_campaign ON path(campaign,at);
+            CREATE INDEX IF NOT EXISTS compounding_campaign ON compounding_events(campaign,at);
         """)
 
     def prune(self, db, now):
@@ -89,6 +95,26 @@ class Store:
             db.execute(f"DELETE FROM {table} WHERE rowid IN (SELECT rowid FROM {table} ORDER BY at DESC,rowid DESC LIMIT -1 OFFSET ?)", (cap,))
         db.execute("DELETE FROM campaigns WHERE closed=1 AND updated < ?", (now - self.retention,))
         db.execute("DELETE FROM campaigns WHERE id IN (SELECT id FROM campaigns WHERE closed=1 ORDER BY updated DESC LIMIT -1 OFFSET ?)", (self.campaign_cap,))
+        # Critical chains cascade only with whole closed campaigns. Generic event
+        # caps never silently erase an active campaign's entry/request evidence.
+
+    @property
+    def coverage_path(self):
+        return Path(self.path + ".coverage.json")
+
+    def note_gap(self, *, now, event, error=None):
+        """Bounded persistent failure marker; absence of it is NOT certification."""
+        path = self.coverage_path
+        data = json.loads(path.read_text(encoding="utf-8")) if path.exists() else dict(schema_version=1, gap_count=0)
+        if error is not None:
+            data.update(gap_count=data.get("gap_count", 0)+1, last_gap_at=now,
+                        last_event=str(event)[:80], error_type=type(error).__name__)
+        if path.exists() and error is None:
+            return
+        temporary=Path(str(path)+".tmp")
+        with temporary.open("w", encoding="utf-8") as output:
+            json.dump(data, output);output.flush();os.fsync(output.fileno())
+        os.replace(temporary,path)
 
     def observe(self, state, signals, *, account, now, unit, event="sample", position=None, details=None, cadence=None):
         # Materialize a private whitelisted snapshot, never retain live dict references.
@@ -104,11 +130,14 @@ class Store:
                            if legs else None)
         account_basis = "retained_opening_account_evidence" if opening_account else "current_session_only"
         account = opening_account or account
-        legs = json.loads(json.dumps([{k: p[k] for k in FIELDS if k in p} for p in legs]))
+        from compounding_observation import entry_receipt
+        legs = json.loads(json.dumps([dict({k: p[k] for k in FIELDS if k in p},
+                                          entry_confirmation=entry_receipt(p)) for p in legs]))
         account_key = account or "account_unavailable"
         details = dict(details or {})
         db = self.connect()
         try:
+            self.note_gap(now=now, event=event)
             with db:
                 if late_outcome:
                     from exit_authority import contract, learning_eligible, identity as evidence_identity
@@ -283,6 +312,25 @@ class Store:
                                economics_basis="June_estimates_not_broker_certified_net",
                                elapsed_since_sample=now-data["last_sample_at"] if "last_sample_at" in data else None,
                                return_value=ret, event_details=details)
+                from compounding_observation import decision_view, protection_values
+                for item in economics:
+                    addon = item.get("deal_id") != data["primary_deal_id"]
+                    item.setdefault("leg_generation", 1 if addon else 0)
+                    item.setdefault("primary_deal_id", data["primary_deal_id"])
+                    # Rolling parent provenance is retained from the confirmed harvest.
+                    harvest = state.get("rolling_realized_harvest") or {}
+                    item.setdefault("parent_deal_id", harvest.get("deal_id") if item["leg_generation"] == 2
+                                    else data["primary_deal_id"] if addon else None)
+                payload.update(schema_version=2, broker_protection=protection_values(economics, unit),
+                    decision_evidence=decision_view(details) if event == "pyramid_decision" else None,
+                    account_equity_cached=number(state.get("balance_total")),
+                    account_equity_observed_at=state.get("balance_fetched_at"),
+                    capacity_evidence=details.get("allocation"),
+                    signal_observation={k:signals.get(data["instrument"],{}).get(k) for k in
+                        ("price","spread_pct","direction","change_5m","change_15m","spread_atr_ratio")},
+                    rolling_state={k:state.get(k) for k in ("rolling_campaign_id", "rolling_capacity_slot",
+                        "rolling_generation_state", "rolling_realized_harvest", "rolling_fuel_reservation",
+                        "rolling_bootstrap_liq_before", "rolling_profit_deployed", "rolling_replacement_eval")})
                 data["maximum_campaign_exposure"] = max(data.get("maximum_campaign_exposure", 0.), current_exposure, exposure)
                 if event == "sample":
                     data["last_sample_at"] = now
@@ -314,6 +362,8 @@ class Store:
                     # Repeated sync/partial requests deduplicate by meaningful state.
                     token = json.dumps([event_leg, details.get("attempt"), details.get("reason"),
                                         [(l.get("ig_size"), l.get("dple_effective_sl"), l.get("intended_stop_level")) for l in legs]], sort_keys=True)
+                    if event.startswith("protection_"):
+                        token = json.dumps([event_leg, details], sort_keys=True)
                     if event in ("entry", "addon_opened", "addon_accepted", "dple_m1", "dple_m2", "mpd_activation"):
                         token = event_leg
                     self.event(db, cid, now, event, payload, token)
@@ -459,6 +509,9 @@ class Store:
     def event(db, cid, now, kind, payload, token):
         key = hashlib.sha256(json.dumps([cid, kind, token], sort_keys=True).encode()).hexdigest()
         db.execute("INSERT OR IGNORE INTO events VALUES(?,?,?,?,?)", (key, cid, now, kind, json.dumps(payload)))
+        from compounding_observation import critical
+        if critical(kind):
+            db.execute("INSERT OR IGNORE INTO compounding_events VALUES(?,?,?,?,?)", (key, cid, now, kind, json.dumps(payload)))
 
     @staticmethod
     def extreme(data, name, value, now, minimum=False):

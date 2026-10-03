@@ -48,7 +48,16 @@ def covers(direction, candidate, target):
     return strongest(direction, c, t) == c
 
 
-def reconcile_broker_stop(position, broker_stop_level, broker_deal_id, *, now, log=None):
+def emit(observe, kind, **details):
+    """Observation failure must never change protection/exit authority."""
+    if observe is not None:
+        try:
+            observe(kind, details)
+        except Exception:
+            pass
+
+
+def reconcile_broker_stop(position, broker_stop_level, broker_deal_id, *, now, log=None, observe=None):
     """Acknowledge a pending stop request from an authoritative broker POSITION
     snapshot when the broker already carries the requested-or-stronger stop on
     the SAME open deal. Fail-closed broker truth: this consumes evidence the
@@ -71,6 +80,7 @@ def reconcile_broker_stop(position, broker_stop_level, broker_deal_id, *, now, l
         return False
     deal_id = position.get("deal_id")
     if not deal_id or broker_deal_id != deal_id:
+        emit(observe, "protection_snapshot_unmatched", broker_deal_id=broker_deal_id)
         return False
     broker = level(broker_stop_level)
     if broker is None:
@@ -81,6 +91,8 @@ def reconcile_broker_stop(position, broker_stop_level, broker_deal_id, *, now, l
         return False
     # The broker must actually hold the requested-or-stronger protection.
     if not covers(direction, broker, target):
+        emit(observe, "protection_snapshot_weaker", broker_deal_id=broker_deal_id,
+             broker_stop_level=broker, intended_stop=target, protection_status="UNKNOWN_OUTCOME")
         return False
     # Acknowledged floor = strongest broker-supported evidence (existing ack or
     # the broker-reported stop). Never certify the software/intended floor.
@@ -95,6 +107,9 @@ def reconcile_broker_stop(position, broker_stop_level, broker_deal_id, *, now, l
     record["acknowledged_stop_level"] = new_ack
     record["acknowledged_at"] = now
     position["stop_sync"] = record
+    emit(observe, "protection_snapshot_acknowledged", broker_deal_id=deal_id,
+         broker_stop_level=broker, acknowledged_stop=new_ack,
+         protection_status="BROKER_SNAPSHOT_CONFIRMED", source="IG.position.stopLevel")
     if log is not None:
         log(f"Stop sync acknowledged via broker position snapshot: "
             f"deal={deal_id} broker_stop={new_ack}")
@@ -137,7 +152,14 @@ def campaign_stop(old_legs, new_leg, proposed, aggregate=None):
     return strongest(direction, proposed, preserve, effective(new_leg), *floors)
 
 
-def protect(position, proposed, *, put, confirm, save, now, log, can_send=True):
+def normalized_target(position, proposed):
+    target = strongest(position["direction"], proposed, effective(position))
+    if target is None:
+        return None
+    return (math.ceil(target * 100000) if position["direction"] == "long" else math.floor(target * 100000)) / 100000
+
+
+def protect(position, proposed, *, put, confirm, save, now, log, can_send=True, observe=None):
     """Keep software floor even on rejection, timeout, stale or unknown reply.
 
     HTTP success/dealReference alone is NOT a stop acknowledgement. Only a
@@ -145,17 +167,21 @@ def protect(position, proposed, *, put, confirm, save, now, log, can_send=True):
     Legacy defensive_stop_level is a software floor; it is never promoted to ack.
     """
     direction = position["direction"]
-    target = strongest(direction, proposed, effective(position))
+    target = normalized_target(position, proposed)
     if target is None:
         return False
     # Round towards protection, never away from it.
-    target = (math.ceil(target * 100000) if direction == "long" else math.floor(target * 100000)) / 100000
+    emit(observe, "protection_intent", proposed_stop=proposed,
+         normalized_requested_stop=target, can_send=can_send,
+         protection_status="NOT_REQUESTED")
     position["intended_stop_level"] = target
     position["defensive_soft_sl"] = target
     position["defensive_stop_level"] = target
     position["defensive_stop_active"] = True
     ack = strongest(direction, position.get("acknowledged_stop_level"), position.get("broker_stop_level"))
     if ack is not None and strongest(direction, ack, target) == ack:
+        emit(observe, "protection_already_acknowledged", acknowledged_stop=ack,
+             protection_status="BROKER_ACKNOWLEDGED", source="retained_broker_evidence")
         return True
     pending = position.get("stop_sync") or {}
     if pending.get("attempted_at") == now:
@@ -164,6 +190,8 @@ def protect(position, proposed, *, put, confirm, save, now, log, can_send=True):
     position["stop_sync"] = record
     try:
         if not can_send or not record["deal_id"]:
+            emit(observe, "protection_not_submitted", normalized_requested_stop=target,
+                 protection_status="NOT_REQUESTED", reason="caller_distance_or_authority_guard")
             save()
             return False
         record["status"] = "pending"
@@ -172,12 +200,19 @@ def protect(position, proposed, *, put, confirm, save, now, log, can_send=True):
         # an idempotent request for this same or stronger absolute stop.
         ref = pending.get("deal_ref") if pending.get("target") == target and pending.get("status") == "pending" else None
         if not ref:
+            emit(observe, "protection_request", normalized_requested_stop=target,
+                 deal_id=record["deal_id"], request_at=now,
+                 protection_status="BROKER_REQUEST_PENDING")
             response = put(f"/positions/otc/{record['deal_id']}",
                            {"stopLevel": target, "guaranteedStop": False}, version="2")
             ref = response.get("dealReference") if isinstance(response, dict) else None
         record["deal_ref"] = ref
+        emit(observe, "protection_request_response", deal_reference=ref,
+             protection_status="BROKER_REQUEST_PENDING" if ref else "UNKNOWN_OUTCOME")
         save()
         reply = confirm(ref) if ref else None
+        emit(observe, "protection_confirmation", deal_reference=ref,
+             confirmation=reply, source="IG.confirms", protection_status="UNKNOWN_OUTCOME")
         # Identity: the confirm reply must echo our deal reference AND concern
         # our position deal. IG returns the amendment's own dealId at top level
         # and the amended position in affectedDeals[].dealId, so accept either.
@@ -202,4 +237,10 @@ def protect(position, proposed, *, put, confirm, save, now, log, can_send=True):
             save()
         except Exception:
             pass
+    emit(observe, "protection_result", normalized_requested_stop=target,
+         acknowledged_stop=position.get("acknowledged_stop_level"),
+         deal_reference=record.get("deal_ref"), stop_sync=dict(record),
+         protection_status=("BROKER_ACKNOWLEDGED" if record["status"] == "acknowledged" else
+                            "BROKER_REJECTED" if record["status"] == "rejected" else
+                            "BROKER_REQUEST_PENDING" if record.get("deal_ref") else "UNKNOWN_OUTCOME"))
     return record["status"] == "acknowledged"

@@ -1,0 +1,180 @@
+{
+  "provenance": "Actual retained Friday NATGAS primary/addon, independent broker-matched cache. Instrumentation sequence is equivalent offline playback, not new broker acceptance or historical missing-event certification.",
+  "primary_opening": {
+    "affectedDeals": [
+      {
+        "dealId": "DIAAAAR9Q9AB5AT",
+        "status": "OPENED"
+      }
+    ],
+    "date": "2026-10-02T14:19:33.517",
+    "dealId": "DIAAAAR9Q9AB5AT",
+    "dealReference": "SQDX9XXC7CATYNV",
+    "dealStatus": "ACCEPTED",
+    "direction": "BUY",
+    "epic": "CC.D.NG.BMU.IP",
+    "expiry": "-",
+    "guaranteedStop": false,
+    "level": 3049.0,
+    "limitDistance": null,
+    "limitLevel": null,
+    "profit": null,
+    "profitCurrency": null,
+    "reason": "SUCCESS",
+    "size": 0.1,
+    "status": "OPEN",
+    "stopDistance": null,
+    "stopLevel": 3034.0,
+    "trailingStop": false
+  },
+  "addon_opening": {
+    "affectedDeals": [
+      {
+        "dealId": "DIAAAAR9RGFULA9",
+        "status": "OPENED"
+      }
+    ],
+    "date": "2026-10-02T14:37:44.752",
+    "dealId": "DIAAAAR9RGFULA9",
+    "dealReference": "L58HS6E9NSWTYNV",
+    "dealStatus": "ACCEPTED",
+    "direction": "BUY",
+    "epic": "CC.D.NG.BMU.IP",
+    "expiry": "-",
+    "guaranteedStop": false,
+    "level": 3074.0,
+    "limitDistance": null,
+    "limitLevel": null,
+    "profit": null,
+    "profitCurrency": null,
+    "reason": "SUCCESS",
+    "size": 0.01,
+    "status": "OPEN",
+    "stopDistance": null,
+    "stopLevel": 3059.0,
+    "trailingStop": false
+  },
+  "qualification": {
+    "at": 1790951344.88958,
+    "signal": {
+      "mid": 3059.5,
+      "spread_pct": 0.0981,
+      "bid": null,
+      "offer": null
+    },
+    "return": 0.002951562889471994
+  },
+  "approval": {
+    "decision": "approve",
+    "reason": "f50_protected_profit_finances_addon",
+    "attempt": 1790951864.0684524,
+    "primary_return": 0.007871316497212196,
+    "protection_state": "profit_protected",
+    "f50_protected_before": 0.649995,
+    "f50_expendable": 0.324997,
+    "f50_legal_ig": 0.01,
+    "f50_reason": "ok",
+    "f50_min_deal": 0.01,
+    "estimated_addon_stop_loss": 0.19,
+    "allocation": {
+      "legs": [
+        {
+          "deal_id": "DIAAAAR9Q9AB5AT",
+          "quantity": 0.05,
+          "actual_notional": 152.45000000000002,
+          "consumed_allocation": 38.65,
+          "reason": "allocation_released_confirmed_partial"
+        }
+      ],
+      "quantity": 0.05,
+      "actual_notional": 152.45000000000002,
+      "consumed_allocation": 38.65,
+      "remaining_allocation": 59.02200000000001,
+      "pending_reservation": 0.0,
+      "primary_rounding_overrun": 0.0,
+      "continuation_shield": 0.0,
+      "reason": "allocation_released_confirmed_partial"
+    },
+    "continuation_economics": {
+      "allowed": true,
+      "reason": "continuation_economics_pass",
+      "spread_native": 3.0007120000000214,
+      "spread_pct": 0.09760000000000069,
+      "baseline_spread_pct": 0.09854565583353288,
+      "spread_history_readings": 45,
+      "widening_limit_pct": 0.29563696750059865,
+      "stop_risk": 0.15,
+      "spread_cost": 0.030007120000000213,
+      "slippage_reserve": 0.04,
+      "commission_reserve": 0.0,
+      "incremental_reserve": 0.22000712000000022,
+      "protected_profit": 0.64999499999999,
+      "f50_budget": 0.324997499999995,
+      "protected_floor_after": 0.4299878799999898,
+      "quantity": 0.01,
+      "min_deal": 0.01
+    },
+    "broker_inventory_verified": true,
+    "proposed_quantity": 0.01,
+    "proposed_allocation": 7.68625,
+    "proposed_notional": 30.745,
+    "proposed_leverage": 4.0
+  },
+  "primary_transactions": [
+    {
+      "date": "2026-10-02",
+      "dateUtc": "2026-10-02T14:41:11",
+      "openDateUtc": "2026-10-02T14:19:33",
+      "instrumentName": "Natural Gas ($1)",
+      "period": "-",
+      "profitAndLoss": "$0.70",
+      "transactionType": "DEAL",
+      "reference": "9Q9PWRAH",
+      "openLevel": "3049",
+      "closeLevel": "3063",
+      "size": "+0.05",
+      "currency": "$",
+      "cashTransaction": false,
+      "_exact_quantity": 0.05,
+      "_quantity_basis": "accepted_close_activity"
+    },
+    {
+      "date": "2026-10-02",
+      "dateUtc": "2026-10-02T14:29:09",
+      "openDateUtc": "2026-10-02T14:19:33",
+      "instrumentName": "Natural Gas ($1)",
+      "period": "-",
+      "profitAndLoss": "$0.25",
+      "transactionType": "DEAL",
+      "reference": "9RC6FYAN",
+      "openLevel": "3049",
+      "closeLevel": "3054",
+      "size": "+0.05",
+      "currency": "$",
+      "cashTransaction": false,
+      "_exact_quantity": 0.05,
+      "_quantity_basis": "accepted_close_activity"
+    }
+  ],
+  "addon_transactions": [
+    {
+      "date": "2026-10-02",
+      "dateUtc": "2026-10-02T14:41:27",
+      "openDateUtc": "2026-10-02T14:37:44",
+      "instrumentName": "Natural Gas ($1)",
+      "period": "-",
+      "profitAndLoss": "$-0.13",
+      "transactionType": "DEAL",
+      "reference": "9RF9NCAD",
+      "openLevel": "3074",
+      "closeLevel": "3061",
+      "size": "+0.01",
+      "currency": "$",
+      "cashTransaction": false,
+      "_exact_quantity": 0.01,
+      "_quantity_basis": "accepted_close_activity"
+    }
+  ],
+  "original_primary_pnl": 0.95,
+  "original_addon_pnl": -0.13
+}

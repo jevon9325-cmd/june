@@ -302,10 +302,58 @@ def policy_nodes():
             for text in (baseline, current)]
 
 
+def exit_economic_policy(text):
+    """Allow only the foundation repair's local geometry and observation edits.
+
+    Stop targets, activation, quantities, exits and all other control flow must
+    remain structurally identical. Numeric geometry has separate regression tests.
+    """
+    class GeometryOnly(ast.NodeTransformer):
+        def visit_ImportFrom(self, node):
+            return None if node.module == 'protection_geometry' else node
+
+        def visit_Assign(self, node):
+            allowed={'_dple_dist_l','_dple_ig_min','_dple_min_l','_dple_geometry',
+                     '_mpd_dist_l','_mpd_ig_min','_mpd_min_l','_mpd_geometry'}
+            if len(node.targets)==1 and isinstance(node.targets[0],ast.Name) and node.targets[0].id in allowed:
+                return None
+            return self.generic_visit(node)
+
+        def visit_Expr(self, node):
+            if isinstance(node.value,ast.Call) and isinstance(node.value.func,ast.Name) and node.value.func.id in {'_live_observe','_live_log'}:
+                return None
+            return self.generic_visit(node)
+
+        def visit_If(self, node):
+            # Sole new conditional observer around already-authoritative LS closure.
+            if ast.dump(node.test)==ast.dump(ast.parse('globals().get("_live_observe")',mode='eval').body):
+                return None
+            old=ast.parse('_dple_dist_l >= _dple_min_l',mode='eval').body
+            new=ast.parse('_dple_geometry["can_send"]',mode='eval').body
+            if ast.dump(node.test) in {ast.dump(old),ast.dump(new)}:
+                node.test=ast.Name(id='LOCAL_GEOMETRY_ELIGIBLE',ctx=ast.Load())
+            return self.generic_visit(node)
+
+        def visit_Call(self, node):
+            if isinstance(node.func,ast.Name) and node.func.id=='_live_protect_stop' and len(node.args)==3:
+                old=ast.parse('_mpd_dist_l >= _mpd_min_l',mode='eval').body
+                new=ast.parse('_mpd_geometry["can_send"]',mode='eval').body
+                if ast.dump(node.args[2]) in {ast.dump(old),ast.dump(new)}:
+                    node.args[2]=ast.Name(id='LOCAL_GEOMETRY_ELIGIBLE',ctx=ast.Load())
+            return self.generic_visit(node)
+    node=next(n for n in ast.parse(text).body if isinstance(n,ast.FunctionDef) and n.name=='_live_check_exit')
+    return ast.dump(GeometryOnly().visit(node))
+
+
 # Structural comparison locks policy functions to the supplied production baseline.
 @pytest.mark.parametrize("name", ["_live_try_entry", "_live_check_exit", "_live_check_pyramid_exits",
     "_live_check_circuit_breaker", "_live_trade_guard", "_live_compute_stop_pts",
     "_live_tier_risk_pct", "_spread_atr_threshold", "_sim_get_tp", "_sim_get_dynamic_stop"])
 def test_excluded_policy_functions_unchanged(name):
+    if name == '_live_check_exit':
+        baseline=subprocess.check_output(['git','show','06b600f:june.py'],encoding='utf-8')
+        current=Path(__file__).with_name('june.py').read_text(encoding='utf-8')
+        assert exit_economic_policy(current)==exit_economic_policy(baseline)
+        return
     baseline, current = policy_nodes()
     assert current[name] == baseline[name]

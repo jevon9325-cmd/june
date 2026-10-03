@@ -931,7 +931,13 @@ def fetch_price(epic: str) -> Optional[dict]:
     offer = snap.get("offer")
 
     if snap.get("marketStatus") == "OFFLINE" and _live_available:
-        return _fetch_price_live_fallback(epic, snap)
+        _observed_quote = _fetch_price_live_fallback(epic, snap)
+        try:
+            from compounding_observation import remember_quote
+            remember_quote(epic, _observed_quote, "IG.live.minute_candle_fallback_scaled", snap)
+        except Exception:
+            pass
+        return _observed_quote
 
     # Demo is TRADEABLE -- use it as normal.
     # If this epic was previously in fallback, mark it as exited so the next
@@ -945,6 +951,12 @@ def fetch_price(epic: str) -> Optional[dict]:
         return None
     bid, offer = float(bid), float(offer)
     mid = (bid + offer) / 2.0
+    try:
+        from compounding_observation import remember_quote
+        remember_quote(epic, {"bid":bid,"offer":offer,"mid":mid,"spread":offer-bid},
+                       "IG.demo.markets.snapshot", snap)
+    except Exception:
+        pass
     return {"bid": bid, "offer": offer, "mid": mid, "spread": offer - bid}
 
 
@@ -7125,6 +7137,18 @@ def _live_observe(event, signals=None, position=None, details=None):
             from exit_authority import classify
             classify(position)
         details = {**contract(position or {}), **(details or {})}
+        from compounding_observation import quote_view
+        _obs_position = position or _live.get("open_position") or {}
+        _obs_sym = _obs_position.get("instrument")
+        details["observed_market_quote"] = quote_view(globals().get("INSTRUMENTS", {}).get(_obs_sym))
+        details["unit_metadata"] = {
+            "pip":globals().get("_live_pip_sizes", {}).get(_obs_sym),
+            "price_unit":globals().get("_live_price_unit", {}).get(_obs_sym),
+            "minimum_points":globals().get("_live_min_stop_pts", {}).get(_obs_sym),
+            "minimum_fraction":globals().get("_live_min_stop_pct", {}).get(_obs_sym),
+            "minimum_quantity":globals().get("_live_min_deal", {}).get(_obs_sym),
+            "margin_fraction":globals().get("_live_margin", {}).get(_obs_sym),
+        }
         default_store().observe(
             _live, signals if signals is not None else _current_cycle_signals_snap,
             account=_live_sess.get("account_id"), now=time.time(), unit=_live_campaign_unit,
@@ -7132,6 +7156,11 @@ def _live_observe(event, signals=None, position=None, details=None):
     except Exception as exc:
         import logging
         logging.warning("CAMPAIGN TELEMETRY GAP: %s; trading continues", type(exc).__name__)
+        try:
+            from campaign_telemetry import default_store
+            default_store().note_gap(now=time.time(), event=event, error=exc)
+        except Exception:
+            logging.warning("CAMPAIGN COVERAGE UNKNOWN: durable gap marker unavailable")
 
 
 def _live_record_path(signals=None) -> None:
@@ -7175,6 +7204,11 @@ def _live_record_path(signals=None) -> None:
     except Exception as exc:
         import logging
         logging.warning("CAMPAIGN PATH GAP: %s; trading continues", type(exc).__name__)
+        try:
+            from campaign_telemetry import default_store
+            default_store().note_gap(now=time.time(), event="path", error=exc)
+        except Exception:
+            logging.warning("CAMPAIGN COVERAGE UNKNOWN: durable gap marker unavailable")
 
 
 # ── Build 4C-B1: thesis-aware same-direction post-loss re-entry ──────────────
@@ -10638,8 +10672,13 @@ def _live_refresh_liq_before() -> None:
 
 def _live_protect_stop(position, proposed, can_send=True):
     from winner_protection import protect
+    observer = globals().get("_live_observe")
+    def observed(kind, evidence):
+        if observer is not None:
+            observer(kind, position=position, details=evidence)
     return protect(position, proposed, put=_ig_live_put, confirm=_live_confirm_deal,
-                   save=_live_save_state, now=time.time(), log=_live_log, can_send=can_send)
+                   save=_live_save_state, now=time.time(), log=_live_log, can_send=can_send,
+                   observe=observed)
 
 
 def _live_retry_stop_sync(signals):
@@ -10666,10 +10705,17 @@ def _live_retry_stop_sync(signals):
             # protect() will reuse existing deal_ref (no new PUT) and poll confirm()
             _live_protect_stop(position, target)
             continue
-        distance = mid - target if position["direction"] == "long" else target - mid
-        minimum = (_live_min_stop_pts.get(sym, 4) + 1) * _live_pip_sizes.get(sym, _LIVE_FX_PIP)
-        if distance >= minimum:
+        from protection_geometry import amendment_geometry
+        geometry = amendment_geometry(position, target, mid=mid,
+            pip=_live_pip_sizes.get(sym, _LIVE_FX_PIP), price_unit=_live_price_unit.get(sym, 1.),
+            min_points=_live_min_stop_pts.get(sym, 4),
+            min_fraction=globals().get("_live_min_stop_pct", {}).get(sym, 0.), include_spread=False)
+        _live_observe("protection_geometry", signals, position, {"source": "retry", **geometry})
+        if geometry["can_send"]:
             _live_protect_stop(position, target)
+        else:
+            _live_observe("protection_deferred", signals, position,
+                          {"source": "retry", "reason": "local_distance", "protection_status": "LOCALLY_TOO_CLOSE", **geometry})
 
 
 def _wc_readiness_observe(sym, pos, signals, ig_sz, min_deal) -> None:
@@ -10980,16 +11026,22 @@ def _live_partial_tp_exit(signals: dict) -> None:
             (dirn == 'short' and _ptp_stop_level < _ptp_cur_bk)
         )
         if _ptp_tighte:
-            _ptp_dist_l = abs(mid - _ptp_stop_level)
-            _ptp_ig_min = (_live_min_stop_pts.get(sym, 4) + 1) * _ptp_pip_l
-            _ptp_min_l  = max(_ptp_ig_min, (_ptp_spn_l / _ptp_pip_l + 1) * _ptp_pip_l)
+            from protection_geometry import amendment_geometry, status
+            _ptp_geometry = amendment_geometry(_live["open_position"], _ptp_stop_level,
+                mid=mid, pip=_ptp_pip_l, price_unit=_live_price_unit.get(sym, 1.),
+                min_points=_live_min_stop_pts.get(sym, 4), spread_native=_ptp_spn_l,
+                min_fraction=globals().get("_live_min_stop_pct", {}).get(sym, 0.))
+            _live_observe("protection_geometry", signals, _live["open_position"], {"source": "partial_TP", **_ptp_geometry})
             _ptp_synced = False
-            if _ptp_dist_l >= _ptp_min_l:
+            if _ptp_geometry["can_send"]:
                 _ptp_synced = _live_protect_stop(_live["open_position"], _ptp_stop_level)
+            else:
+                _live_observe("protection_deferred", signals, _live["open_position"],
+                              {"source": "partial_TP", "reason": "local_distance", "protection_status": "LOCALLY_TOO_CLOSE", **_ptp_geometry})
             _live_log(
                 f"🔒 [PARTIAL-TP SYNC] {sym}: broker stop -> breakeven "
                 f"stopLevel={_ptp_stop_level:.5f} | broker_sync={_ptp_synced}"
-                + (" (too close — polling-only)" if not _ptp_synced else "")
+                + f" | protection_status={status(_live['open_position'], locally_blocked=not _ptp_geometry['can_send'], geometry=_ptp_geometry)}"
             )
         _live_save_state()
     else:
@@ -11026,6 +11078,10 @@ def _live_check_exit(signals: dict, regime: str) -> None:
         )
         # B4CA2_WIRED: settle the LS-confirmed broker exit before reconcile clears it.
         _b4ca2_lspnl = _ls_confirmed_pnl(_ls_chk_id)
+        if globals().get("_live_observe"):
+            _live_observe("protection_position_gone", signals, pos,
+                          {"protection_status": "BROKER_POSITION_GONE", "source": "LS.FULLY_CLOSED",
+                           "broker_close_evidence": _b4ca2_lspnl})
         _live_settle_primary_exit(
             pos, "broker_ls_fully_closed", source="ls_fully_closed",
             confirmed_pnl=(_b4ca2_lspnl.get('profit') if _b4ca2_lspnl else None),
@@ -11153,16 +11209,22 @@ def _live_check_exit(signals: dict, regime: str) -> None:
                     (dirn == 'short' and _dple_sl_abs < _dple_cur_bk)
                 )
                 if _dple_tighte:
-                    _dple_dist_l = abs(mid - _dple_sl_abs)
-                    _dple_ig_min = (_live_min_stop_pts.get(sym, 4) + 1) * _dple_pip_l
-                    _dple_min_l  = max(_dple_ig_min, (_dple_spn_l / _dple_pip_l + 1) * _dple_pip_l)
+                    from protection_geometry import amendment_geometry, status
+                    _dple_geometry = amendment_geometry(pos, _dple_sl_abs,
+                        mid=mid, pip=_dple_pip_l, price_unit=_live_price_unit.get(sym, 1.),
+                        min_points=_live_min_stop_pts.get(sym, 4), spread_native=_dple_spn_l,
+                        min_fraction=globals().get("_live_min_stop_pct", {}).get(sym, 0.))
+                    _live_observe("protection_geometry", signals, pos, {"source": "DPLE", **_dple_geometry})
                     _dple_synced = False
-                    if _dple_dist_l >= _dple_min_l:
+                    if _dple_geometry["can_send"]:
                         _dple_synced = _live_protect_stop(pos, _dple_sl_abs)
+                    else:
+                        _live_observe("protection_deferred", signals, pos,
+                                      {"source": "DPLE", "reason": "local_distance", "protection_status": "LOCALLY_TOO_CLOSE", **_dple_geometry})
                     _live_log(
                         f"📈 [DPLE SYNC] {sym}: trail floor {_trail_sl_l*100:.3f}% "
                         f"-> stopLevel={_dple_sl_abs:.5f} | broker_sync={_dple_synced}"
-                        + (" (too close — polling-only)" if not _dple_synced else "")
+                        + f" | protection_status={status(pos, locally_blocked=not _dple_geometry['can_send'], geometry=_dple_geometry)}"
                     )
         elif pnl_pct >= 0.5 * _dple_tp_l and not pos.get('breakeven_locked'):
             _spread_buf_l = _sim_get_spread_floor(sym)
@@ -11218,16 +11280,19 @@ def _live_check_exit(signals: dict, regime: str) -> None:
             if _improve_l:
                 pos = _live["open_position"]
                 # Try broker-side stop update; fall back to software mirror if too close
-                _mpd_dist_l = abs(mid - _p_stop_l)
-                _mpd_ig_min = (_live_min_stop_pts.get(sym, 4) + 1) * _mpd_pip_l
-                _mpd_min_l  = max(_mpd_ig_min, (_mpd_spn_l / _mpd_pip_l + 1) * _mpd_pip_l)
+                from protection_geometry import amendment_geometry, status
+                _mpd_geometry = amendment_geometry(pos, _p_stop_l,
+                    mid=mid, pip=_mpd_pip_l, price_unit=_live_price_unit.get(sym, 1.),
+                    min_points=_live_min_stop_pts.get(sym, 4), spread_native=_mpd_spn_l,
+                    min_fraction=globals().get("_live_min_stop_pct", {}).get(sym, 0.))
+                _live_observe("protection_geometry", signals, pos, {"source": "MPD", **_mpd_geometry})
                 _mpd_synced = False
-                _mpd_synced = _live_protect_stop(pos, _p_stop_l, _mpd_dist_l >= _mpd_min_l)
+                _mpd_synced = _live_protect_stop(pos, _p_stop_l, _mpd_geometry["can_send"])
                 pos = _live["open_position"]
                 _live_log(
                     f"\U0001f6e1\ufe0f [PROFIT DEFENSE] {sym}: Micro-profit lock at "
                     f"{_p_stop_l:.5f} | friction {_mpd_fric_l:.5f} | "
-                    f"broker_sync={_mpd_synced}"
+                    f"broker_sync={_mpd_synced} | protection_status={status(pos, locally_blocked=not _mpd_geometry['can_send'], geometry=_mpd_geometry)}"
                 )
                 _live_save_state()
         if pos.get("defensive_stop_active"):
@@ -11665,15 +11730,25 @@ def _live_v1_submit_gen2_replacement(signals: dict, primary: dict) -> None:
     import rolling_fuel as _rf
     from rolling_build4a import b4a_v1_admit_gen2, b4a_build_ledgers, b4a_campaign_id, B4A_UNKNOWN
 
+    def _observe_gen2_defer(reason, **known):
+        from winner_protection import emit
+        observer = globals().get("_live_observe")
+        emit((lambda kind, evidence: observer(kind, signals, primary, evidence)) if observer else None,
+             "v1_gen2_gate", reason=reason, decision="DEFER", leg_generation=2,
+             downstream_gates="UNOBSERVED", **known)
+
     # Rollback switch — instant disable.
     if not _ROLLING_V1_ENABLED:
         _live_log("[V1] gen-2 disabled by _ROLLING_V1_ENABLED=False")
+        _observe_gen2_defer("v1_disabled")
         return
     if not _live_trade_guard():
         _live_log("[V1] gen-2 blocked: trade guard")
+        _observe_gen2_defer("trade_guard")
         return
     if not _june_live_trading_enabled:
         _live_log("[V1] gen-2 blocked: new-trade authority disabled")
+        _observe_gen2_defer("new_trade_authority_disabled")
         return
 
     sym  = primary.get("instrument", "")
@@ -11683,56 +11758,68 @@ def _live_v1_submit_gen2_replacement(signals: dict, primary: dict) -> None:
     if (_live.get("orphan_suspected") or _live.get("manual_review_required")
             or primary.get("partial_exit_pending") or _live.get("pyramid_entry_pending")):
         _live_log("[V1] gen-2 blocked: unresolved position/submission state")
+        _observe_gen2_defer("unresolved_position_or_submission")
         return
     # No existing gen-2 order/position (single active reservation in V1).
     if _rf.active_reservation(_live) is not None:
         _live_log("[V1] gen-2 blocked: reservation already active")
+        _observe_gen2_defer("reservation_already_active")
         return
     if any(l.get("leg_generation") == 2 for l in _live.get("pyramid_legs", [])):
         _live_log("[V1] gen-2 blocked: gen-2 leg already tracked")
+        _observe_gen2_defer("gen2_already_tracked")
         return
 
     # A SUBMITTED reservation needing reconciliation must be resolved first.
     if _rf.needs_broker_reconciliation(_live):
         _live_log("[V1] gen-2 blocked: prior submission awaiting broker reconciliation")
+        _observe_gen2_defer("submission_awaiting_reconciliation")
         return
 
     # Campaign identity must match the primary.
     campaign_id = _live.get("rolling_campaign_id")
     if not campaign_id or campaign_id != b4a_campaign_id(primary):
         _live_log("[V1] gen-2 blocked: campaign identity mismatch/absent")
+        _observe_gen2_defer("campaign_identity_mismatch")
         return
 
     # Momentum / performance / regime / market gates.
     if _live_perf_blocked(sym):
         _live_log("[V1] gen-2 blocked: performance block")
+        _observe_gen2_defer("performance_block")
         return
     if sym in _METALS_INSTRUMENTS and _is_metals_weekend_closure():
         _live_log("[V1] gen-2 blocked: market closed")
+        _observe_gen2_defer("market_closed")
         return
     if time.time() < _live.get("pause_expiry", {}).get(sym, 0):
         _live_log("[V1] gen-2 blocked: instrument pause")
+        _observe_gen2_defer("instrument_pause")
         return
     if primary.get("deal_id") and _ls_deal_closed(primary["deal_id"]):
         _live_log("[V1] gen-2 blocked: primary already closed")
+        _observe_gen2_defer("primary_closed")
         return
 
     sig = signals.get(sym, {})
     mid = sig.get("price", 0.0)
     if mid <= 0:
         _live_log("[V1] gen-2 blocked: no price")
+        _observe_gen2_defer("price_unavailable")
         return
 
     # 1x MINDEAL sizing from live geometry (fail closed if unavailable).
     min_deal = _live_min_deal.get(sym)
     if not min_deal or min_deal <= 0:
         _live_log("[V1] gen-2 blocked: MINDEAL geometry unavailable")
+        _observe_gen2_defer("mindeal_unavailable")
         return
     ig_size = round(min_deal * _ROLLING_V1_MAX_MULT, 4)
     try:
         unit = _live_campaign_unit(sym, mid)
     except Exception as exc:
         _live_log(f"[V1] gen-2 blocked: unit geometry unavailable: {exc}")
+        _observe_gen2_defer("unit_geometry_unavailable", error_type=type(exc).__name__)
         return
     notional = ig_size * unit
     margin_rate = _live_margin.get(sym, 0.0)
@@ -11742,6 +11829,7 @@ def _live_v1_submit_gen2_replacement(signals: dict, primary: dict) -> None:
     stop_pct = primary.get("stop_pct", 0.0)
     if not stop_pct or stop_pct <= 0:
         _live_log("[V1] gen-2 blocked: candidate stop_pct unavailable")
+        _observe_gen2_defer("candidate_stop_unavailable")
         return
     candidate_stop_risk = round(ig_size * unit * stop_pct, 8)
 
@@ -11751,6 +11839,7 @@ def _live_v1_submit_gen2_replacement(signals: dict, primary: dict) -> None:
     equity  = max(0.0, total - skimmed)
     if margin_req is not None and margin_req > 0.5 * equity:
         _live_log(f"[V1] gen-2 blocked: margin ${margin_req:.2f} > 50% equity ${equity:.2f}")
+        _observe_gen2_defer("margin_equity_gate", margin_req=margin_req, equity=equity)
         return
 
     # Pure self-funding admission (D1 must be 0).
@@ -11787,7 +11876,9 @@ def _live_v1_submit_gen2_replacement(signals: dict, primary: dict) -> None:
     )
     _live_observe("v1_gen2_admitted", signals, primary,
                   {**admit, "reservation_id": reservation_id, "ig_size": ig_size,
-                   "notional": notional, "margin_req": margin_req})
+                   "notional": notional, "margin_req": margin_req,
+                   "candidate_stop_risk": candidate_stop_risk, "equity": equity,
+                   "a_remaining": a_rem, "ledgers": ledgers, "r_primary": r_primary})
 
     # STEP: durable reservation BEFORE any broker call. Fail closed on persist failure.
     try:
@@ -11795,6 +11886,7 @@ def _live_v1_submit_gen2_replacement(signals: dict, primary: dict) -> None:
                     save=_live_save_state)
     except Exception as exc:
         _live_log(f"[V1] gen-2 aborted: fuel reservation failed (no order sent): {exc}")
+        _observe_gen2_defer("fuel_reservation_persist_failed", error_type=type(exc).__name__)
         return
 
     body = {
@@ -11815,6 +11907,7 @@ def _live_v1_submit_gen2_replacement(signals: dict, primary: dict) -> None:
         # Persist failed BEFORE the durable attempt marker and BEFORE any POST:
         # no order was sent, safe to release (reservation still RESERVED).
         _live_log(f"[V1] gen-2 aborted: pending-intent persist failed; releasing reservation: {exc}")
+        _observe_gen2_defer("pending_intent_persist_failed", error_type=type(exc).__name__)
         try:
             _rf.release(_live, reservation_id, "pending_intent_persist_failed", save=_live_save_state)
         except Exception:
@@ -11830,12 +11923,16 @@ def _live_v1_submit_gen2_replacement(signals: dict, primary: dict) -> None:
     except Exception as exc:
         # Could not durably record the attempt -> do NOT POST (no order sent yet).
         _live_log(f"[V1] gen-2 aborted: attempt-state persist failed; no order sent: {exc}")
+        _observe_gen2_defer("attempt_state_persist_failed", error_type=type(exc).__name__)
         try:
             _rf.release(_live, reservation_id, "attempt_state_persist_failed", save=_live_save_state)
         except Exception:
             pass
         _live.pop("pyramid_entry_pending", None)
         return
+    _live_observe("addon_submission", signals, primary,
+                  {"order": dict(body), "attempt": _live["pyramid_entry_pending"]["created_at"],
+                   "submission_stage": "about_to_call_broker", "decision": "SUBMIT"})
     resp = _ig_live_post("/positions/otc", body, version="1")
     if not resp:
         # POST returned nothing: broker outcome UNKNOWN and the order MAY exist.
@@ -11848,8 +11945,13 @@ def _live_v1_submit_gen2_replacement(signals: dict, primary: dict) -> None:
             pass
         _live_log("[V1] gen-2 POST returned no response -- outcome UNKNOWN, "
                   "reservation ATTEMPTED+ambiguous, fuel locked for reconciliation")
+        _observe_gen2_defer("post_outcome_unknown", reservation_id=reservation_id)
         return
     deal_ref = resp.get("dealReference", "")
+    _live_observe("addon_submission_response", signals, primary,
+                  {"deal_reference": deal_ref, "reservation_id": reservation_id,
+                   "leg_generation": 2, "source": "IG.positions.POST.response",
+                   "submission_status": "REFERENCE_RECEIVED" if deal_ref else "UNKNOWN_OUTCOME"})
     try:
         _rf.mark_submitted(_live, reservation_id, deal_ref, save=_live_save_state)
     except Exception as exc:
@@ -11857,6 +11959,10 @@ def _live_v1_submit_gen2_replacement(signals: dict, primary: dict) -> None:
         return
 
     confirm = _live_confirm_deal(deal_ref) if deal_ref else None
+    _live_observe("addon_confirmation", signals, primary,
+                  {"deal_reference": deal_ref, "confirmation": confirm,
+                   "leg_generation": 2, "reservation_id": reservation_id,
+                   "source": "IG.confirms", "decision": (confirm or {}).get("dealStatus", "UNKNOWN")})
     if not confirm:
         _live_log("[V1] gen-2 confirm UNKNOWN -- reservation stays SUBMITTED for reconciliation")
         return
@@ -11951,6 +12057,14 @@ def _live_settle_gen2_reservation(leg: dict, confirmed_exit_price=None,
             _rf.settle_loss(_live, rid, save=_live_save_state)
             _live_log(f"[V1] gen-2 reservation SETTLED loss (fuel consumed) "
                       f"(src={exit_price_source})")
+        from winner_protection import emit
+        observer = globals().get("_live_observe")
+        emit((lambda kind, evidence: observer(kind, position=leg, details=evidence)) if observer else None,
+             "v1_gen2_reservation_settled", reservation_id=rid,
+             realized_estimate=realized, exit_price_source=exit_price_source,
+             confirmed_exit_price=confirmed_exit_price,
+             reservation=dict(_live.get(_rf.RESERVATION_KEY) or {}),
+             non_redeployable=True, economic_basis="existing_rolling_estimate_not_broker_net")
     except Exception as _exc:
         import logging
         logging.warning("D-2 gen-2 settlement error (reservation retained): %s", _exc)
@@ -12604,6 +12718,11 @@ def _live_add_pyramid_leg(signals: dict, decision=None) -> None:
     decision.update(proposed_allocation=actual_notional / lev,
                     proposed_notional=actual_notional, proposed_leverage=lev,
                     proposed_quantity=ig_size)
+    # Observation only: do not replace the allocation/margin admission checks.
+    try:
+        decision["candidate_margin_estimate"] = actual_notional * _real_margin_fraction(sym, positive(_live_margin.get(sym)))
+    except Exception:
+        decision["candidate_margin_estimate"] = None
     if _f50_active:
         # ATR is context, not spendable capital. Use actual spread plus the
         # existing stop/slippage/commission reserves inside the unchanged F50.
@@ -12761,8 +12880,16 @@ def _live_add_pyramid_leg(signals: dict, decision=None) -> None:
         decision.update(decision="reject", reason="pending_intent_persistence_failed")
         _live_log(f"[PYRAMID] pending intent persistence failed; no order sent: {exc}")
         return
+    _live_observe("addon_submission", signals, primary,
+                  {"order": dict(body), "attempt": _live["pyramid_entry_pending"]["created_at"],
+                   "submission_stage": "about_to_call_broker", "decision": "SUBMIT"})
     resp = _ig_live_post("/positions/otc", body, version="1")
     decision["submission"] = "sent_outcome_pending"
+    _live_observe("addon_submission_response", signals, primary,
+                  {"attempt": _live["pyramid_entry_pending"]["created_at"],
+                   "deal_reference": (resp or {}).get("dealReference"),
+                   "source": "IG.positions.POST.response",
+                   "submission_status": "REFERENCE_RECEIVED" if (resp or {}).get("dealReference") else "UNKNOWN_OUTCOME"})
     if not resp:
         _live_log(f"[PYRAMID] {sym}: POST failed -- addon aborted")
         return
@@ -12771,6 +12898,10 @@ def _live_add_pyramid_leg(signals: dict, decision=None) -> None:
     _live["pyramid_entry_pending"]["deal_ref"] = deal_ref
     _live_save_state()
     confirm  = _live_confirm_deal(deal_ref) if deal_ref else None
+    _live_observe("addon_confirmation", signals, primary,
+                  {"attempt": deal_ref, "deal_reference": deal_ref, "confirmation": confirm,
+                   "submission_status": "ACCEPTED" if confirm and confirm.get("dealStatus") == "ACCEPTED"
+                       else "REJECTED" if confirm and confirm.get("dealStatus") == "REJECTED" else "UNKNOWN_OUTCOME"})
     if not confirm or confirm.get("dealStatus") != "ACCEPTED":
         decision["submission"] = "rejected" if confirm and confirm.get("dealStatus") == "REJECTED" else "unknown"
         _live_observe("addon_rejected" if confirm and confirm.get("dealStatus") == "REJECTED" else "addon_outcome_unknown",
@@ -12876,13 +13007,15 @@ def _live_add_pyramid_leg(signals: dict, decision=None) -> None:
     _live_save_state()
 
     # PUT aggregate stop to ALL open deals (primary + all addon legs including the new one)
-    _pip_sz       = _live_pip_sizes.get(sym, _LIVE_FX_PIP)
-    dist_to_agg   = abs(mid - agg_stop_level)
-    min_stop_dist = (_live_min_stop_pts.get(sym, 4) + 1) * _pip_sz
-    _correct_side = agg_stop_level < mid if dirn == "long" else agg_stop_level > mid
+    from protection_geometry import amendment_geometry
     for _protected_leg in [primary, *_live.get("pyramid_legs", [])]:
+        _agg_geometry = amendment_geometry(_protected_leg, agg_stop_level,
+            mid=mid, pip=_live_pip_sizes.get(sym, _LIVE_FX_PIP),
+            price_unit=_live_price_unit.get(sym, 1.), min_points=_live_min_stop_pts.get(sym, 4),
+            min_fraction=globals().get("_live_min_stop_pct", {}).get(sym, 0.), include_spread=False)
+        _live_observe("protection_geometry", signals, _protected_leg, {"source": "aggregate", **_agg_geometry})
         _live_protect_stop(_protected_leg, agg_stop_level,
-                           _correct_side and dist_to_agg >= min_stop_dist)
+                           _agg_geometry["can_send"])
 
     _live_log(
         f"✅ PYRAMID LEG {leg_index} OPENED: {sym} {ig_dir} @ {fill_price:.5f} "
@@ -13825,6 +13958,10 @@ def _live_reconcile_positions() -> None:
             classify(primary, [proof["activity"]] if proof.get("activity") else [])
             _live_capture_evidence(primary, "authoritative_broker_close", **proof,
                                    broker_positions_response=data)
+            if globals().get("_live_observe"):
+                _live_observe("protection_position_gone", position=primary,
+                              details={"protection_status": "BROKER_POSITION_GONE", "source": proof["source"],
+                                       "broker_close_evidence": proof})
             pnl = proof.get("pnl") or {}
             _live_settle_primary_exit(primary, "broker_side_disappearance",
                                      source=proof["source"], confirmed_pnl=pnl.get("profit"),
@@ -13880,7 +14017,9 @@ def _live_reconcile_positions() -> None:
                 if _broker_stop is not None and (leg.get("stop_sync") or {}).get("status") != "acknowledged":
                     from winner_protection import reconcile_broker_stop as _recon_stop
                     _recon_stop(leg, _broker_stop, matches[0].get("dealId"),
-                                now=time.time(), log=_live_log)
+                                now=time.time(), log=_live_log,
+                                observe=lambda kind, evidence, _leg=leg:
+                                    _live_observe(kind, position=_leg, details=evidence))
             except (KeyError, TypeError, ValueError):
                 pass  # Incomplete broker evidence -> leave acknowledgement unresolved.
     primary = _live.get("open_position")
