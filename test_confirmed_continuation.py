@@ -296,9 +296,10 @@ def test_nonprotected_ratio_gate_unchanged():
 # Cache parsing only; every invariant compares actual candidate and baseline ASTs.
 @lru_cache(maxsize=1)
 def policy_nodes():
+    from test_decision_ledger import WithoutObservation
     baseline = subprocess.check_output(["git", "show", "76951a7121c44ae6b35b7698c6bee2f62f5d581b:june.py"], encoding="utf-8")
     current = Path(__file__).with_name("june.py").read_text(encoding="utf-8")
-    return [{n.name: ast.dump(n) for n in ast.parse(text).body if isinstance(n, ast.FunctionDef)}
+    return [{n.name: ast.dump(n) for n in WithoutObservation().visit(ast.parse(text)).body if isinstance(n, ast.FunctionDef)}
             for text in (baseline, current)]
 
 

@@ -220,8 +220,9 @@ def test_private_quote_does_not_change_signal_contract():
 
 
 def test_strategy_freeze():
+    from test_decision_ledger import WithoutObservation
     before=subprocess.check_output(['git','show','06b600f:june.py'],cwd=ROOT,text=True,encoding='utf-8')
-    old=ast.parse(before);new=ast.parse((ROOT/'june.py').read_text(encoding='utf-8'))
+    old=ast.parse(before);new=WithoutObservation().visit(ast.parse((ROOT/'june.py').read_text(encoding='utf-8')))
     funcs=['_live_compute_ig_size','_live_compute_stop_pts','_live_try_entry','_live_open_position',
            '_live_tier_risk_pct','_live_check_circuit_breaker','_live_poll_balance','_live_close_position',
            'compute_signal','_live_fetch_market_data','_live_campaign_unit','_live_defensive_scaling_evidence',

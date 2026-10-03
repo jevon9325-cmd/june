@@ -700,7 +700,9 @@ def _live_trade_guard() -> bool:
     if not _june_live_trading_enabled:
         import logging
         logging.warning("🔒 live_trade_guard: june_live_enabled=false — order blocked")
+        globals().get("_decision_record", lambda *a, **k: None)('helper_snapshot', locals(), function='_live_trade_guard', source_line=703, input_names=())
         return False
+    globals().get("_decision_record", lambda *a, **k: None)('helper_snapshot', locals(), function='_live_trade_guard', source_line=704, input_names=())
     return True
 
 
@@ -3604,6 +3606,7 @@ def _sim_position_size(balance: float, approach: str, conviction: int = 5) -> fl
 
 
 def _sim_check_min_feasible(sym: str, pos_size: float, leverage: int) -> bool:
+    globals().get("_decision_record", lambda *a, **k: None)('helper_snapshot', locals(), function='_sim_check_min_feasible', source_line=3607, input_names=())
     return (pos_size * leverage) >= _sim_min_notional.get(sym, 0.0)
 
 
@@ -3621,12 +3624,15 @@ def _sim_is_eligible(sym: str, balance: float, leverage: int,
     """
     min_n = _sim_min_notional.get(sym)
     if min_n is None:
+        globals().get("_decision_record", lambda *a, **k: None)('helper_snapshot', locals(), function='_sim_is_eligible', source_line=3624, input_names=('_SIM_CONCENTRATION_CAP',))
         return False
     if margin_rate and 0 < margin_rate <= 1.0:
         # Margin-based: actual IG margin cost must fit within concentration cap.
         # GOLD example: $173.98 × 0.005 = $0.87 ≤ 0.20 × $48.49 = $9.70 → eligible
+        globals().get("_decision_record", lambda *a, **k: None)('helper_snapshot', locals(), function='_sim_is_eligible', source_line=3628, input_names=('_SIM_CONCENTRATION_CAP',))
         return (min_n * margin_rate) <= (_SIM_CONCENTRATION_CAP * balance)
     # Legacy: sim-leverage divisor (no margin data — conservative fallback)
+    globals().get("_decision_record", lambda *a, **k: None)('helper_snapshot', locals(), function='_sim_is_eligible', source_line=3630, input_names=('_SIM_CONCENTRATION_CAP',))
     return (min_n / leverage) <= (_SIM_CONCENTRATION_CAP * balance)
 
 
@@ -3689,6 +3695,7 @@ def _sim_conviction_gauge(
         )
     if grind_pts:
         import logging; logging.getLogger().debug(f"  grind_pts={grind_pts:+.3f} for {sym}/{direction}")
+    globals().get("_decision_record", lambda *a, **k: None)('score', locals())
     return _final_conv
 
 
@@ -3713,6 +3720,7 @@ def _sim_combo_wr_gate(sym: str, direction: str) -> tuple:
     outcomes = (_sim.get("combo_outcomes") or {}).get(combo, [])
     n        = len(outcomes)
     if n < _SIM_COMBO_CI_MIN_N:
+        globals().get("_decision_record", lambda *a, **k: None)('helper_snapshot', locals(), function='_sim_combo_wr_gate', source_line=3716, input_names=('K', '_BARBIE_COMBO_THRESH_MAX', '_BARBIE_COMBO_THRESH_MIN', '_SIM_COMBO_CI_ALPHA', '_SIM_COMBO_CI_MIN_N'))
         return False, 0, ""
 
     all_combos = _sim.get("combo_outcomes") or {}
@@ -3754,12 +3762,15 @@ def _sim_combo_wr_gate(sym: str, direction: str) -> tuple:
               f" brk={threshold:.0%}[{thresh_src}] K={K}")
 
     if ci_hi < threshold:
+        globals().get("_decision_record", lambda *a, **k: None)('helper_snapshot', locals(), function='_sim_combo_wr_gate', source_line=3757, input_names=('K', '_BARBIE_COMBO_THRESH_MAX', '_BARBIE_COMBO_THRESH_MIN', '_SIM_COMBO_CI_ALPHA', '_SIM_COMBO_CI_MIN_N'))
         return True, -1, (
             f"⏭️  Skip {sym} {direction.upper()}: "
             f"CI_hi={ci_hi:.0%} < breakeven {threshold:.0%} [{thresh_src}] | {note}"
         )
     if ci_lo > threshold:
+        globals().get("_decision_record", lambda *a, **k: None)('helper_snapshot', locals(), function='_sim_combo_wr_gate', source_line=3762, input_names=('K', '_BARBIE_COMBO_THRESH_MAX', '_BARBIE_COMBO_THRESH_MIN', '_SIM_COMBO_CI_ALPHA', '_SIM_COMBO_CI_MIN_N'))
         return False, 1, f"CI_lo={ci_lo:.0%} > breakeven {threshold:.0%} [{thresh_src}] | {note}"
+    globals().get("_decision_record", lambda *a, **k: None)('helper_snapshot', locals(), function='_sim_combo_wr_gate', source_line=3763, input_names=('K', '_BARBIE_COMBO_THRESH_MAX', '_BARBIE_COMBO_THRESH_MIN', '_SIM_COMBO_CI_ALPHA', '_SIM_COMBO_CI_MIN_N'))
     return False, 0, note
 
 
@@ -3778,6 +3789,7 @@ def _htf_combo_gate(sym: str, direction: str, htf_bias: str) -> tuple:
     outcomes   = all_combos.get(combo_key, [])
     n          = len(outcomes)
     if n < _HTF_COMBO_MIN_N:
+        globals().get("_decision_record", lambda *a, **k: None)('helper_snapshot', locals(), function='_htf_combo_gate', source_line=3781, input_names=('K', '_', '_HTF_COMBO_ALPHA', '_HTF_COMBO_CI_FLOOR', '_HTF_COMBO_MIN_N'))
         return "inconclusive", 0, f"N={n}<{_HTF_COMBO_MIN_N}"
     K = max(1, sum(1 for v in all_combos.values() if len(v) >= _HTF_COMBO_MIN_N))
     # Bonferroni-corrected z via rational approx of normal PPF (A&S 26.2.17, max err ~1e-3)
@@ -3793,9 +3805,12 @@ def _htf_combo_gate(sym: str, direction: str, htf_bias: str) -> tuple:
     ci_hi  = center + margin
     note   = f"N={n} WR={p:.0%} z={z:.2f} CI=[{ci_lo:.0%},{ci_hi:.0%}] K={K}"
     if ci_lo > _HTF_COMBO_CI_FLOOR:
+        globals().get("_decision_record", lambda *a, **k: None)('helper_snapshot', locals(), function='_htf_combo_gate', source_line=3796, input_names=('K', '_', '_HTF_COMBO_ALPHA', '_HTF_COMBO_CI_FLOOR', '_HTF_COMBO_MIN_N'))
         return "positive", 1, note
     if ci_hi < (1.0 - _HTF_COMBO_CI_FLOOR):
+        globals().get("_decision_record", lambda *a, **k: None)('helper_snapshot', locals(), function='_htf_combo_gate', source_line=3798, input_names=('K', '_', '_HTF_COMBO_ALPHA', '_HTF_COMBO_CI_FLOOR', '_HTF_COMBO_MIN_N'))
         return "negative", -1, note
+    globals().get("_decision_record", lambda *a, **k: None)('helper_snapshot', locals(), function='_htf_combo_gate', source_line=3799, input_names=('K', '_', '_HTF_COMBO_ALPHA', '_HTF_COMBO_CI_FLOOR', '_HTF_COMBO_MIN_N'))
     return "inconclusive", 0, note
 
 
@@ -3810,13 +3825,17 @@ def _htf_opposed_floor_gate(sym: str, direction: str, htf_bias: str, conv: int) 
     """
     floor = _HTF_OPPOSITION_FLOOR.get(sym)
     if floor is None:
+        globals().get("_decision_record", lambda *a, **k: None)('helper_snapshot', locals(), function='_htf_opposed_floor_gate', source_line=3813, input_names=('_HTF_OPPOSITION_FLOOR',))
         return False, ""
     opposed = ((direction == "long"  and htf_bias == "bear") or
                (direction == "short" and htf_bias == "bull"))
     if not opposed:
+        globals().get("_decision_record", lambda *a, **k: None)('helper_snapshot', locals(), function='_htf_opposed_floor_gate', source_line=3817, input_names=('_HTF_OPPOSITION_FLOOR',))
         return False, ""
     if conv >= floor:
+        globals().get("_decision_record", lambda *a, **k: None)('helper_snapshot', locals(), function='_htf_opposed_floor_gate', source_line=3819, input_names=('_HTF_OPPOSITION_FLOOR',))
         return False, f"HTF opposed ({htf_bias}) conv {conv}/10 \u2265 floor {floor} \u2014 passes"
+    globals().get("_decision_record", lambda *a, **k: None)('helper_snapshot', locals(), function='_htf_opposed_floor_gate', source_line=3820, input_names=('_HTF_OPPOSITION_FLOOR',))
     return True, f"HTF opposed ({htf_bias}) conv {conv}/10 < floor {floor}"
 
 
@@ -4112,6 +4131,7 @@ def _load_correlation_map() -> None:
     global _correlation_map
     try:
         raw = _redis().get("june_correlation_map")
+        globals().get("_decision_record", lambda *a, **k: None)('strategic_read', locals(), key='june_correlation_map', variable='raw', function='_load_correlation_map')
         if raw:
             _correlation_map = json.loads(raw)
             n_pairs = len(_correlation_map.get("pairs", {}))
@@ -4134,6 +4154,7 @@ def _load_barbie_overrides() -> None:
     global _barbie_overrides, _barbie_combo_thresholds
     try:
         raw = _redis().get("barbie_june_overrides")
+        globals().get("_decision_record", lambda *a, **k: None)('strategic_read', locals(), key='barbie_june_overrides', variable='raw', function='_load_barbie_overrides')
         if raw:
             _barbie_overrides = json.loads(raw)
             if _barbie_overrides:
@@ -4147,6 +4168,7 @@ def _load_barbie_overrides() -> None:
         _barbie_overrides = {}
     try:
         raw_ct = _redis().get(_BARBIE_COMBO_THRESH_KEY)
+        globals().get("_decision_record", lambda *a, **k: None)('strategic_read', locals(), key='barbie_june_combo_thresholds', variable='raw_ct', function='_load_barbie_overrides')
         if raw_ct:
             _barbie_combo_thresholds = json.loads(raw_ct)
             if _barbie_combo_thresholds:
@@ -4172,6 +4194,7 @@ def _load_claudia_corr_notes() -> None:
     global _claudia_corr_notes
     try:
         raw = _redis().get("claudia_correlation_notes")
+        globals().get("_decision_record", lambda *a, **k: None)('strategic_read', locals(), key='claudia_correlation_notes', variable='raw', function='_load_claudia_corr_notes')
         if raw:
             _claudia_corr_notes = json.loads(raw).get("notes", {})
             if _claudia_corr_notes:
@@ -4207,6 +4230,7 @@ def _load_claudia_directive_notes() -> None:
     global _claudia_directive_notes
     try:
         raw = _redis().get("session_directive")
+        globals().get("_decision_record", lambda *a, **k: None)('strategic_read', locals(), key='session_directive', variable='raw', function='_load_claudia_directive_notes')
         if not raw:
             _claudia_directive_notes = {}
             return
@@ -4367,6 +4391,7 @@ def _sim_forecast_pts(sym: str, direction: str) -> float:
         return 0.0
     try:
         raw = _redis().get(f"barbie_forecast:{sym}")
+        globals().get("_decision_record", lambda *a, **k: None)('strategic_read', locals(), key=f"barbie_forecast:{sym}", variable='raw', function='_sim_forecast_pts')
         if not raw:
             return 0.0
         data = json.loads(raw)
@@ -7426,6 +7451,7 @@ def _live_b1_reentry_allowed(sym: str, direction: str, current: dict) -> bool:
     combo = _sim_combo_key(sym, direction)
     failure = (_live.get(_B1_FAILURES_KEY) or {}).get(combo)
     if not failure:
+        globals().get("_decision_record", lambda *a, **k: None)('helper_snapshot', locals(), function='_live_b1_reentry_allowed', source_line=7429, input_names=('_B1_FAILURES_KEY', '_B1_FAILURE_HISTORY_KEY', '_B1_FAILURE_MAX_AGE_SECS', '_B1_REENTRY_LOGGED'))
         return True
     changed, unchanged = _live_b1_material_change(failure, current)
     age = max(0, time.time() - float(failure.get("failure_epoch", time.time())))
@@ -7446,6 +7472,7 @@ def _live_b1_reentry_allowed(sym: str, direction: str, current: dict) -> bool:
             f"thesis_id_new={current.get('thesis_key')}"
         )
         _live_save_state()
+        globals().get("_decision_record", lambda *a, **k: None)('helper_snapshot', locals(), function='_live_b1_reentry_allowed', source_line=7449, input_names=('_B1_FAILURES_KEY', '_B1_FAILURE_HISTORY_KEY', '_B1_FAILURE_MAX_AGE_SECS', '_B1_REENTRY_LOGGED'))
         return True
     log_key = (combo, failure.get("failure_id"), tuple(sorted(changed)), tuple(unchanged))
     if log_key not in _B1_REENTRY_LOGGED:
@@ -7456,6 +7483,7 @@ def _live_b1_reentry_allowed(sym: str, direction: str, current: dict) -> bool:
             f"changed={sorted(changed)} unchanged={unchanged} age={int(age)}s "
             f"reason=material evidence change required"
         )
+    globals().get("_decision_record", lambda *a, **k: None)('helper_snapshot', locals(), function='_live_b1_reentry_allowed', source_line=7459, input_names=('_B1_FAILURES_KEY', '_B1_FAILURE_HISTORY_KEY', '_B1_FAILURE_MAX_AGE_SECS', '_B1_REENTRY_LOGGED'))
     return False
 
 
@@ -8769,12 +8797,23 @@ def _live_instrument_capability(sym: str) -> tuple:
     """
     status = (_live_market_status or {}).get(sym)
     if status == "EDITS_ONLY":
+        globals().get("_decision_record", lambda *a, **k: None)('gate', locals(), function='_live_instrument_capability', source_line=8771, expression='status == "EDITS_ONLY"', input_names=('status',), gate_name='_live_instrument_capability:8771', result='FAIL')
+        globals().get("_decision_record", lambda *a, **k: None)('function_return', locals(), function='_live_instrument_capability', source_line=8772)
         return False, "market_edits_only"
+    globals().get("_decision_record", lambda *a, **k: None)('gate', locals(), function='_live_instrument_capability', source_line=8771, expression='status == "EDITS_ONLY"', input_names=('status',), gate_name='_live_instrument_capability:8771', result='PASS')
     if status in ("CLOSED", "OFFLINE", "SUSPENDED", "UNTRADEABLE"):
+        globals().get("_decision_record", lambda *a, **k: None)('gate', locals(), function='_live_instrument_capability', source_line=8773, expression='status in ("CLOSED", "OFFLINE", "SUSPENDED", "UNTRADEABLE")', input_names=('status',), gate_name='_live_instrument_capability:8773', result='FAIL')
+        globals().get("_decision_record", lambda *a, **k: None)('function_return', locals(), function='_live_instrument_capability', source_line=8774)
         return False, "market_temporarily_closed"
+    globals().get("_decision_record", lambda *a, **k: None)('gate', locals(), function='_live_instrument_capability', source_line=8773, expression='status in ("CLOSED", "OFFLINE", "SUSPENDED", "UNTRADEABLE")', input_names=('status',), gate_name='_live_instrument_capability:8773', result='PASS')
     if sym not in _live_margin or (_live_margin.get(sym) or 0.0) <= 0.0:
+        globals().get("_decision_record", lambda *a, **k: None)('branch', locals(), function='_live_instrument_capability', source_line=8775, expression='sym not in _live_margin or (_live_margin.get(sym) or 0.0) <= 0.0', input_names=('_live_margin', 'sym'))
         if sym not in _live_fx_instruments:
+            globals().get("_decision_record", lambda *a, **k: None)('gate', locals(), function='_live_instrument_capability', source_line=8776, expression='sym not in _live_fx_instruments', input_names=('_live_fx_instruments', 'sym'), gate_name='_live_instrument_capability:8776', result='FAIL')
+            globals().get("_decision_record", lambda *a, **k: None)('function_return', locals(), function='_live_instrument_capability', source_line=8777)
             return False, "missing_margin"
+        globals().get("_decision_record", lambda *a, **k: None)('gate', locals(), function='_live_instrument_capability', source_line=8776, expression='sym not in _live_fx_instruments', input_names=('_live_fx_instruments', 'sym'), gate_name='_live_instrument_capability:8776', result='PASS')
+    globals().get("_decision_record", lambda *a, **k: None)('function_return', locals(), function='_live_instrument_capability', source_line=8778)
     return True, None
 
 
@@ -8798,32 +8837,45 @@ def _live_is_eligible(sym: str) -> bool:
     """
     _cap_ok, _cap_reason = _live_instrument_capability(sym)
     if not _cap_ok:
+        globals().get("_decision_record", lambda *a, **k: None)('gate', locals(), function='_live_is_eligible', source_line=8800, expression='not _cap_ok', input_names=('_cap_ok',), gate_name='_live_is_eligible:8800', result='FAIL')
         _cap_key = (sym, _cap_reason)
         if _cap_key not in _live_capability_skip_logged:
+            globals().get("_decision_record", lambda *a, **k: None)('branch', locals(), function='_live_is_eligible', source_line=8802, expression='_cap_key not in _live_capability_skip_logged', input_names=('_cap_key', '_live_capability_skip_logged'))
             _live_capability_skip_logged.add(_cap_key)
             _live_log(f"INSTRUMENT_INELIGIBLE: symbol={sym} reason={_cap_reason}")
+        globals().get("_decision_record", lambda *a, **k: None)('function_return', locals(), function='_live_is_eligible', source_line=8805)
         return False
+    globals().get("_decision_record", lambda *a, **k: None)('gate', locals(), function='_live_is_eligible', source_line=8800, expression='not _cap_ok', input_names=('_cap_ok',), gate_name='_live_is_eligible:8800', result='PASS')
     total   = _live.get("balance_total", 0.0)
     skimmed = _live.get("skimmed_total", 0.0)
     bal     = max(0.0, total - skimmed)
     if bal <= 0:
+        globals().get("_decision_record", lambda *a, **k: None)('gate', locals(), function='_live_is_eligible', source_line=8809, expression='bal <= 0', input_names=('bal',), gate_name='_live_is_eligible:8809', result='FAIL')
+        globals().get("_decision_record", lambda *a, **k: None)('function_return', locals(), function='_live_is_eligible', source_line=8810)
         return False
+    globals().get("_decision_record", lambda *a, **k: None)('gate', locals(), function='_live_is_eligible', source_line=8809, expression='bal <= 0', input_names=('bal',), gate_name='_live_is_eligible:8809', result='PASS')
     if sym in _live_fx_instruments:
+        globals().get("_decision_record", lambda *a, **k: None)('gate', locals(), function='_live_is_eligible', source_line=8811, expression='sym in _live_fx_instruments', input_names=('_live_fx_instruments', 'sym'), gate_name='_live_is_eligible:8811', result='FAIL')
+        globals().get("_decision_record", lambda *a, **k: None)('function_return', locals(), function='_live_is_eligible', source_line=8812)
         return False  # FX structurally blocked: cheapest pair (AUDUSD) needs ~$4,800 balance;
+    globals().get("_decision_record", lambda *a, **k: None)('gate', locals(), function='_live_is_eligible', source_line=8811, expression='sym in _live_fx_instruments', input_names=('_live_fx_instruments', 'sym'), gate_name='_live_is_eligible:8811', result='PASS')
                     # current balance ~$22 (215× below). _KNOWN_MIN_NOTIONALS now uses correct
                     # FX formula — guard stays until balance reaches viable threshold.
     lev = int(_SIM_LEV_RANGES.get("sprout", (3, 10))[1])  # sim ceiling
     margin_rate = _live_margin.get(sym)
     if margin_rate and margin_rate > 0:
+        globals().get("_decision_record", lambda *a, **k: None)('branch', locals(), function='_live_is_eligible', source_line=8817, expression='margin_rate and margin_rate > 0', input_names=('margin_rate',))
         lev = _ig_margin_to_max_lev(margin_rate, lev)
     # Pass real margin_rate so _sim_is_eligible uses the margin-based check
     # when data is available (correct for GOLD, SILVER, equity CFDs etc).
+    globals().get("_decision_record", lambda *a, **k: None)('function_return', locals(), function='_live_is_eligible', source_line=8821)
     return _sim_is_eligible(sym, bal, lev, margin_rate=margin_rate or 0.0)
 
 
 def _live_is_paused(combo: str) -> bool:
     """Live-specific pause tracking — separate from sim's pause_expiry."""
     exp = (_live.get("pause_expiry") or {}).get(combo, 0.0)
+    globals().get("_decision_record", lambda *a, **k: None)('helper_snapshot', locals(), function='_live_is_paused', source_line=8827, input_names=())
     return time.time() < exp
 
 
@@ -8879,24 +8931,30 @@ def _live_perf_blocked(sym: str) -> bool:
     now = time.time()
     sub = _current_sub_session(sym)
     if now < _perf_block_cache.get(sym, 0.0):
+        globals().get("_decision_record", lambda *a, **k: None)('helper_snapshot', locals(), function='_live_perf_blocked', source_line=8882, input_names=())
         return True  # instrument-wide block cache (WR/legacy, or full-TTL from fire time)
     if now < _perf_block_cache.get(f"{sym}:{sub}", 0.0):
+        globals().get("_decision_record", lambda *a, **k: None)('helper_snapshot', locals(), function='_live_perf_blocked', source_line=8884, input_names=())
         return True  # sub-session SAR block cache — no Redis round-trip during block window
     try:
         r = _redis()
         # Instrument-wide blocks (WR, legacy) apply across all sub-sessions.
         if r.get(f"june_perf_block:{sym}") or r.get(f"june_perf_block_wr:{sym}"):
             _perf_block_cache[sym] = now + 300.0  # 5-min cache for instrument-wide blocks
+            globals().get("_decision_record", lambda *a, **k: None)('helper_snapshot', locals(), function='_live_perf_blocked', source_line=8890, input_names=())
             return True
         # SAR block is sub-session specific — a bad afternoon never blocks the next morning.
         if r.get(f"june_perf_block_sar:{sym}:{sub}"):
             _perf_block_cache[f"{sym}:{sub}"] = now + 300.0
+            globals().get("_decision_record", lambda *a, **k: None)('helper_snapshot', locals(), function='_live_perf_blocked', source_line=8894, input_names=())
             return True
     except Exception as exc:
         _live_log(f"⚠️ [PERF BLOCK] {sym}/{sub}: Redis error — treating as BLOCKED (fail-closed): {exc}")
+        globals().get("_decision_record", lambda *a, **k: None)('helper_snapshot', locals(), function='_live_perf_blocked', source_line=8897, input_names=())
         return True  # fail-closed: never allow a blocked instrument to trade on Redis outage
     _perf_block_cache.pop(sym, None)
     _perf_block_cache.pop(f"{sym}:{sub}", None)
+    globals().get("_decision_record", lambda *a, **k: None)('helper_snapshot', locals(), function='_live_perf_blocked', source_line=8900, input_names=())
     return False
 
 
@@ -9331,6 +9389,7 @@ def _live_macro_confluence(sym: str, signal_dir: str) -> tuple:
     # If its timestamp is >_MACRO_STALE_SECS old, Claudia has not run recently.
     try:
         _csm_raw = _redis().get("claudia_sector_momentum")
+        globals().get("_decision_record", lambda *a, **k: None)('strategic_read', locals(), key='claudia_sector_momentum', variable='_csm_raw', function='_live_macro_confluence')
         if not _csm_raw:
             return 0.8, 0, "stale", False
         _csm_ts = json.loads(_csm_raw).get("timestamp", 0)
@@ -9420,8 +9479,11 @@ def _live_open_position(sym: str, direction: str, signals: dict,
     sig       = signals.get(sym, {})
     mid_price = sig.get("price", 0.0)
     if mid_price <= 0:
+        globals().get("_decision_record", lambda *a, **k: None)('gate', locals(), function='_live_open_position', source_line=9422, expression='mid_price <= 0', input_names=('mid_price',), gate_name='_live_open_position:9422', result='FAIL')
         _live_log(f"open_position aborted: no price for {sym}")
+        globals().get("_decision_record", lambda *a, **k: None)('function_return', locals(), function='_live_open_position', source_line=9424)
         return
+    globals().get("_decision_record", lambda *a, **k: None)('gate', locals(), function='_live_open_position', source_line=9422, expression='mid_price <= 0', input_names=('mid_price',), gate_name='_live_open_position:9422', result='PASS')
 
     notional  = pos_size * leverage
     _sprout_floor_mult = (
@@ -9430,6 +9492,7 @@ def _live_open_position(sym: str, direction: str, signals: dict,
     )
     ig_size    = _live_compute_ig_size(sym, notional, mid_price, floor_mult=_sprout_floor_mult)
     if _sprout_floor_mult > 1:
+        globals().get("_decision_record", lambda *a, **k: None)('branch', locals(), function='_live_open_position', source_line=9432, expression='_sprout_floor_mult > 1', input_names=('_sprout_floor_mult',))
         _live_log(
             f"  [SPROUT {_sprout_floor_mult}× FLOOR] {sym}: ig_size={ig_size} lots "
             f"(floor={_live_min_deal.get(sym, 1.0) * _sprout_floor_mult})"
@@ -9437,8 +9500,10 @@ def _live_open_position(sym: str, direction: str, signals: dict,
     lot_sz     = _live_lot_sizes.get(sym, _LIVE_LOT_SIZE_FX)  # per-instrument lot size
     price_unit = _live_price_unit.get(sym, 1.0)
     if sym in _live_equity_cfd:
+        globals().get("_decision_record", lambda *a, **k: None)('branch', locals(), function='_live_open_position', source_line=9439, expression='sym in _live_equity_cfd', input_names=('_live_equity_cfd', 'sym'))
         actual_n = ig_size * mid_price * price_unit          # equity CFD: size = shares
     elif sym in _live_fx_instruments:
+        globals().get("_decision_record", lambda *a, **k: None)('branch', locals(), function='_live_open_position', source_line=9441, expression='sym in _live_fx_instruments', input_names=('_live_fx_instruments', 'sym'))
         _pip_sz_n = _live_pip_sizes.get(sym, _LIVE_FX_PIP)
         actual_n  = ig_size * (lot_sz / _pip_sz_n) if _pip_sz_n > 0 else 0.0  # FX: size × 100k
     else:
@@ -9453,8 +9518,10 @@ def _live_open_position(sym: str, direction: str, signals: dict,
     # rather than allow effective leverage to silently exceed the phase ceiling.
     # Not triggered for SILVER/OIL (not in _live_equity_cfd).
     if sym in _live_equity_cfd and pos_size > 0:
+        globals().get("_decision_record", lambda *a, **k: None)('branch', locals(), function='_live_open_position', source_line=9455, expression='sym in _live_equity_cfd and pos_size > 0', input_names=('_live_equity_cfd', 'pos_size', 'sym'))
         _eff_lev = _log_n / pos_size
         if _eff_lev > leverage + 0.5:  # 0.5 tolerance for float rounding at exact boundary
+            globals().get("_decision_record", lambda *a, **k: None)('gate', locals(), function='_live_open_position', source_line=9457, expression='_eff_lev > leverage + 0.5', input_names=('_eff_lev', 'leverage'), gate_name='_live_open_position:9457', result='FAIL')
             _live_log(
                 f"\U0001f6ab EQUITY LEV GATE: {sym} blocked — minDeal clamp produced "
                 f"{_eff_lev:.1f}\u00d7 effective leverage "
@@ -9462,10 +9529,13 @@ def _live_open_position(sym: str, direction: str, signals: dict,
                 f"vs intended {leverage}:1 — account too small to size one share "
                 f"within phase leverage control"
             )
+            globals().get("_decision_record", lambda *a, **k: None)('function_return', locals(), function='_live_open_position', source_line=9465)
             return
+        globals().get("_decision_record", lambda *a, **k: None)('gate', locals(), function='_live_open_position', source_line=9457, expression='_eff_lev > leverage + 0.5', input_names=('_eff_lev', 'leverage'), gate_name='_live_open_position:9457', result='PASS')
     _spread_floor = _sim_get_spread_floor(sym)
     stop_pct      = max(_sim_get_dynamic_stop(sym), _spread_floor)
     if stop_mult != 1.0:
+        globals().get("_decision_record", lambda *a, **k: None)('branch', locals(), function='_live_open_position', source_line=9468, expression='stop_mult != 1.0', input_names=('stop_mult',))
         stop_pct = round(stop_pct * stop_mult, 6)  # counter-trend SL compression
     # Leverage-scaled stop tightening — dormant below _LIVE_PHASE_GATE_BAL ($200).
     # Normalised to phase floor (3x = _LIVE_PHASE_CONSERVATIVE_LEV): the most
@@ -9474,6 +9544,7 @@ def _live_open_position(sym: str, direction: str, signals: dict,
     # Spread floor clamped as hard minimum — stops never tighten into spread noise.
     # NOT empirically validated at $200+: reasoned starting point, revisit when data exists.
     if _live.get("balance", 0.0) >= _LIVE_PHASE_GATE_BAL and leverage > _LIVE_PHASE_CONSERVATIVE_LEV:
+        globals().get("_decision_record", lambda *a, **k: None)('branch', locals(), function='_live_open_position', source_line=9476, expression='_live.get("balance", 0.0) >= _LIVE_PHASE_GATE_BAL and leverage > _LIVE_PHASE_CONSERVATIVE_LEV', input_names=('_LIVE_PHASE_CONSERVATIVE_LEV', '_LIVE_PHASE_GATE_BAL', '_live', 'leverage'))
         _lev_mult = (_LIVE_PHASE_CONSERVATIVE_LEV / leverage) ** 0.5
         stop_pct  = max(round(stop_pct * _lev_mult, 6), _spread_floor)
         _live_log(
@@ -9484,6 +9555,7 @@ def _live_open_position(sym: str, direction: str, signals: dict,
     tp_pct    = _sim_get_tp(sym, direction, conviction)
     _tp_spread_floor_l = _sim_get_spread_floor(sym) / 2
     if tp_pct < _tp_spread_floor_l:
+        globals().get("_decision_record", lambda *a, **k: None)('branch', locals(), function='_live_open_position', source_line=9486, expression='tp_pct < _tp_spread_floor_l', input_names=('_tp_spread_floor_l', 'tp_pct'))
         tp_pct = _tp_spread_floor_l
     stop_dist = _live_compute_stop_pts(sym, stop_pct, mid_price)
 
@@ -9500,16 +9572,20 @@ def _live_open_position(sym: str, direction: str, signals: dict,
     # Commission gate: equity CFDs (MU, INTC, AAPL etc) cost $9/side = $18 round-trip.
     # Block any trade where TP expected gross < $18 — structurally guaranteed to lose.
     if sym in _live_equity_cfd:
+        globals().get("_decision_record", lambda *a, **k: None)('branch', locals(), function='_live_open_position', source_line=9502, expression='sym in _live_equity_cfd', input_names=('_live_equity_cfd', 'sym'))
         _exp_gross = actual_n * tp_pct
         _rt_comm   = _IG_EQUITY_COMMISSION_USD * 2
         if _exp_gross < _rt_comm:
+            globals().get("_decision_record", lambda *a, **k: None)('gate', locals(), function='_live_open_position', source_line=9505, expression='_exp_gross < _rt_comm', input_names=('_exp_gross', '_rt_comm'), gate_name='_live_open_position:9505', result='FAIL')
             _live_log(
                 f"🚫 COMMISSION GATE: {sym} blocked — "
                 f"expected gross ${_exp_gross:.2f} < ${_rt_comm:.2f} round-trip "
                 f"commission (notional ${actual_n:.2f} TP {tp_pct*100:.2f}%)."
             )
             _live.setdefault("pause_expiry", {})[_sim_combo_key(sym, direction)] = time.time() + 600
+            globals().get("_decision_record", lambda *a, **k: None)('function_return', locals(), function='_live_open_position', source_line=9512)
             return
+        globals().get("_decision_record", lambda *a, **k: None)('gate', locals(), function='_live_open_position', source_line=9505, expression='_exp_gross < _rt_comm', input_names=('_exp_gross', '_rt_comm'), gate_name='_live_open_position:9505', result='PASS')
 
     # Pre-order margin check — catches weekend-uplifted margins that slip past eligibility filter.
     # FX excluded: tiny notional sizes make INSUFFICIENT_FUNDS structurally impossible there.
@@ -9517,9 +9593,13 @@ def _live_open_position(sym: str, direction: str, signals: dict,
     # silently allowing it through unchecked. Arises from rate-limited startup fetch.
     _margin_raw = _live_margin.get(sym, 0.0)
     if sym not in _live_fx_instruments:
+        globals().get("_decision_record", lambda *a, **k: None)('branch', locals(), function='_live_open_position', source_line=9519, expression='sym not in _live_fx_instruments', input_names=('_live_fx_instruments', 'sym'))
         if _margin_raw <= 0:
+            globals().get("_decision_record", lambda *a, **k: None)('gate', locals(), function='_live_open_position', source_line=9520, expression='_margin_raw <= 0', input_names=('_margin_raw',), gate_name='_live_open_position:9520', result='FAIL')
             _live_log(f"🚫 MARGIN GATE: {sym} skip — margin not loaded (fail-closed) — no cooldown")
+            globals().get("_decision_record", lambda *a, **k: None)('function_return', locals(), function='_live_open_position', source_line=9522)
             return
+        globals().get("_decision_record", lambda *a, **k: None)('gate', locals(), function='_live_open_position', source_line=9520, expression='_margin_raw <= 0', input_names=('_margin_raw',), gate_name='_live_open_position:9520', result='PASS')
         _mfrac  = _real_margin_fraction(sym, _margin_raw)
         _eq_fx  = (_live_fx_base.get(sym, 1.0) or 1.0) if sym in _live_equity_cfd else 1.0
         _usd_n  = ((ig_size * mid_price * price_unit if sym in _live_equity_cfd
@@ -9527,14 +9607,20 @@ def _live_open_position(sym: str, direction: str, signals: dict,
         _req_mg = _usd_n * _mfrac
         _avail  = _live.get("balance_total", 0.0)
         if _req_mg > _avail:
+            globals().get("_decision_record", lambda *a, **k: None)('gate', locals(), function='_live_open_position', source_line=9529, expression='_req_mg > _avail', input_names=('_avail', '_req_mg'), gate_name='_live_open_position:9529', result='FAIL')
             _live_log(
                 f"🚫 MARGIN GATE: {sym} skip — est. margin ${_req_mg:.2f} "
                 f"> balance ${_avail:.2f} (rate={_margin_raw:.0%}) — no cooldown"
             )
+            globals().get("_decision_record", lambda *a, **k: None)('function_return', locals(), function='_live_open_position', source_line=9534)
             return
+        globals().get("_decision_record", lambda *a, **k: None)('gate', locals(), function='_live_open_position', source_line=9529, expression='_req_mg > _avail', input_names=('_avail', '_req_mg'), gate_name='_live_open_position:9529', result='PASS')
 
     if not _live_trade_guard():  # ← structural gate: no order without this passing
+        globals().get("_decision_record", lambda *a, **k: None)('gate', locals(), function='_live_open_position', source_line=9536, expression='not _live_trade_guard()', input_names=('_live_trade_guard',), gate_name='_live_open_position:9536', result='FAIL')
+        globals().get("_decision_record", lambda *a, **k: None)('function_return', locals(), function='_live_open_position', source_line=9537)
         return
+    globals().get("_decision_record", lambda *a, **k: None)('gate', locals(), function='_live_open_position', source_line=9536, expression='not _live_trade_guard()', input_names=('_live_trade_guard',), gate_name='_live_open_position:9536', result='PASS')
 
     # ── Pre-submission price re-check (staleness guard) ────────────────────────────
     # Fetch a fresh mid price immediately before the POST. If price has drifted
@@ -9545,16 +9631,21 @@ def _live_open_position(sym: str, direction: str, signals: dict,
     # (BTC/ETH intra-minute velocity commonly exceeds 0.5% in fast conditions).
     _precheck_fresh = fetch_price(epic)
     if _precheck_fresh is not None and mid_price > 0:
+        globals().get("_decision_record", lambda *a, **k: None)('branch', locals(), function='_live_open_position', source_line=9547, expression='_precheck_fresh is not None and mid_price > 0', input_names=('_precheck_fresh', 'mid_price'))
         _fresh_mid = _precheck_fresh["mid"]
         _drift = abs(_fresh_mid - mid_price) / mid_price
         if _drift > _PRESUBMIT_DRIFT_CAP:
+            globals().get("_decision_record", lambda *a, **k: None)('gate', locals(), function='_live_open_position', source_line=9550, expression='_drift > _PRESUBMIT_DRIFT_CAP', input_names=('_PRESUBMIT_DRIFT_CAP', '_drift'), gate_name='_live_open_position:9550', result='FAIL')
             _live_log(
                 f"🚫 PRESUBMIT DRIFT: {sym} {ig_direction} aborted — "
                 f"signal mid={mid_price:.5f} fresh mid={_fresh_mid:.5f} "
                 f"drift={_drift*100:.3f}% > {_PRESUBMIT_DRIFT_CAP*100:.1f}% cap"
             )
+            globals().get("_decision_record", lambda *a, **k: None)('function_return', locals(), function='_live_open_position', source_line=9556)
             return
+        globals().get("_decision_record", lambda *a, **k: None)('gate', locals(), function='_live_open_position', source_line=9550, expression='_drift > _PRESUBMIT_DRIFT_CAP', input_names=('_PRESUBMIT_DRIFT_CAP', '_drift'), gate_name='_live_open_position:9550', result='PASS')
     elif _precheck_fresh is None:
+        globals().get("_decision_record", lambda *a, **k: None)('branch', locals(), function='_live_open_position', source_line=9557, expression='_precheck_fresh is None', input_names=('_precheck_fresh',))
         _live_log(
             f"⚠️  presubmit check: {sym} price fetch failed — proceeding (fail-open)"
         )
@@ -9575,35 +9666,52 @@ def _live_open_position(sym: str, direction: str, signals: dict,
         # Non-FX instruments (OIL, SILVER, GOLD) attach a broker-side hard stop below.
     }
     if sym not in _live_fx_instruments:
+        globals().get("_decision_record", lambda *a, **k: None)('branch', locals(), function='_live_open_position', source_line=9577, expression='sym not in _live_fx_instruments', input_names=('_live_fx_instruments', 'sym'))
         order_body["stopDistance"] = stop_dist
 
+    globals().get("_decision_record", lambda *a, **k: None)('submission', locals())
     resp = _ig_live_post("/positions/otc", order_body, version="2")
+    globals().get("_decision_record", lambda *a, **k: None)('submission_response', locals())
     if not resp:
+        globals().get("_decision_record", lambda *a, **k: None)('gate', locals(), function='_live_open_position', source_line=9581, expression='not resp', input_names=('resp',), gate_name='_live_open_position:9581', result='FAIL')
         _live_log(f"open_position: POST failed for {sym} — 5min cooldown")
         _live.setdefault("pause_expiry", {})[_sim_combo_key(sym, direction)] = time.time() + 300
+        globals().get("_decision_record", lambda *a, **k: None)('function_return', locals(), function='_live_open_position', source_line=9584)
         return
+    globals().get("_decision_record", lambda *a, **k: None)('gate', locals(), function='_live_open_position', source_line=9581, expression='not resp', input_names=('resp',), gate_name='_live_open_position:9581', result='PASS')
 
     deal_ref = resp.get("dealReference", "")
     if not deal_ref:
+        globals().get("_decision_record", lambda *a, **k: None)('gate', locals(), function='_live_open_position', source_line=9587, expression='not deal_ref', input_names=('deal_ref',), gate_name='_live_open_position:9587', result='FAIL')
         _live_log(f"open_position: no dealReference in response for {sym}")
+        globals().get("_decision_record", lambda *a, **k: None)('function_return', locals(), function='_live_open_position', source_line=9589)
         return
+    globals().get("_decision_record", lambda *a, **k: None)('gate', locals(), function='_live_open_position', source_line=9587, expression='not deal_ref', input_names=('deal_ref',), gate_name='_live_open_position:9587', result='PASS')
 
     # Confirm fill
     confirm = _live_confirm_deal(deal_ref)
+    globals().get("_decision_record", lambda *a, **k: None)('confirmation', locals())
     if not confirm:
+        globals().get("_decision_record", lambda *a, **k: None)('gate', locals(), function='_live_open_position', source_line=9593, expression='not confirm', input_names=('confirm',), gate_name='_live_open_position:9593', result='FAIL')
         _live_log(f"open_position: could not confirm {deal_ref} for {sym}")
+        globals().get("_decision_record", lambda *a, **k: None)('function_return', locals(), function='_live_open_position', source_line=9595)
         return
+    globals().get("_decision_record", lambda *a, **k: None)('gate', locals(), function='_live_open_position', source_line=9593, expression='not confirm', input_names=('confirm',), gate_name='_live_open_position:9593', result='PASS')
 
     status = confirm.get("dealStatus", "")
     if status != "ACCEPTED":
+        globals().get("_decision_record", lambda *a, **k: None)('gate', locals(), function='_live_open_position', source_line=9598, expression='status != "ACCEPTED"', input_names=('status',), gate_name='_live_open_position:9598', result='FAIL')
         _live_log(f"open_position: {sym} deal {status}: {confirm.get('reason', '?')} — 10min cooldown")
         _live.setdefault("pause_expiry", {})[_sim_combo_key(sym, direction)] = time.time() + 600
+        globals().get("_decision_record", lambda *a, **k: None)('function_return', locals(), function='_live_open_position', source_line=9601)
         return
+    globals().get("_decision_record", lambda *a, **k: None)('gate', locals(), function='_live_open_position', source_line=9598, expression='status != "ACCEPTED"', input_names=('status',), gate_name='_live_open_position:9598', result='PASS')
 
     fill_price = float(confirm.get("level", mid_price))
     deal_id    = confirm.get("dealId", "")
 
     if sym in _fallback_epics:
+        globals().get("_decision_record", lambda *a, **k: None)('branch', locals(), function='_live_open_position', source_line=9606, expression='sym in _fallback_epics', input_names=('_fallback_epics', 'sym'))
         _live_log(
             f"  ⚠️  [FALLBACK EPIC] {sym} order ACCEPTED on non-pinned epic "
             f"{INSTRUMENTS.get(sym, '?')!r} (pinned was {_PINNED_EPICS.get(sym, '?')!r}) "
@@ -9614,8 +9722,10 @@ def _live_open_position(sym: str, direction: str, signals: dict,
     # IG returns stopLevel when the stop was accepted alongside the position.
     _broker_stop_level = None
     if sym not in _live_fx_instruments:
+        globals().get("_decision_record", lambda *a, **k: None)('branch', locals(), function='_live_open_position', source_line=9616, expression='sym not in _live_fx_instruments', input_names=('_live_fx_instruments', 'sym'))
         _broker_stop_level = confirm.get("stopLevel")
         if _broker_stop_level:
+            globals().get("_decision_record", lambda *a, **k: None)('branch', locals(), function='_live_open_position', source_line=9618, expression='_broker_stop_level', input_names=('_broker_stop_level',))
             _live_log(
                 f"🛑 Broker stop confirmed: {sym} stopLevel={_broker_stop_level} "
                 f"(sent stopDistance={stop_dist}pts)"
@@ -11365,16 +11475,26 @@ def _live_select_instrument(signals: dict, regime: str) -> list:
     Returns all qualifying candidates ranked by effective volatility (desc).
     Callers use [0] as primary pick; subsequent entries are notional-gate runner-ups.
     """
+    globals().get("_decision_record", lambda *a, **k: None)('universe', locals())
     bal = _live.get("balance", 0.0)
     if bal <= 0:
+        globals().get("_decision_record", lambda *a, **k: None)('gate', locals(), function='_live_select_instrument', source_line=11369, expression='bal <= 0', input_names=('bal',), gate_name='_live_select_instrument:11369', result='FAIL')
+        globals().get("_decision_record", lambda *a, **k: None)('ranking', locals())
+        globals().get("_decision_record", lambda *a, **k: None)('function_return', locals(), function='_live_select_instrument', source_line=11370)
         return []
+    globals().get("_decision_record", lambda *a, **k: None)('gate', locals(), function='_live_select_instrument', source_line=11369, expression='bal <= 0', input_names=('bal',), gate_name='_live_select_instrument:11369', result='PASS')
     candidates: list = []   # [(sym, eff_vol)]
 
     for sym in _sim_eligible:
+        globals().get("_decision_record", lambda *a, **k: None)('candidate', locals())
         if not _live_is_eligible(sym):
+            globals().get("_decision_record", lambda *a, **k: None)('gate', locals(), function='_live_select_instrument', source_line=11374, expression='not _live_is_eligible(sym)', input_names=('_live_is_eligible', 'sym'), gate_name='_live_select_instrument:11374', result='FAIL')
             continue
+        globals().get("_decision_record", lambda *a, **k: None)('gate', locals(), function='_live_select_instrument', source_line=11374, expression='not _live_is_eligible(sym)', input_names=('_live_is_eligible', 'sym'), gate_name='_live_select_instrument:11374', result='PASS')
         if sym not in signals:
+            globals().get("_decision_record", lambda *a, **k: None)('gate', locals(), function='_live_select_instrument', source_line=11376, expression='sym not in signals', input_names=('signals', 'sym'), gate_name='_live_select_instrument:11376', result='FAIL')
             continue
+        globals().get("_decision_record", lambda *a, **k: None)('gate', locals(), function='_live_select_instrument', source_line=11376, expression='sym not in signals', input_names=('signals', 'sym'), gate_name='_live_select_instrument:11376', result='PASS')
         sig  = signals[sym]
         vol  = abs(sig.get("change_5m", 0.0))
         dirn = sig.get("direction", "neutral")
@@ -11382,31 +11502,57 @@ def _live_select_instrument(signals: dict, regime: str) -> list:
 
         thresh = _sim_get_threshold(sym, direction_str, low_tier=(_sim_vol_bucket(vol) == "low"))
         if vol < thresh:
+            globals().get("_decision_record", lambda *a, **k: None)('gate', locals(), function='_live_select_instrument', source_line=11384, expression='vol < thresh', input_names=('thresh', 'vol'), gate_name='_live_select_instrument:11384', result='FAIL')
             continue
+        globals().get("_decision_record", lambda *a, **k: None)('gate', locals(), function='_live_select_instrument', source_line=11384, expression='vol < thresh', input_names=('thresh', 'vol'), gate_name='_live_select_instrument:11384', result='PASS')
         if sig.get("spread_alert"):
+            globals().get("_decision_record", lambda *a, **k: None)('gate', locals(), function='_live_select_instrument', source_line=11386, expression='sig.get("spread_alert")', input_names=('sig',), gate_name='_live_select_instrument:11386', result='FAIL')
             continue
+        globals().get("_decision_record", lambda *a, **k: None)('gate', locals(), function='_live_select_instrument', source_line=11386, expression='sig.get("spread_alert")', input_names=('sig',), gate_name='_live_select_instrument:11386', result='PASS')
         if direction_str and _live_is_paused(_sim_combo_key(sym, direction_str)):
+            globals().get("_decision_record", lambda *a, **k: None)('gate', locals(), function='_live_select_instrument', source_line=11388, expression='direction_str and _live_is_paused(_sim_combo_key(sym, direction_str))', input_names=('_live_is_paused', '_sim_combo_key', 'direction_str', 'sym'), gate_name='_live_select_instrument:11388', result='FAIL')
             continue
+        globals().get("_decision_record", lambda *a, **k: None)('gate', locals(), function='_live_select_instrument', source_line=11388, expression='direction_str and _live_is_paused(_sim_combo_key(sym, direction_str))', input_names=('_live_is_paused', '_sim_combo_key', 'direction_str', 'sym'), gate_name='_live_select_instrument:11388', result='PASS')
         if time.time() < (_live.get("instrument_cooldown") or {}).get(sym, 0.0):
+            globals().get("_decision_record", lambda *a, **k: None)('gate', locals(), function='_live_select_instrument', source_line=11390, expression='time.time() < (_live.get("instrument_cooldown") or {}).get(sym, 0.0)', input_names=('_live', 'sym', 'time'), gate_name='_live_select_instrument:11390', result='FAIL')
             continue  # all-direction cooldown after stop-out
-        if regime == "bull" and dirn != "bull": continue
-        if regime == "bear" and dirn != "bear": continue
-        if regime in ("volatile", "neutral") and dirn == "neutral": continue
+        globals().get("_decision_record", lambda *a, **k: None)('gate', locals(), function='_live_select_instrument', source_line=11390, expression='time.time() < (_live.get("instrument_cooldown") or {}).get(sym, 0.0)', input_names=('_live', 'sym', 'time'), gate_name='_live_select_instrument:11390', result='PASS')
+        if regime == "bull" and dirn != "bull":
+            globals().get("_decision_record", lambda *a, **k: None)('gate', locals(), function='_live_select_instrument', source_line=11392, expression='regime == "bull" and dirn != "bull"', input_names=('dirn', 'regime'), gate_name='_live_select_instrument:11392', result='FAIL')
+            continue
+        globals().get("_decision_record", lambda *a, **k: None)('gate', locals(), function='_live_select_instrument', source_line=11392, expression='regime == "bull" and dirn != "bull"', input_names=('dirn', 'regime'), gate_name='_live_select_instrument:11392', result='PASS')
+        if regime == "bear" and dirn != "bear":
+            globals().get("_decision_record", lambda *a, **k: None)('gate', locals(), function='_live_select_instrument', source_line=11393, expression='regime == "bear" and dirn != "bear"', input_names=('dirn', 'regime'), gate_name='_live_select_instrument:11393', result='FAIL')
+            continue
+        globals().get("_decision_record", lambda *a, **k: None)('gate', locals(), function='_live_select_instrument', source_line=11393, expression='regime == "bear" and dirn != "bear"', input_names=('dirn', 'regime'), gate_name='_live_select_instrument:11393', result='PASS')
+        if regime in ("volatile", "neutral") and dirn == "neutral":
+            globals().get("_decision_record", lambda *a, **k: None)('gate', locals(), function='_live_select_instrument', source_line=11394, expression='regime in ("volatile", "neutral") and dirn == "neutral"', input_names=('dirn', 'regime'), gate_name='_live_select_instrument:11394', result='FAIL')
+            continue
+        globals().get("_decision_record", lambda *a, **k: None)('gate', locals(), function='_live_select_instrument', source_line=11394, expression='regime in ("volatile", "neutral") and dirn == "neutral"', input_names=('dirn', 'regime'), gate_name='_live_select_instrument:11394', result='PASS')
         if direction_str:
+            globals().get("_decision_record", lambda *a, **k: None)('branch', locals(), function='_live_select_instrument', source_line=11395, expression='direction_str', input_names=('direction_str',))
             skip, _, reason = _sim_combo_wr_gate(sym, direction_str)
             if skip:
+                globals().get("_decision_record", lambda *a, **k: None)('gate', locals(), function='_live_select_instrument', source_line=11397, expression='skip', input_names=('skip',), gate_name='_live_select_instrument:11397', result='FAIL')
                 _live_log(f"skip {sym}: {reason}")
                 continue
+            globals().get("_decision_record", lambda *a, **k: None)('gate', locals(), function='_live_select_instrument', source_line=11397, expression='skip', input_names=('skip',), gate_name='_live_select_instrument:11397', result='PASS')
         weight     = _sim_regime_weight(sym, direction_str)
         corr_adj   = _sim_corr_weight(sym, direction_str, signals)
         eff_vol    = vol * weight * corr_adj
         if _live_perf_blocked(sym):
+            globals().get("_decision_record", lambda *a, **k: None)('gate', locals(), function='_live_select_instrument', source_line=11403, expression='_live_perf_blocked(sym)', input_names=('_live_perf_blocked', 'sym'), gate_name='_live_select_instrument:11403', result='FAIL')
             continue  # performance filter: below 30% WR or chronic wide Spread/ATR
+        globals().get("_decision_record", lambda *a, **k: None)('gate', locals(), function='_live_select_instrument', source_line=11403, expression='_live_perf_blocked(sym)', input_names=('_live_perf_blocked', 'sym'), gate_name='_live_select_instrument:11403', result='PASS')
         if sig.get("spread_atr_wide"):
+            globals().get("_decision_record", lambda *a, **k: None)('branch', locals(), function='_live_select_instrument', source_line=11405, expression='sig.get("spread_atr_wide")', input_names=('sig',))
             eff_vol *= 0.5   # rank penalty: spread > ATR threshold
+        globals().get("_decision_record", lambda *a, **k: None)('score_rank', locals())
         candidates.append((sym, eff_vol))
 
     candidates.sort(key=lambda x: -x[1])
+    globals().get("_decision_record", lambda *a, **k: None)('ranking', locals())
+    globals().get("_decision_record", lambda *a, **k: None)('function_return', locals(), function='_live_select_instrument', source_line=11410)
     return [s for s, _ in candidates]
 
 
@@ -13102,31 +13248,48 @@ def _live_try_entry(signals: dict, regime: str, _notional_skip: set = None) -> N
     """Evaluate entry for live trading. Reuses all sim decision functions.
     Calls _live_open_position which is the only place orders are placed.
     """
+    globals().get("_decision_record", lambda *a, **k: None)('entry_call', locals(), function='_live_try_entry')
+    globals().get("_decision_record", lambda *a, **k: None)('universe', locals())
     if _live.get("open_position"):
+        globals().get("_decision_record", lambda *a, **k: None)('gate', locals(), function='_live_try_entry', source_line=13105, expression='_live.get("open_position")', input_names=('_live',), gate_name='_live_try_entry:13105', result='FAIL')
+        globals().get("_decision_record", lambda *a, **k: None)('function_return', locals(), function='_live_try_entry', source_line=13106)
         return     # one position at a time
+    globals().get("_decision_record", lambda *a, **k: None)('gate', locals(), function='_live_try_entry', source_line=13105, expression='_live.get("open_position")', input_names=('_live',), gate_name='_live_try_entry:13105', result='PASS')
 
     if (_live.get("orphan_suspected") or _live.get("manual_review_required")
             or _live.get("pyramid_legs") or _live.get("pyramid_entry_pending")):
+        globals().get("_decision_record", lambda *a, **k: None)('gate', locals(), function='_live_try_entry', source_line=13108, expression='_live.get("orphan_suspected") or _live.get("manual_review_required")\n            or _live.get("pyramid_legs") or _live.get("pyramid_entry_pending")', input_names=('_live',), gate_name='_live_try_entry:13108', result='FAIL')
         _live_log("Entry blocked: unresolved position evidence requires reconciliation")
+        globals().get("_decision_record", lambda *a, **k: None)('function_return', locals(), function='_live_try_entry', source_line=13111)
         return
+    globals().get("_decision_record", lambda *a, **k: None)('gate', locals(), function='_live_try_entry', source_line=13108, expression='_live.get("orphan_suspected") or _live.get("manual_review_required")\n            or _live.get("pyramid_legs") or _live.get("pyramid_entry_pending")', input_names=('_live',), gate_name='_live_try_entry:13108', result='PASS')
 
     total   = _live.get("balance_total", 0.0)
     skimmed = _live.get("skimmed_total", 0.0)
     bal     = max(0.0, total - skimmed)   # tradeable capital = total equity minus set-aside
     if bal <= 0:
+        globals().get("_decision_record", lambda *a, **k: None)('gate', locals(), function='_live_try_entry', source_line=13116, expression='bal <= 0', input_names=('bal',), gate_name='_live_try_entry:13116', result='FAIL')
+        globals().get("_decision_record", lambda *a, **k: None)('function_return', locals(), function='_live_try_entry', source_line=13117)
         return
+    globals().get("_decision_record", lambda *a, **k: None)('gate', locals(), function='_live_try_entry', source_line=13116, expression='bal <= 0', input_names=('bal',), gate_name='_live_try_entry:13116', result='PASS')
 
     # Extend signals with fresh equity CFD snapshots (same pattern as sim)
     _ext = dict(signals)
     _now_ext = time.time()
     for _eq_b, _eq_d in _direct_cfd_signals.items():
         if _eq_b in _ext:
+            globals().get("_decision_record", lambda *a, **k: None)('gate', locals(), function='_live_try_entry', source_line=13123, expression='_eq_b in _ext', input_names=('_eq_b', '_ext'), gate_name='_live_try_entry:13123', result='FAIL')
             continue
+        globals().get("_decision_record", lambda *a, **k: None)('gate', locals(), function='_live_try_entry', source_line=13123, expression='_eq_b in _ext', input_names=('_eq_b', '_ext'), gate_name='_live_try_entry:13123', result='PASS')
         if _now_ext - _eq_d.get("ts", 0) > 20 * 60:
+            globals().get("_decision_record", lambda *a, **k: None)('gate', locals(), function='_live_try_entry', source_line=13125, expression='_now_ext - _eq_d.get("ts", 0) > 20 * 60', input_names=('_eq_d', '_now_ext'), gate_name='_live_try_entry:13125', result='FAIL')
             continue
+        globals().get("_decision_record", lambda *a, **k: None)('gate', locals(), function='_live_try_entry', source_line=13125, expression='_now_ext - _eq_d.get("ts", 0) > 20 * 60', input_names=('_eq_d', '_now_ext'), gate_name='_live_try_entry:13125', result='PASS')
         _eq_mid = _eq_d.get("mid", 0.0)
         if _eq_mid <= 0.0:
+            globals().get("_decision_record", lambda *a, **k: None)('gate', locals(), function='_live_try_entry', source_line=13128, expression='_eq_mid <= 0.0', input_names=('_eq_mid',), gate_name='_live_try_entry:13128', result='FAIL')
             continue
+        globals().get("_decision_record", lambda *a, **k: None)('gate', locals(), function='_live_try_entry', source_line=13128, expression='_eq_mid <= 0.0', input_names=('_eq_mid',), gate_name='_live_try_entry:13128', result='PASS')
         _eq_dir_raw = _eq_d.get("direction", "flat")
         _ext[_eq_b] = {
             "change_5m":    _eq_d["pct"],
@@ -13150,19 +13313,29 @@ def _live_try_entry(signals: dict, regime: str, _notional_skip: set = None) -> N
     # meaningfully defensive. All other gates (spread/ATR, SAR, observer, HTF/15m,
     # exhaustion, CB, kill switch, sizing, stops) are unchanged.
     if _gmode == "defensive" and regime == "neutral":
+        globals().get("_decision_record", lambda *a, **k: None)('branch', locals(), function='_live_try_entry', source_line=13152, expression='_gmode == "defensive" and regime == "neutral"', input_names=('_gmode', 'regime'))
         _live_observe("defensive_eval_proceed", signals, None,
                       {"scope": "global", "regime": regime, "B4CA": True})
     _ranked = _live_select_instrument(_ext, regime)
     if _notional_skip:
+        globals().get("_decision_record", lambda *a, **k: None)('branch', locals(), function='_live_try_entry', source_line=13156, expression='_notional_skip', input_names=('_notional_skip',))
         _ranked = [s for s in _ranked if s not in _notional_skip]
     if not _ranked:
+        globals().get("_decision_record", lambda *a, **k: None)('gate', locals(), function='_live_try_entry', source_line=13158, expression='not _ranked', input_names=('_ranked',), gate_name='_live_try_entry:13158', result='FAIL')
         if not _notional_skip:
+            globals().get("_decision_record", lambda *a, **k: None)('branch', locals(), function='_live_try_entry', source_line=13159, expression='not _notional_skip', input_names=('_notional_skip',))
             _live_log(f"No live candidate — regime={regime} bal=${bal:.2f}")
+        globals().get("_decision_record", lambda *a, **k: None)('function_return', locals(), function='_live_try_entry', source_line=13161)
         return
+    globals().get("_decision_record", lambda *a, **k: None)('gate', locals(), function='_live_try_entry', source_line=13158, expression='not _ranked', input_names=('_ranked',), gate_name='_live_try_entry:13158', result='PASS')
+    globals().get("_decision_record", lambda *a, **k: None)('attempt', locals())
     sym = _ranked[0]
     if sym not in _ext:
+        globals().get("_decision_record", lambda *a, **k: None)('gate', locals(), function='_live_try_entry', source_line=13163, expression='sym not in _ext', input_names=('_ext', 'sym'), gate_name='_live_try_entry:13163', result='FAIL')
         _live_log(f"No live candidate — regime={regime} bal=${bal:.2f}")
+        globals().get("_decision_record", lambda *a, **k: None)('function_return', locals(), function='_live_try_entry', source_line=13165)
         return
+    globals().get("_decision_record", lambda *a, **k: None)('gate', locals(), function='_live_try_entry', source_line=13163, expression='sym not in _ext', input_names=('_ext', 'sym'), gate_name='_live_try_entry:13163', result='PASS')
 
     # Per-instrument defensive mode regime check (applied after selection)
     # Build 4C-A: like global defensive, an instrument in defensive mode no longer
@@ -13170,19 +13343,26 @@ def _live_try_entry(signals: dict, regime: str, _notional_skip: set = None) -> N
     # conviction floor applied below (_in_defensive covers instrument-level too).
     _imode = (_live.get("instrument_mode") or {}).get(sym, "normal")
     if _imode == "defensive" and regime == "neutral":
+        globals().get("_decision_record", lambda *a, **k: None)('branch', locals(), function='_live_try_entry', source_line=13172, expression='_imode == "defensive" and regime == "neutral"', input_names=('_imode', 'regime'))
         _live_observe("defensive_eval_proceed", signals, None,
                       {"scope": "instrument", "instrument": sym, "regime": regime, "B4CA": True})
 
     # Metals session gate: SILVER/OIL follow CME Sunday 18:00 ET reopen,
     # 2h after FX (21:00 UK). Silently skip — no cooldown, no log spam.
     if sym in _METALS_INSTRUMENTS and _is_metals_weekend_closure():
+        globals().get("_decision_record", lambda *a, **k: None)('gate', locals(), function='_live_try_entry', source_line=13178, expression='sym in _METALS_INSTRUMENTS and _is_metals_weekend_closure()', input_names=('_METALS_INSTRUMENTS', '_is_metals_weekend_closure', 'sym'), gate_name='_live_try_entry:13178', result='FAIL')
         _live_log(f"⏳ {sym}: CME metals not yet open (Sun 18:00 ET) — skipping")
+        globals().get("_decision_record", lambda *a, **k: None)('function_return', locals(), function='_live_try_entry', source_line=13180)
         return
+    globals().get("_decision_record", lambda *a, **k: None)('gate', locals(), function='_live_try_entry', source_line=13178, expression='sym in _METALS_INSTRUMENTS and _is_metals_weekend_closure()', input_names=('_METALS_INSTRUMENTS', '_is_metals_weekend_closure', 'sym'), gate_name='_live_try_entry:13178', result='PASS')
 
     # FX weekend gate: block non-continuous instruments Fri 22:00 UK → Sun 21:00 UK.
     # Continuous instruments (24/7 markets) bypass this gate entirely.
     if sym not in _CONTINUOUS_INSTRUMENTS and is_weekend_closure():
+        globals().get("_decision_record", lambda *a, **k: None)('gate', locals(), function='_live_try_entry', source_line=13184, expression='sym not in _CONTINUOUS_INSTRUMENTS and is_weekend_closure()', input_names=('_CONTINUOUS_INSTRUMENTS', 'is_weekend_closure', 'sym'), gate_name='_live_try_entry:13184', result='FAIL')
+        globals().get("_decision_record", lambda *a, **k: None)('function_return', locals(), function='_live_try_entry', source_line=13185)
         return
+    globals().get("_decision_record", lambda *a, **k: None)('gate', locals(), function='_live_try_entry', source_line=13184, expression='sym not in _CONTINUOUS_INSTRUMENTS and is_weekend_closure()', input_names=('_CONTINUOUS_INSTRUMENTS', 'is_weekend_closure', 'sym'), gate_name='_live_try_entry:13184', result='PASS')
 
     sig       = _ext[sym]
     chg       = sig.get("change_5m", 0.0)
@@ -13193,32 +13373,44 @@ def _live_try_entry(signals: dict, regime: str, _notional_skip: set = None) -> N
     # Hybrid Spread/ATR gate — tiered threshold using 5-minute ATR baseline (fail-open)
     _atr5, _atr5_fb = _compute_atr_5m(sym)
     if _atr5 is not None and _atr5 > 0:
+        globals().get("_decision_record", lambda *a, **k: None)('branch', locals(), function='_live_try_entry', source_line=13195, expression='_atr5 is not None and _atr5 > 0', input_names=('_atr5',))
         _sp_raw = (sig.get("spread_pct", 0.0) or 0.0) * (sig.get("price", 0.0) or 0.0) / 100.0
         _sar5   = _sp_raw / _atr5
         _thr5   = _spread_atr_threshold(sym, _atr5_fb)
         if _sar5 > _thr5:
+            globals().get("_decision_record", lambda *a, **k: None)('gate', locals(), function='_live_try_entry', source_line=13199, expression='_sar5 > _thr5', input_names=('_sar5', '_thr5'), gate_name='_live_try_entry:13199', result='FAIL')
             _live_log(
                 f"🚫 [HYBRID SPREAD GATE] {sym}: Spread/ATR(5m) ratio {_sar5:.2f} "
                 f"> tier cap {_thr5:.2f} | Entry suppressed"
             )
             _now_sb = int(time.time())
             if _now_sb - _live_spread_block_cooldown.get(sym, 0) >= 300:
+                globals().get("_decision_record", lambda *a, **k: None)('branch', locals(), function='_live_try_entry', source_line=13205, expression='_now_sb - _live_spread_block_cooldown.get(sym, 0) >= 300', input_names=('_live_spread_block_cooldown', '_now_sb', 'sym'))
                 _live_spread_block_cooldown[sym] = _now_sb
                 _live_write_block_log(sym, direction, "spread_atr",
                                      {"sar5": round(_sar5, 3), "thr5": round(_thr5, 3),
                                       "atr5": round(_atr5, 4)})
             _live_shadow_obs_blocked(sym, direction, sig, combo, "SPREAD-BLOCKED")
+            globals().get("_decision_record", lambda *a, **k: None)('function_return', locals(), function='_live_try_entry', source_line=13211)
             return
+        globals().get("_decision_record", lambda *a, **k: None)('gate', locals(), function='_live_try_entry', source_line=13199, expression='_sar5 > _thr5', input_names=('_sar5', '_thr5'), gate_name='_live_try_entry:13199', result='PASS')
 
     # 1m anti-reversal gate (same as sim)
     price_1m = _price_n_minutes_ago(sym, 1)
     if price_1m and price_1m > 0:
+        globals().get("_decision_record", lambda *a, **k: None)('branch', locals(), function='_live_try_entry', source_line=13215, expression='price_1m and price_1m > 0', input_names=('price_1m',))
         cur_px = sig.get("price", 0.0)
         rev_pct = abs(cur_px - price_1m) / price_1m * 100.0
         if direction == "long" and cur_px < price_1m and rev_pct >= _SIM_1M_MIN_REVERSAL:
+            globals().get("_decision_record", lambda *a, **k: None)('gate', locals(), function='_live_try_entry', source_line=13218, expression='direction == "long" and cur_px < price_1m and rev_pct >= _SIM_1M_MIN_REVERSAL', input_names=('_SIM_1M_MIN_REVERSAL', 'cur_px', 'direction', 'price_1m', 'rev_pct'), gate_name='_live_try_entry:13218', result='FAIL')
+            globals().get("_decision_record", lambda *a, **k: None)('function_return', locals(), function='_live_try_entry', source_line=13219)
             return
+        globals().get("_decision_record", lambda *a, **k: None)('gate', locals(), function='_live_try_entry', source_line=13218, expression='direction == "long" and cur_px < price_1m and rev_pct >= _SIM_1M_MIN_REVERSAL', input_names=('_SIM_1M_MIN_REVERSAL', 'cur_px', 'direction', 'price_1m', 'rev_pct'), gate_name='_live_try_entry:13218', result='PASS')
         if direction == "short" and cur_px > price_1m and rev_pct >= _SIM_1M_MIN_REVERSAL:
+            globals().get("_decision_record", lambda *a, **k: None)('gate', locals(), function='_live_try_entry', source_line=13220, expression='direction == "short" and cur_px > price_1m and rev_pct >= _SIM_1M_MIN_REVERSAL', input_names=('_SIM_1M_MIN_REVERSAL', 'cur_px', 'direction', 'price_1m', 'rev_pct'), gate_name='_live_try_entry:13220', result='FAIL')
+            globals().get("_decision_record", lambda *a, **k: None)('function_return', locals(), function='_live_try_entry', source_line=13221)
             return
+        globals().get("_decision_record", lambda *a, **k: None)('gate', locals(), function='_live_try_entry', source_line=13220, expression='direction == "short" and cur_px > price_1m and rev_pct >= _SIM_1M_MIN_REVERSAL', input_names=('_SIM_1M_MIN_REVERSAL', 'cur_px', 'direction', 'price_1m', 'rev_pct'), gate_name='_live_try_entry:13220', result='PASS')
 
     # 15m gate (same as sim, uses sim's reliability data — calibration shared)
     change_15m = sig.get("change_15m") or 0.0
@@ -13227,16 +13419,21 @@ def _live_try_entry(signals: dict, regime: str, _notional_skip: set = None) -> N
     gate_mode, rel_score = _sim_15m_gate_mode(sym, direction)
 
     if has_15m and gate_mode != "relaxed":
+        globals().get("_decision_record", lambda *a, **k: None)('branch', locals(), function='_live_try_entry', source_line=13229, expression='has_15m and gate_mode != "relaxed"', input_names=('gate_mode', 'has_15m'))
         blocked = False
         if gate_mode == "strict":
+            globals().get("_decision_record", lambda *a, **k: None)('branch', locals(), function='_live_try_entry', source_line=13231, expression='gate_mode == "strict"', input_names=('gate_mode',))
             blocked = (direction == "long" and change_15m <= 0) or \
                       (direction == "short" and change_15m >= 0)
         else:
             blocked = (direction == "long" and change_15m <= -_SIM_15M_DEADZONE) or \
                       (direction == "short" and change_15m >= _SIM_15M_DEADZONE)
         if blocked:
+            globals().get("_decision_record", lambda *a, **k: None)('gate', locals(), function='_live_try_entry', source_line=13237, expression='blocked', input_names=('blocked',), gate_name='_live_try_entry:13237', result='FAIL')
             _live_log(f"skip {sym}: 15m gate ({gate_mode})")
+            globals().get("_decision_record", lambda *a, **k: None)('function_return', locals(), function='_live_try_entry', source_line=13239)
             return
+        globals().get("_decision_record", lambda *a, **k: None)('gate', locals(), function='_live_try_entry', source_line=13237, expression='blocked', input_names=('blocked',), gate_name='_live_try_entry:13237', result='PASS')
 
     # Conviction and leverage
     thresh  = _sim_get_threshold(sym, direction)
@@ -13247,6 +13444,7 @@ def _live_try_entry(signals: dict, regime: str, _notional_skip: set = None) -> N
     # HTF per-combo gate: Bonferroni-corrected Wilson CI (dormant until N≥25 per combo)
     _htf_cg_verdict, _htf_cg_pts, _htf_cg_note = _htf_combo_gate(sym, direction, _htf_b)
     if _htf_cg_pts != 0:
+        globals().get("_decision_record", lambda *a, **k: None)('branch', locals(), function='_live_try_entry', source_line=13249, expression='_htf_cg_pts != 0', input_names=('_htf_cg_pts',))
         conv = min(10, max(1, conv + _htf_cg_pts))
         _live_log(f"  📊 [HTF COMBO] {sym}/{direction}/{_htf_b}: "
                   f"{_htf_cg_verdict} → conv {conv}/10 | {_htf_cg_note}")
@@ -13254,26 +13452,33 @@ def _live_try_entry(signals: dict, regime: str, _notional_skip: set = None) -> N
     # positive CI signal adds +1 conviction here (dormant until N>=_SIM_COMBO_CI_MIN_N)
     _, _cwg_pts, _cwg_note = _sim_combo_wr_gate(sym, direction)
     if _cwg_pts > 0:
+        globals().get("_decision_record", lambda *a, **k: None)('branch', locals(), function='_live_try_entry', source_line=13256, expression='_cwg_pts > 0', input_names=('_cwg_pts',))
         conv = min(10, max(1, conv + _cwg_pts))
         _live_log(f"  📈 [COMBO-WR CI] {sym}/{direction}: "
                   f"+{_cwg_pts} → conv {conv}/10 | {_cwg_note}")
     elif _cwg_note:
+        globals().get("_decision_record", lambda *a, **k: None)('branch', locals(), function='_live_try_entry', source_line=13260, expression='_cwg_note', input_names=('_cwg_note',))
         _live_log(f"  [COMBO-WR CI] {sym}/{direction}: inconclusive | {_cwg_note}")
     # HTF opposition floor — blocks low-conviction entries when HTF is confirmed opposed.
     # Only fires for instruments in _HTF_OPPOSITION_FLOOR (currently OIL=5).
     # SILVER and NATGAS dormant (insufficient evidence); gate auto-extends to
     # any future _HTF_INSTRUMENTS member added to _HTF_OPPOSITION_FLOOR.
     if sym in _HTF_INSTRUMENTS:
+        globals().get("_decision_record", lambda *a, **k: None)('branch', locals(), function='_live_try_entry', source_line=13266, expression='sym in _HTF_INSTRUMENTS', input_names=('_HTF_INSTRUMENTS', 'sym'))
         _htf_opp_blocked, _htf_opp_note = _htf_opposed_floor_gate(sym, direction, _htf_b, conv)
         if _htf_opp_blocked:
+            globals().get("_decision_record", lambda *a, **k: None)('gate', locals(), function='_live_try_entry', source_line=13268, expression='_htf_opp_blocked', input_names=('_htf_opp_blocked',), gate_name='_live_try_entry:13268', result='FAIL')
             _live_log(
                 f"  \U0001f4cf [HTF OPP FLOOR] {sym}/{direction}: {_htf_opp_note} \u2014 skip"
             )
             _live_write_block_log(sym, direction, "htf_opp_floor",
                                   {"htf_bias": _htf_b, "conv": conv,
                                    "floor": _HTF_OPPOSITION_FLOOR.get(sym, 0)})
+            globals().get("_decision_record", lambda *a, **k: None)('function_return', locals(), function='_live_try_entry', source_line=13275)
             return
+        globals().get("_decision_record", lambda *a, **k: None)('gate', locals(), function='_live_try_entry', source_line=13268, expression='_htf_opp_blocked', input_names=('_htf_opp_blocked',), gate_name='_live_try_entry:13268', result='PASS')
         if _htf_opp_note:
+            globals().get("_decision_record", lambda *a, **k: None)('branch', locals(), function='_live_try_entry', source_line=13276, expression='_htf_opp_note', input_names=('_htf_opp_note',))
             _live_log(f"  \U0001f4cf [HTF OPP FLOOR] {sym}/{direction}: {_htf_opp_note}")
     # Conviction floor — applied only in DEFENSIVE mode (global or instrument-level).
     # In NORMAL mode, all conviction levels are permitted.
@@ -13287,15 +13492,22 @@ def _live_try_entry(signals: dict, regime: str, _notional_skip: set = None) -> N
     _eff_conv_floor = max(_obs_floor, _def_floor)
     # Dynamic exit: score clears raised observer floor AND last trade was a win
     if _observer_key and _obs_floor > 0 and conv >= _obs_floor:
+        globals().get("_decision_record", lambda *a, **k: None)('branch', locals(), function='_live_try_entry', source_line=13289, expression='_observer_key and _obs_floor > 0 and conv >= _obs_floor', input_names=('_obs_floor', '_observer_key', 'conv'))
         if _live_perf_last_won(sym):
+            globals().get("_decision_record", lambda *a, **k: None)('branch', locals(), function='_live_try_entry', source_line=13290, expression='_live_perf_last_won(sym)', input_names=('_live_perf_last_won', 'sym'))
             _live_clear_observer(sym)
             _observer_key = None
             _eff_conv_floor = _def_floor
             _live_log(f"🟢 [OBSERVER LIFTED] {sym}: score {conv}/10 cleared floor, last trade won")
     if _eff_conv_floor > 0 and conv < _eff_conv_floor:
+        globals().get("_decision_record", lambda *a, **k: None)('gate', locals(), function='_live_try_entry', source_line=13295, expression='_eff_conv_floor > 0 and conv < _eff_conv_floor', input_names=('_eff_conv_floor', 'conv'), gate_name='_live_try_entry:13295', result='FAIL')
         _floor_parts = []
-        if _observer_key: _floor_parts.append(f"observer-{_observer_key}")
-        if _in_defensive: _floor_parts.append(f"defensive[g={_gmode} i={_imode}]")
+        if _observer_key:
+            globals().get("_decision_record", lambda *a, **k: None)('branch', locals(), function='_live_try_entry', source_line=13297, expression='_observer_key', input_names=('_observer_key',))
+            _floor_parts.append(f"observer-{_observer_key}")
+        if _in_defensive:
+            globals().get("_decision_record", lambda *a, **k: None)('branch', locals(), function='_live_try_entry', source_line=13298, expression='_in_defensive', input_names=('_in_defensive',))
+            _floor_parts.append(f"defensive[g={_gmode} i={_imode}]")
         _live_log(
             f"skip {sym}: conviction {conv}/10 below floor {_eff_conv_floor:.0f}/10 "
             f"[{'+'.join(_floor_parts)}]"
@@ -13305,7 +13517,9 @@ def _live_try_entry(signals: dict, regime: str, _notional_skip: set = None) -> N
                       {"instrument": sym, "direction": direction, "conv": conv,
                        "floor": _eff_conv_floor, "in_defensive": _in_defensive,
                        "gmode": _gmode, "imode": _imode, "B4CA": True})
+        globals().get("_decision_record", lambda *a, **k: None)('function_return', locals(), function='_live_try_entry', source_line=13308)
         return
+    globals().get("_decision_record", lambda *a, **k: None)('gate', locals(), function='_live_try_entry', source_line=13295, expression='_eff_conv_floor > 0 and conv < _eff_conv_floor', input_names=('_eff_conv_floor', 'conv'), gate_name='_live_try_entry:13295', result='PASS')
     # ── Trend-exhaustion gate ────────────────────────────────────────────────
     # Blocks entries where the directional move in the _history window has
     # already run > _EXHAUST_RATIO_BLOCK × ATR_5m. Prevents chasing aged moves
@@ -13318,13 +13532,16 @@ def _live_try_entry(signals: dict, regime: str, _notional_skip: set = None) -> N
     # Same ATR_5m denominator as the gate; only net_move uses prices[-10:].
     _diag_hist = _history.get(sym)
     if _diag_hist and len(_diag_hist) >= 10:
+        globals().get("_decision_record", lambda *a, **k: None)('branch', locals(), function='_live_try_entry', source_line=13320, expression='_diag_hist and len(_diag_hist) >= 10', input_names=('_diag_hist', 'len'))
         _diag_px       = [px for _, px in _diag_hist]
         _diag_atr, _   = _compute_atr_5m(sym)
         if _diag_atr:
+            globals().get("_decision_record", lambda *a, **k: None)('branch', locals(), function='_live_try_entry', source_line=13323, expression='_diag_atr', input_names=('_diag_atr',))
             _net10_raw     = _diag_px[-1] - _diag_px[-10]
             _net10_signed  = _net10_raw if direction == "long" else -_net10_raw
             _ex10          = max(0.0, _net10_signed / _diag_atr)
             if _ex_ratio > 0.0 or _ex10 > 0.0:
+                globals().get("_decision_record", lambda *a, **k: None)('branch', locals(), function='_live_try_entry', source_line=13327, expression='_ex_ratio > 0.0 or _ex10 > 0.0', input_names=('_ex10', '_ex_ratio'))
                 _live_log(
                     f"  📏 [EXHAUST DIAG] {sym}/{direction}: "
                     f"20t={_ex_ratio:.2f}× 10t={_ex10:.2f}× ATR={_diag_atr:.2f}"
@@ -13332,9 +13549,11 @@ def _live_try_entry(signals: dict, regime: str, _notional_skip: set = None) -> N
     # [EX_RATIO OBS] Continuous timeseries — OIL/SILVER/NATGAS, every cycle.
     # Purely observational: zero gate, conviction, or sizing effect.
     if sym in _HTF_INSTRUMENTS:
+        globals().get("_decision_record", lambda *a, **k: None)('branch', locals(), function='_live_try_entry', source_line=13334, expression='sym in _HTF_INSTRUMENTS', input_names=('_HTF_INSTRUMENTS', 'sym'))
         _live_write_ex_ratio_obs(sym, direction, _ex_ratio,
                                  sig.get("spread_atr_ratio"), conv)
     if _ex_ratio >= _EXHAUST_RATIO_BLOCK:
+        globals().get("_decision_record", lambda *a, **k: None)('gate', locals(), function='_live_try_entry', source_line=13337, expression='_ex_ratio >= _EXHAUST_RATIO_BLOCK', input_names=('_EXHAUST_RATIO_BLOCK', '_ex_ratio'), gate_name='_live_try_entry:13337', result='FAIL')
         _live_log(
             f"skip {sym}: trend-exhausted {_ex_ratio:.1f}× ATR ≥ {_EXHAUST_RATIO_BLOCK}× "
             f"({direction}, net_move/ATR_5m over history window)"
@@ -13342,8 +13561,11 @@ def _live_try_entry(signals: dict, regime: str, _notional_skip: set = None) -> N
         _live_write_block_log(sym, direction, "exhaust_block",
                               {"ex_ratio": round(_ex_ratio, 3),
                                "threshold": _EXHAUST_RATIO_BLOCK, "conv": conv})
+        globals().get("_decision_record", lambda *a, **k: None)('function_return', locals(), function='_live_try_entry', source_line=13345)
         return
+    globals().get("_decision_record", lambda *a, **k: None)('gate', locals(), function='_live_try_entry', source_line=13337, expression='_ex_ratio >= _EXHAUST_RATIO_BLOCK', input_names=('_EXHAUST_RATIO_BLOCK', '_ex_ratio'), gate_name='_live_try_entry:13337', result='PASS')
     if _ex_ratio >= _EXHAUST_RATIO_REDUCE:
+        globals().get("_decision_record", lambda *a, **k: None)('branch', locals(), function='_live_try_entry', source_line=13346, expression='_ex_ratio >= _EXHAUST_RATIO_REDUCE', input_names=('_EXHAUST_RATIO_REDUCE', '_ex_ratio'))
         conv = max(1, conv - 1)
         _live_log(
             f"  📉 trend-exhaustion {_ex_ratio:.1f}× ATR: conviction reduced 1pt → {conv}/10"
@@ -13357,6 +13579,7 @@ def _live_try_entry(signals: dict, regime: str, _notional_skip: set = None) -> N
     # Phase system: cap conviction-based lev at current phase ceiling.
     # Dormant below _LIVE_PHASE_GATE_BAL — lev passes through unchanged.
     if bal >= _LIVE_PHASE_GATE_BAL:
+        globals().get("_decision_record", lambda *a, **k: None)('branch', locals(), function='_live_try_entry', source_line=13359, expression='bal >= _LIVE_PHASE_GATE_BAL', input_names=('_LIVE_PHASE_GATE_BAL', 'bal'))
         _phase_ceil = _live_phase_leverage(_live.get("live_phase", 1))
         lev = min(_cv_lev, _phase_ceil)
         _live_log(
@@ -13369,6 +13592,7 @@ def _live_try_entry(signals: dict, regime: str, _notional_skip: set = None) -> N
     # Cap leverage at IG's real margin rate — prevents INSUFFICIENT_FUNDS rejection
     _mr = _live_margin.get(sym)
     if _mr and _mr > 0:
+        globals().get("_decision_record", lambda *a, **k: None)('branch', locals(), function='_live_try_entry', source_line=13371, expression='_mr and _mr > 0', input_names=('_mr',))
         lev = _ig_margin_to_max_lev(_mr, lev)
 
     # Sizing: unified tier system. Sprout (<$50) 90%, Seedling ($50-$200) 80%,
@@ -13381,6 +13605,7 @@ def _live_try_entry(signals: dict, regime: str, _notional_skip: set = None) -> N
     # Proportional size reduction when spread is wide relative to ATR
     _sar_live = sig.get("spread_atr_ratio")
     if sig.get("spread_atr_wide") and _sar_live:
+        globals().get("_decision_record", lambda *a, **k: None)('branch', locals(), function='_live_try_entry', source_line=13383, expression='sig.get("spread_atr_wide") and _sar_live', input_names=('_sar_live', 'sig'))
         _scale = min(1.0, (SPREAD_ATR_THRESHOLD / _sar_live) ** 0.5)
         pos_size = max(2.0, round(pos_size * _scale, 2))
         _live_log(
@@ -13391,6 +13616,7 @@ def _live_try_entry(signals: dict, regime: str, _notional_skip: set = None) -> N
     # Macro confluence — scale pos_size by Claudia directional alignment
     _macro_scale, _claudia_dir, _conf_note, _compress_sl = _live_macro_confluence(sym, direction)
     if _macro_scale < 1.0:
+        globals().get("_decision_record", lambda *a, **k: None)('branch', locals(), function='_live_try_entry', source_line=13393, expression='_macro_scale < 1.0', input_names=('_macro_scale',))
         pos_size = max(2.0, round(pos_size * _macro_scale, 2))
         notional = pos_size * lev
     _claudia_label = "Bullish" if _claudia_dir == 1 else ("Bearish" if _claudia_dir == -1 else "Neutral")
@@ -13401,6 +13627,7 @@ def _live_try_entry(signals: dict, regime: str, _notional_skip: set = None) -> N
 
     # Observer Moderate: reduce position size 0.7x (light does not affect size)
     if _observer_key == "moderate":
+        globals().get("_decision_record", lambda *a, **k: None)('branch', locals(), function='_live_try_entry', source_line=13403, expression='_observer_key == "moderate"', input_names=('_observer_key',))
         pos_size = max(2.0, round(pos_size * 0.7, 2))
         notional = pos_size * lev
         _live_log(f"  📉 Observer MODERATE: position scaled x0.70 -> ${pos_size:.2f}")
@@ -13413,16 +13640,23 @@ def _live_try_entry(signals: dict, regime: str, _notional_skip: set = None) -> N
     # Check IG minimum feasibility
     if not _sim_check_min_feasible(sym, pos_size, lev):
         # Try with $10 fixed if pct_10 too small
+        globals().get("_decision_record", lambda *a, **k: None)('branch', locals(), function='_live_try_entry', source_line=13414, expression='not _sim_check_min_feasible(sym, pos_size, lev)', input_names=('_sim_check_min_feasible', 'lev', 'pos_size', 'sym'))
         if not _sim_check_min_feasible(sym, 2.0, lev):
+            globals().get("_decision_record", lambda *a, **k: None)('gate', locals(), function='_live_try_entry', source_line=13416, expression='not _sim_check_min_feasible(sym, 2.0, lev)', input_names=('_sim_check_min_feasible', 'lev', 'sym'), gate_name='_live_try_entry:13416', result='FAIL')
             _live_log(f"skip {sym}: notional ${notional:.2f} < IG min "
                       f"${_sim_min_notional.get(sym, 0):.2f}")
             # Hard structural gate — try the next ranked candidate (max 3 fallbacks)
             _skip = (_notional_skip or set()) | {sym}
             if len(_skip) <= 3:
+                globals().get("_decision_record", lambda *a, **k: None)('branch', locals(), function='_live_try_entry', source_line=13421, expression='len(_skip) <= 3', input_names=('_skip', 'len'))
                 if len(_skip) == 1:
+                    globals().get("_decision_record", lambda *a, **k: None)('branch', locals(), function='_live_try_entry', source_line=13422, expression='len(_skip) == 1', input_names=('_skip', 'len'))
                     _live_log(f"  -> notional hard gate — trying ranked fallback")
+                globals().get("_decision_record", lambda *a, **k: None)('fallback', locals())
                 _live_try_entry(signals, regime, _notional_skip=_skip)
+            globals().get("_decision_record", lambda *a, **k: None)('function_return', locals(), function='_live_try_entry', source_line=13425)
             return
+        globals().get("_decision_record", lambda *a, **k: None)('gate', locals(), function='_live_try_entry', source_line=13416, expression='not _sim_check_min_feasible(sym, 2.0, lev)', input_names=('_sim_check_min_feasible', 'lev', 'sym'), gate_name='_live_try_entry:13416', result='PASS')
         pos_size = 2.0
         notional = pos_size * lev
 
@@ -13442,36 +13676,48 @@ def _live_try_entry(signals: dict, regime: str, _notional_skip: set = None) -> N
     # _live_trade_guard() inside _live_open_position() provides a second
     # structural backstop, but this gate makes the dry-run explicit in logs.
     if not _june_live_trading_enabled:
+        globals().get("_decision_record", lambda *a, **k: None)('gate', locals(), function='_live_try_entry', source_line=13444, expression='not _june_live_trading_enabled', input_names=('_june_live_trading_enabled',), gate_name='_live_try_entry:13444', result='FAIL')
         _live_log(
             f"[DRY-RUN] would enter {sym}/{direction} conv={conv}/10 "
             f"lev={lev}:1 pos=${pos_size:.2f} — live halted, no order placed"
         )
+        globals().get("_decision_record", lambda *a, **k: None)('function_return', locals(), function='_live_try_entry', source_line=13449)
         return
+    globals().get("_decision_record", lambda *a, **k: None)('gate', locals(), function='_live_try_entry', source_line=13444, expression='not _june_live_trading_enabled', input_names=('_june_live_trading_enabled',), gate_name='_live_try_entry:13444', result='PASS')
     # Pre-flight margin check: mirrors MARGIN GATE inside _live_open_position()
     # but catches it here so fallback to the next ranked candidate works.
     # Without this, a margin-less candidate wins selection every cycle and blocks
     # all lower-ranked instruments — the return inside _live_open_position()
     # exits without trying _ranked[1], _ranked[2], etc.
     if sym not in _live_fx_instruments and _live_margin.get(sym, 0.0) <= 0:
+        globals().get("_decision_record", lambda *a, **k: None)('gate', locals(), function='_live_try_entry', source_line=13455, expression='sym not in _live_fx_instruments and _live_margin.get(sym, 0.0) <= 0', input_names=('_live_fx_instruments', '_live_margin', 'sym'), gate_name='_live_try_entry:13455', result='FAIL')
         _live_log(f"🚫 MARGIN PRECHECK: {sym} margin not loaded — trying next ranked candidate")
         _skip = (_notional_skip or set()) | {sym}
         if len(_skip) <= 3:
+            globals().get("_decision_record", lambda *a, **k: None)('branch', locals(), function='_live_try_entry', source_line=13458, expression='len(_skip) <= 3', input_names=('_skip', 'len'))
+            globals().get("_decision_record", lambda *a, **k: None)('fallback', locals())
             _live_try_entry(signals, regime, _notional_skip=_skip)
+        globals().get("_decision_record", lambda *a, **k: None)('function_return', locals(), function='_live_try_entry', source_line=13460)
         return
+    globals().get("_decision_record", lambda *a, **k: None)('gate', locals(), function='_live_try_entry', source_line=13455, expression='sym not in _live_fx_instruments and _live_margin.get(sym, 0.0) <= 0', input_names=('_live_fx_instruments', '_live_margin', 'sym'), gate_name='_live_try_entry:13455', result='PASS')
     # MinDeal over-sizing guard: pre-screens commodity CFDs where IG's minimum lot
     # forces actual exposure beyond _MINDEAL_OVERSIZE_MAX × the risk-ceiling-approved
     # desired_notional. Mirrors MARGIN PRECHECK pattern so the next ranked candidate
     # is tried rather than the cycle aborting. Equity minDeal is handled separately
     # by the EQUITY LEV GATE inside _live_open_position().
     if sym not in _live_equity_cfd and sym not in _live_fx_instruments:
+        globals().get("_decision_record", lambda *a, **k: None)('branch', locals(), function='_live_try_entry', source_line=13466, expression='sym not in _live_equity_cfd and sym not in _live_fx_instruments', input_names=('_live_equity_cfd', '_live_fx_instruments', 'sym'))
         _md_mid = sig.get("price", 0.0)
         _md_lot = _live_lot_sizes.get(sym, _LIVE_LOT_SIZE_FX)
         _md_mdl = _live_min_deal.get(sym, 1.0)
         if _md_mid > 0 and _md_lot > 0 and notional > 0:
+            globals().get("_decision_record", lambda *a, **k: None)('branch', locals(), function='_live_try_entry', source_line=13470, expression='_md_mid > 0 and _md_lot > 0 and notional > 0', input_names=('_md_lot', '_md_mid', 'notional'))
             _md_formula = notional / (_md_lot * _md_mid)  # unclamped lot count
             if _md_formula > 0 and _md_mdl > _md_formula:
+                globals().get("_decision_record", lambda *a, **k: None)('branch', locals(), function='_live_try_entry', source_line=13472, expression='_md_formula > 0 and _md_mdl > _md_formula', input_names=('_md_formula', '_md_mdl'))
                 _md_ratio = round(_md_mdl / _md_formula, 2)
                 if _md_ratio > _MINDEAL_OVERSIZE_MAX:
+                    globals().get("_decision_record", lambda *a, **k: None)('gate', locals(), function='_live_try_entry', source_line=13474, expression='_md_ratio > _MINDEAL_OVERSIZE_MAX', input_names=('_MINDEAL_OVERSIZE_MAX', '_md_ratio'), gate_name='_live_try_entry:13474', result='FAIL')
                     _live_log(
                         f"🚫 MINDEAL GUARD: {sym} blocked — minDeal {_md_mdl} forces "
                         f"{_md_ratio:.1f}× intended risk "
@@ -13481,8 +13727,12 @@ def _live_try_entry(signals: dict, regime: str, _notional_skip: set = None) -> N
                     )
                     _skip = (_notional_skip or set()) | {sym}
                     if len(_skip) <= 3:
+                        globals().get("_decision_record", lambda *a, **k: None)('branch', locals(), function='_live_try_entry', source_line=13483, expression='len(_skip) <= 3', input_names=('_skip', 'len'))
+                        globals().get("_decision_record", lambda *a, **k: None)('fallback', locals())
                         _live_try_entry(signals, regime, _notional_skip=_skip)
+                    globals().get("_decision_record", lambda *a, **k: None)('function_return', locals(), function='_live_try_entry', source_line=13485)
                     return
+                globals().get("_decision_record", lambda *a, **k: None)('gate', locals(), function='_live_try_entry', source_line=13474, expression='_md_ratio > _MINDEAL_OVERSIZE_MAX', input_names=('_MINDEAL_OVERSIZE_MAX', '_md_ratio'), gate_name='_live_try_entry:13474', result='PASS')
     _b1_build = globals().get("_live_b1_build_snapshot")
     _b1_gate = globals().get("_live_b1_reentry_allowed")
     _b1_snapshot = (_b1_build(
@@ -13491,16 +13741,22 @@ def _live_try_entry(signals: dict, regime: str, _notional_skip: set = None) -> N
         _last_cycle_direction.get(sym) == ("bull" if direction == "long" else "bear"))
         if _b1_build is not None else {})
     if _b1_gate is not None and not _b1_gate(sym, direction, _b1_snapshot):
+        globals().get("_decision_record", lambda *a, **k: None)('gate', locals(), function='_live_try_entry', source_line=13493, expression='_b1_gate is not None and not _b1_gate(sym, direction, _b1_snapshot)', input_names=('_b1_gate', '_b1_snapshot', 'direction', 'sym'), gate_name='_live_try_entry:13493', result='FAIL')
         _skip = (_notional_skip or set()) | {sym}
         if len(_skip) <= 3:
+            globals().get("_decision_record", lambda *a, **k: None)('branch', locals(), function='_live_try_entry', source_line=13495, expression='len(_skip) <= 3', input_names=('_skip', 'len'))
+            globals().get("_decision_record", lambda *a, **k: None)('fallback', locals())
             _live_try_entry(signals, regime, _notional_skip=_skip)
+        globals().get("_decision_record", lambda *a, **k: None)('function_return', locals(), function='_live_try_entry', source_line=13497)
         return
+    globals().get("_decision_record", lambda *a, **k: None)('gate', locals(), function='_live_try_entry', source_line=13493, expression='_b1_gate is not None and not _b1_gate(sym, direction, _b1_snapshot)', input_names=('_b1_gate', '_b1_snapshot', 'direction', 'sym'), gate_name='_live_try_entry:13493', result='PASS')
 
     # Re-entry observation telemetry: fires when an entry is about to open.
     # Double try/except; any exception here must never veto the entry.
     try:
         _prev_rev = _live_reversal_exits.get(sym)
         if _prev_rev is not None:
+            globals().get("_decision_record", lambda *a, **k: None)('branch', locals(), function='_live_try_entry', source_line=13503, expression='_prev_rev is not None', input_names=('_prev_rev',))
             _elapsed_s   = time.time() - _prev_rev["exit_epoch"]
             _same_dir    = (_prev_rev["direction"] == direction)
             _interval_bk = ("<=5m"  if _elapsed_s <= 300  else
@@ -13689,6 +13945,7 @@ def _run_live_step_observed(signals: dict) -> None:
     regime = "neutral"
     try:
         raw = _redis().get("june_macro_regime")
+        globals().get("_decision_record", lambda *a, **k: None)('strategic_read', locals(), key='june_macro_regime', variable='raw', function='_run_live_step_observed')
         if raw:
             regime = json.loads(raw).get("regime", "neutral")
     except Exception:
@@ -13763,7 +14020,11 @@ def _run_live_step_observed(signals: dict) -> None:
     # Entry check (FX weekend gate is now per-instrument inside _live_try_entry)
     if not _defensive_ready:
         return
-    _live_try_entry(signals, regime)
+    globals().get("_decision_record", lambda *a, **k: None)('begin', locals())
+    try:
+        _live_try_entry(signals, regime)
+    finally:
+        globals().get("_decision_record", lambda *a, **k: None)('finish', locals())
     _live_shadow_evaluate_blocked(signals, regime)
 
 
@@ -14652,6 +14913,281 @@ def main():
                 consec_errors = 0
             else:
                 time.sleep(30)
+
+
+
+
+def _decision_record(event, values, **metadata):
+    """Optional observer only. Never returns a decision or raises to trading."""
+    try:
+        from decision_ledger import observe
+        observe(event, values, globals(), **metadata)
+    except Exception:
+        pass
+
+
+_DECISION_GATE_CATALOG = ({'gate_name': '_live_instrument_capability:8771',
+  'catalog_order': 1,
+  'function': '_live_instrument_capability',
+  'expression': 'status == "EDITS_ONLY"',
+  'source_line': 8771},
+ {'gate_name': '_live_instrument_capability:8773',
+  'catalog_order': 2,
+  'function': '_live_instrument_capability',
+  'expression': 'status in ("CLOSED", "OFFLINE", "SUSPENDED", "UNTRADEABLE")',
+  'source_line': 8773},
+ {'gate_name': '_live_instrument_capability:8776',
+  'catalog_order': 3,
+  'function': '_live_instrument_capability',
+  'expression': 'sym not in _live_fx_instruments',
+  'source_line': 8776},
+ {'gate_name': '_live_is_eligible:8800',
+  'catalog_order': 4,
+  'function': '_live_is_eligible',
+  'expression': 'not _cap_ok',
+  'source_line': 8800},
+ {'gate_name': '_live_is_eligible:8809',
+  'catalog_order': 5,
+  'function': '_live_is_eligible',
+  'expression': 'bal <= 0',
+  'source_line': 8809},
+ {'gate_name': '_live_is_eligible:8811',
+  'catalog_order': 6,
+  'function': '_live_is_eligible',
+  'expression': 'sym in _live_fx_instruments',
+  'source_line': 8811},
+ {'gate_name': '_live_select_instrument:11369',
+  'catalog_order': 7,
+  'function': '_live_select_instrument',
+  'expression': 'bal <= 0',
+  'source_line': 11369},
+ {'gate_name': '_live_select_instrument:11374',
+  'catalog_order': 8,
+  'function': '_live_select_instrument',
+  'expression': 'not _live_is_eligible(sym)',
+  'source_line': 11374},
+ {'gate_name': '_live_select_instrument:11376',
+  'catalog_order': 9,
+  'function': '_live_select_instrument',
+  'expression': 'sym not in signals',
+  'source_line': 11376},
+ {'gate_name': '_live_select_instrument:11384',
+  'catalog_order': 10,
+  'function': '_live_select_instrument',
+  'expression': 'vol < thresh',
+  'source_line': 11384},
+ {'gate_name': '_live_select_instrument:11386',
+  'catalog_order': 11,
+  'function': '_live_select_instrument',
+  'expression': 'sig.get("spread_alert")',
+  'source_line': 11386},
+ {'gate_name': '_live_select_instrument:11388',
+  'catalog_order': 12,
+  'function': '_live_select_instrument',
+  'expression': 'direction_str and _live_is_paused(_sim_combo_key(sym, direction_str))',
+  'source_line': 11388},
+ {'gate_name': '_live_select_instrument:11390',
+  'catalog_order': 13,
+  'function': '_live_select_instrument',
+  'expression': 'time.time() < (_live.get("instrument_cooldown") or {}).get(sym, 0.0)',
+  'source_line': 11390},
+ {'gate_name': '_live_select_instrument:11392',
+  'catalog_order': 14,
+  'function': '_live_select_instrument',
+  'expression': 'regime == "bull" and dirn != "bull"',
+  'source_line': 11392},
+ {'gate_name': '_live_select_instrument:11393',
+  'catalog_order': 15,
+  'function': '_live_select_instrument',
+  'expression': 'regime == "bear" and dirn != "bear"',
+  'source_line': 11393},
+ {'gate_name': '_live_select_instrument:11394',
+  'catalog_order': 16,
+  'function': '_live_select_instrument',
+  'expression': 'regime in ("volatile", "neutral") and dirn == "neutral"',
+  'source_line': 11394},
+ {'gate_name': '_live_select_instrument:11403',
+  'catalog_order': 17,
+  'function': '_live_select_instrument',
+  'expression': '_live_perf_blocked(sym)',
+  'source_line': 11403},
+ {'gate_name': '_live_select_instrument:11397',
+  'catalog_order': 18,
+  'function': '_live_select_instrument',
+  'expression': 'skip',
+  'source_line': 11397},
+ {'gate_name': '_live_try_entry:13105',
+  'catalog_order': 19,
+  'function': '_live_try_entry',
+  'expression': '_live.get("open_position")',
+  'source_line': 13105},
+ {'gate_name': '_live_try_entry:13108',
+  'catalog_order': 20,
+  'function': '_live_try_entry',
+  'expression': '_live.get("orphan_suspected") or _live.get("manual_review_required")\n'
+                '            or _live.get("pyramid_legs") or _live.get("pyramid_entry_pending")',
+  'source_line': 13108},
+ {'gate_name': '_live_try_entry:13116',
+  'catalog_order': 21,
+  'function': '_live_try_entry',
+  'expression': 'bal <= 0',
+  'source_line': 13116},
+ {'gate_name': '_live_try_entry:13158',
+  'catalog_order': 22,
+  'function': '_live_try_entry',
+  'expression': 'not _ranked',
+  'source_line': 13158},
+ {'gate_name': '_live_try_entry:13163',
+  'catalog_order': 23,
+  'function': '_live_try_entry',
+  'expression': 'sym not in _ext',
+  'source_line': 13163},
+ {'gate_name': '_live_try_entry:13178',
+  'catalog_order': 24,
+  'function': '_live_try_entry',
+  'expression': 'sym in _METALS_INSTRUMENTS and _is_metals_weekend_closure()',
+  'source_line': 13178},
+ {'gate_name': '_live_try_entry:13184',
+  'catalog_order': 25,
+  'function': '_live_try_entry',
+  'expression': 'sym not in _CONTINUOUS_INSTRUMENTS and is_weekend_closure()',
+  'source_line': 13184},
+ {'gate_name': '_live_try_entry:13295',
+  'catalog_order': 26,
+  'function': '_live_try_entry',
+  'expression': '_eff_conv_floor > 0 and conv < _eff_conv_floor',
+  'source_line': 13295},
+ {'gate_name': '_live_try_entry:13337',
+  'catalog_order': 27,
+  'function': '_live_try_entry',
+  'expression': '_ex_ratio >= _EXHAUST_RATIO_BLOCK',
+  'source_line': 13337},
+ {'gate_name': '_live_try_entry:13444',
+  'catalog_order': 28,
+  'function': '_live_try_entry',
+  'expression': 'not _june_live_trading_enabled',
+  'source_line': 13444},
+ {'gate_name': '_live_try_entry:13455',
+  'catalog_order': 29,
+  'function': '_live_try_entry',
+  'expression': 'sym not in _live_fx_instruments and _live_margin.get(sym, 0.0) <= 0',
+  'source_line': 13455},
+ {'gate_name': '_live_try_entry:13493',
+  'catalog_order': 30,
+  'function': '_live_try_entry',
+  'expression': '_b1_gate is not None and not _b1_gate(sym, direction, _b1_snapshot)',
+  'source_line': 13493},
+ {'gate_name': '_live_try_entry:13123',
+  'catalog_order': 31,
+  'function': '_live_try_entry',
+  'expression': '_eq_b in _ext',
+  'source_line': 13123},
+ {'gate_name': '_live_try_entry:13125',
+  'catalog_order': 32,
+  'function': '_live_try_entry',
+  'expression': '_now_ext - _eq_d.get("ts", 0) > 20 * 60',
+  'source_line': 13125},
+ {'gate_name': '_live_try_entry:13128',
+  'catalog_order': 33,
+  'function': '_live_try_entry',
+  'expression': '_eq_mid <= 0.0',
+  'source_line': 13128},
+ {'gate_name': '_live_try_entry:13199',
+  'catalog_order': 34,
+  'function': '_live_try_entry',
+  'expression': '_sar5 > _thr5',
+  'source_line': 13199},
+ {'gate_name': '_live_try_entry:13218',
+  'catalog_order': 35,
+  'function': '_live_try_entry',
+  'expression': 'direction == "long" and cur_px < price_1m and rev_pct >= _SIM_1M_MIN_REVERSAL',
+  'source_line': 13218},
+ {'gate_name': '_live_try_entry:13220',
+  'catalog_order': 36,
+  'function': '_live_try_entry',
+  'expression': 'direction == "short" and cur_px > price_1m and rev_pct >= _SIM_1M_MIN_REVERSAL',
+  'source_line': 13220},
+ {'gate_name': '_live_try_entry:13237',
+  'catalog_order': 37,
+  'function': '_live_try_entry',
+  'expression': 'blocked',
+  'source_line': 13237},
+ {'gate_name': '_live_try_entry:13268',
+  'catalog_order': 38,
+  'function': '_live_try_entry',
+  'expression': '_htf_opp_blocked',
+  'source_line': 13268},
+ {'gate_name': '_live_try_entry:13416',
+  'catalog_order': 39,
+  'function': '_live_try_entry',
+  'expression': 'not _sim_check_min_feasible(sym, 2.0, lev)',
+  'source_line': 13416},
+ {'gate_name': '_live_try_entry:13474',
+  'catalog_order': 40,
+  'function': '_live_try_entry',
+  'expression': '_md_ratio > _MINDEAL_OVERSIZE_MAX',
+  'source_line': 13474},
+ {'gate_name': '_live_open_position:9422',
+  'catalog_order': 41,
+  'function': '_live_open_position',
+  'expression': 'mid_price <= 0',
+  'source_line': 9422},
+ {'gate_name': '_live_open_position:9536',
+  'catalog_order': 42,
+  'function': '_live_open_position',
+  'expression': 'not _live_trade_guard()',
+  'source_line': 9536},
+ {'gate_name': '_live_open_position:9581',
+  'catalog_order': 43,
+  'function': '_live_open_position',
+  'expression': 'not resp',
+  'source_line': 9581},
+ {'gate_name': '_live_open_position:9587',
+  'catalog_order': 44,
+  'function': '_live_open_position',
+  'expression': 'not deal_ref',
+  'source_line': 9587},
+ {'gate_name': '_live_open_position:9593',
+  'catalog_order': 45,
+  'function': '_live_open_position',
+  'expression': 'not confirm',
+  'source_line': 9593},
+ {'gate_name': '_live_open_position:9598',
+  'catalog_order': 46,
+  'function': '_live_open_position',
+  'expression': 'status != "ACCEPTED"',
+  'source_line': 9598},
+ {'gate_name': '_live_open_position:9457',
+  'catalog_order': 47,
+  'function': '_live_open_position',
+  'expression': '_eff_lev > leverage + 0.5',
+  'source_line': 9457},
+ {'gate_name': '_live_open_position:9505',
+  'catalog_order': 48,
+  'function': '_live_open_position',
+  'expression': '_exp_gross < _rt_comm',
+  'source_line': 9505},
+ {'gate_name': '_live_open_position:9520',
+  'catalog_order': 49,
+  'function': '_live_open_position',
+  'expression': '_margin_raw <= 0',
+  'source_line': 9520},
+ {'gate_name': '_live_open_position:9529',
+  'catalog_order': 50,
+  'function': '_live_open_position',
+  'expression': '_req_mg > _avail',
+  'source_line': 9529},
+ {'gate_name': '_live_open_position:9550',
+  'catalog_order': 51,
+  'function': '_live_open_position',
+  'expression': '_drift > _PRESUBMIT_DRIFT_CAP',
+  'source_line': 9550})
+
+try:
+    from decision_ledger import initialize as _initialize_decision_ledger
+    _initialize_decision_ledger(__file__, _DECISION_GATE_CATALOG)
+except Exception:
+    pass
 
 
 if __name__ == "__main__":
