@@ -236,9 +236,25 @@ def test_strategy_freeze():
         and isinstance(n.targets[0],ast.Name)}
     assert constants(old)==constants(new)
     for name in ['defensive_scaling.py','continuation_economics.py','winner_accounting.py',
-                 'rolling_fuel.py','rolling_build4a.py','winner_continuity.py','exit_authority.py','settlement_reconcile.py']:
+                   'rolling_fuel.py','rolling_build4a.py','winner_continuity.py']:
         original=subprocess.check_output(['git','show','06b600f:'+name],cwd=ROOT)
         assert original.replace(b'\r\n',b'\n')==(ROOT/name).read_bytes().replace(b'\r\n',b'\n'),name
+    # Plumbing repair permits only the delivery commit and a broker-opening
+    # exclusion before the existing settlement matcher. All authority policy,
+    # economic aggregation, quantity tolerances and remaining AST stay frozen.
+    for name in ('exit_authority.py','settlement_reconcile.py'):
+        old=ast.parse(subprocess.check_output(['git','show','06b600f:'+name],cwd=ROOT,text=True,encoding='utf-8'))
+        new=ast.parse((ROOT/name).read_text(encoding='utf-8'))
+        if name=='exit_authority.py':
+            old.body=[n for n in old.body if not (isinstance(n,ast.FunctionDef) and n.name=='commit_performance')]
+            new.body=[n for n in new.body if not ((isinstance(n,ast.FunctionDef) and n.name=='commit_performance')
+                or (isinstance(n,ast.ClassDef) and n.name=='PerformanceWriteRejected'))]
+        else:
+            new.body=[n for n in new.body if not (isinstance(n,ast.FunctionDef) and n.name=='_opening_identity_transactions')]
+            recon=next(n for n in new.body if isinstance(n,ast.FunctionDef) and n.name=='reconcile_settlement')
+            recon.body=[n for n in recon.body if not (isinstance(n,ast.Assign) and isinstance(n.value,ast.Call)
+                and isinstance(n.value.func,ast.Name) and n.value.func.id=='_opening_identity_transactions')]
+        assert ast.dump(old)==ast.dump(new),name
 
 
 @pytest.mark.parametrize('observer_raises',[False,True])

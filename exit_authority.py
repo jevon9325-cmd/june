@@ -40,6 +40,10 @@ def contract(record):
     return {k: deepcopy(record[k]) for k in FIELDS if k in record}
 
 
+class PerformanceWriteRejected(RuntimeError):
+    """Definitive no-write response; durable delivery may be retried safely."""
+
+
 def commit_performance(redis, key, previous, stats, observation_id):
     """Atomic stats + permanent delivery identity; bounded windows aren't a ledger.
 
@@ -50,13 +54,24 @@ def commit_performance(redis, key, previous, stats, observation_id):
         redis.set(key, json.dumps(stats))  # unchanged explicit legacy delivery
         return True
     marker = 'june_perf_delivery:' + identity([key, observation_id])
-    result = redis.eval('''
+    from redis.exceptions import OutOfMemoryError
+    try:
+        result = redis.eval('''
         if redis.call('GET', KEYS[2]) then return 0 end
         if (redis.call('GET', KEYS[1]) or '') ~= ARGV[1] then return -1 end
-        redis.call('SET', KEYS[1], ARGV[2])
-        redis.call('SET', KEYS[2], ARGV[3])
+        local written = redis.pcall('MSET', KEYS[1], ARGV[2], KEYS[2], ARGV[3])
+        if type(written) == 'table' and written.err then
+            if string.find(written.err, 'OOM', 1, true) then return -2 end
+            return redis.error_reply(written.err)
+        end
         return 1
     ''', 2, key, marker, previous or '', json.dumps(stats), observation_id)
+    except OutOfMemoryError as exc:
+        # Either EVAL was refused or the sole atomic MSET was refused. No
+        # preceding mutation exists. Transport/lost-ack errors remain uncertain.
+        raise PerformanceWriteRejected('Performance write rejected by Redis OOM; replay required') from exc
+    if result == -2:
+        raise PerformanceWriteRejected('Performance write rejected by Redis OOM; replay required')
     if result == -1:
         raise RuntimeError('Performance history changed concurrently; replay required')
     return result == 1

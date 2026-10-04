@@ -1,0 +1,1210 @@
+{
+  "source": "read-only IG HT2Q8 history captured 2026-10-04; unchanged selected broker rows",
+  "records": [
+    {
+      "deal_id": "DIAAAAR9P26LJAK",
+      "instrument": "SILVER",
+      "direction": "long",
+      "entry_price": 6180.3,
+      "ig_size": 0.09,
+      "exit_epoch": 1790946207,
+      "partial_dollar_pnl": 1.035,
+      "broker_entry_evidence": {
+        "schema_version": 1,
+        "source": "june.accepted_entry_path",
+        "identity_status": "pending_broker_opening",
+        "identity_issues": [],
+        "account_id": "HT2Q8",
+        "account_evidence": {
+          "order": {
+            "account_id": "HT2Q8",
+            "currency": "USD",
+            "source": "IG.session.currentAccountId",
+            "verified": true
+          },
+          "confirmation": {
+            "account_id": "HT2Q8",
+            "currency": "USD",
+            "source": "IG.session.currentAccountId",
+            "verified": true
+          }
+        },
+        "instrument": "SILVER",
+        "role": "primary",
+        "deal_id": "DIAAAAR9P26LJAK",
+        "deal_reference": "6DJDZU7BDVNTYNV",
+        "broker_direction": "BUY",
+        "broker_quantity": 0.09,
+        "broker_level": 6180.3,
+        "broker_opened_utc": null,
+        "confirmation_utc": null,
+        "missing_for_reconciliation": [
+          "exact_broker_opening_utc",
+          "verified_transaction_instrument_name",
+          "verified_position_currency_and_unit_semantics"
+        ],
+        "submitted_order": {
+          "epic": "CS.D.CFDSILVER.BMU.IP",
+          "expiry": "-",
+          "direction": "BUY",
+          "size": 0.09,
+          "orderType": "MARKET",
+          "timeInForce": "FILL_OR_KILL",
+          "guaranteedStop": false,
+          "forceOpen": true,
+          "currencyCode": "USD",
+          "stopDistance": 13
+        },
+        "opening_response": {
+          "dealReference": "6DJDZU7BDVNTYNV"
+        },
+        "accepted_confirmation": {
+          "date": "2026-10-02T13:01:00.164",
+          "status": "OPEN",
+          "reason": "SUCCESS",
+          "dealStatus": "ACCEPTED",
+          "epic": "CS.D.CFDSILVER.BMU.IP",
+          "expiry": "-",
+          "dealReference": "6DJDZU7BDVNTYNV",
+          "dealId": "DIAAAAR9P26LJAK",
+          "affectedDeals": [
+            {
+              "dealId": "DIAAAAR9P26LJAK",
+              "status": "OPENED"
+            }
+          ],
+          "level": 6180.3,
+          "size": 0.09,
+          "direction": "BUY",
+          "stopLevel": 6167.3,
+          "limitLevel": null,
+          "stopDistance": null,
+          "limitDistance": null,
+          "guaranteedStop": false,
+          "trailingStop": false,
+          "profit": null,
+          "profitCurrency": null
+        },
+        "broker_market_snapshot": {
+          "source": "IG.markets.instrument",
+          "epic": "CS.D.CFDSILVER.BMU.IP",
+          "fields": {
+            "name": "Spot Silver ($1)",
+            "epic": "CS.D.CFDSILVER.BMU.IP",
+            "type": "CURRENCIES",
+            "lotSize": 1.0,
+            "contractSize": "1",
+            "unit": "CONTRACTS",
+            "onePipMeans": "1 Cents/Troy Ounce",
+            "valueOfOnePip": "1.00",
+            "currencies": [
+              {
+                "code": "$.",
+                "name": "USD",
+                "symbol": "$",
+                "baseExchangeRate": 1.0,
+                "exchangeRate": 0.77,
+                "isDefault": true
+              }
+            ]
+          }
+        },
+        "local_context": {
+          "entry_time": 1790946060.5556548,
+          "conviction": 6
+        }
+      },
+      "settlement_state": "PROVISIONAL",
+      "dollar_pnl": null
+    },
+    {
+      "deal_id": "DIAAAAR78ADVZAE",
+      "instrument": "NATGAS",
+      "direction": "long",
+      "entry_price": 3193.0,
+      "ig_size": 0.2,
+      "exit_epoch": 1790238916,
+      "partial_dollar_pnl": 0.0,
+      "broker_entry_evidence": {
+        "accepted_confirmation": {
+          "affectedDeals": [
+            {
+              "dealId": "DIAAAAR78ADVZAE",
+              "status": "OPENED"
+            }
+          ],
+          "date": "2026-09-24T08:29:32.851",
+          "dealId": "DIAAAAR78ADVZAE",
+          "dealReference": "8KK2RZF6L2JTYNV",
+          "dealStatus": "ACCEPTED",
+          "direction": "BUY",
+          "epic": "CC.D.NG.BMU.IP",
+          "expiry": "-",
+          "guaranteedStop": false,
+          "level": 3193.0,
+          "limitDistance": null,
+          "limitLevel": null,
+          "profit": null,
+          "profitCurrency": null,
+          "reason": "SUCCESS",
+          "size": 0.2,
+          "status": "OPEN",
+          "stopDistance": null,
+          "stopLevel": 3182.0,
+          "trailingStop": false
+        },
+        "account_evidence": {
+          "confirmation": {
+            "account_id": "HT2Q8",
+            "currency": "USD",
+            "source": "IG.session.currentAccountId",
+            "verified": true
+          },
+          "order": {
+            "account_id": "HT2Q8",
+            "currency": "USD",
+            "source": "IG.session.currentAccountId",
+            "verified": true
+          }
+        },
+        "account_id": "HT2Q8",
+        "broker_direction": "BUY",
+        "broker_level": 3193.0,
+        "broker_market_snapshot": {
+          "epic": "CC.D.NG.BMU.IP",
+          "fields": {
+            "contractSize": "1",
+            "currencies": [
+              {
+                "baseExchangeRate": 1.0,
+                "code": "$.",
+                "exchangeRate": 0.77,
+                "isDefault": true,
+                "name": "USD",
+                "symbol": "$"
+              }
+            ],
+            "epic": "CC.D.NG.BMU.IP",
+            "lotSize": 1.0,
+            "name": "Natural Gas ($1)",
+            "onePipMeans": "0.001 $ per MMBtu",
+            "type": "COMMODITIES",
+            "unit": "CONTRACTS",
+            "valueOfOnePip": "1.00"
+          },
+          "source": "IG.markets.instrument"
+        },
+        "broker_opened_utc": null,
+        "broker_quantity": 0.2,
+        "confirmation_utc": null,
+        "deal_id": "DIAAAAR78ADVZAE",
+        "deal_reference": "8KK2RZF6L2JTYNV",
+        "identity_issues": [],
+        "identity_status": "pending_broker_opening",
+        "instrument": "NATGAS",
+        "local_context": {
+          "conviction": 4,
+          "entry_time": 1790238573.2564704
+        },
+        "missing_for_reconciliation": [
+          "exact_broker_opening_utc",
+          "verified_transaction_instrument_name",
+          "verified_position_currency_and_unit_semantics"
+        ],
+        "opening_response": {
+          "dealReference": "8KK2RZF6L2JTYNV"
+        },
+        "role": "primary",
+        "schema_version": 1,
+        "source": "june.accepted_entry_path",
+        "submitted_order": {
+          "currencyCode": "USD",
+          "direction": "BUY",
+          "epic": "CC.D.NG.BMU.IP",
+          "expiry": "-",
+          "forceOpen": true,
+          "guaranteedStop": false,
+          "orderType": "MARKET",
+          "size": 0.2,
+          "stopDistance": 11,
+          "timeInForce": "FILL_OR_KILL"
+        }
+      },
+      "settlement_state": "PROVISIONAL",
+      "dollar_pnl": null,
+      "discovery_learning_quarantined": true
+    },
+    {
+      "deal_id": "DIAAAAR788TXRA3",
+      "instrument": "NATGAS",
+      "direction": "long",
+      "entry_price": 3193.0,
+      "ig_size": 0.04,
+      "exit_epoch": 1790248550,
+      "partial_dollar_pnl": 0.0,
+      "broker_entry_evidence": {
+        "accepted_confirmation": {
+          "affectedDeals": [
+            {
+              "dealId": "DIAAAAR788TXRA3",
+              "status": "OPENED"
+            }
+          ],
+          "date": "2026-09-24T11:07:52.501",
+          "dealId": "DIAAAAR788TXRA3",
+          "dealReference": "W5MSVXFBFBJTYNV",
+          "dealStatus": "ACCEPTED",
+          "direction": "BUY",
+          "epic": "CC.D.NG.BMU.IP",
+          "expiry": "-",
+          "guaranteedStop": false,
+          "level": 3193.0,
+          "limitDistance": null,
+          "limitLevel": null,
+          "profit": null,
+          "profitCurrency": null,
+          "reason": "SUCCESS",
+          "size": 0.04,
+          "status": "OPEN",
+          "stopDistance": null,
+          "stopLevel": 3178.0,
+          "trailingStop": false
+        },
+        "account_evidence": {
+          "confirmation": {
+            "account_id": "HT2Q8",
+            "currency": "USD",
+            "source": "IG.session.currentAccountId",
+            "verified": true
+          },
+          "order": {
+            "account_id": "HT2Q8",
+            "currency": "USD",
+            "source": "IG.session.currentAccountId",
+            "verified": true
+          }
+        },
+        "account_id": "HT2Q8",
+        "broker_direction": "BUY",
+        "broker_level": 3193.0,
+        "broker_market_snapshot": {
+          "epic": "CC.D.NG.BMU.IP",
+          "fields": {
+            "contractSize": "1",
+            "currencies": [
+              {
+                "baseExchangeRate": 1.0,
+                "code": "$.",
+                "exchangeRate": 0.77,
+                "isDefault": true,
+                "name": "USD",
+                "symbol": "$"
+              }
+            ],
+            "epic": "CC.D.NG.BMU.IP",
+            "lotSize": 1.0,
+            "name": "Natural Gas ($1)",
+            "onePipMeans": "0.001 $ per MMBtu",
+            "type": "COMMODITIES",
+            "unit": "CONTRACTS",
+            "valueOfOnePip": "1.00"
+          },
+          "source": "IG.markets.instrument"
+        },
+        "broker_opened_utc": null,
+        "broker_quantity": 0.04,
+        "confirmation_utc": null,
+        "deal_id": "DIAAAAR788TXRA3",
+        "deal_reference": "W5MSVXFBFBJTYNV",
+        "identity_issues": [],
+        "identity_status": "pending_broker_opening",
+        "instrument": "NATGAS",
+        "local_context": {
+          "entry_time": 1790248072.9365563,
+          "leg_index": 2,
+          "parent_deal_id": "DIAAAAR788ERHAS"
+        },
+        "missing_for_reconciliation": [
+          "exact_broker_opening_utc",
+          "verified_transaction_instrument_name",
+          "verified_position_currency_and_unit_semantics"
+        ],
+        "opening_response": {
+          "dealReference": "W5MSVXFBFBJTYNV"
+        },
+        "role": "add_on",
+        "schema_version": 1,
+        "source": "june.accepted_entry_path",
+        "submitted_order": {
+          "currencyCode": "USD",
+          "direction": "BUY",
+          "epic": "CC.D.NG.BMU.IP",
+          "expiry": "-",
+          "forceOpen": true,
+          "guaranteedStop": false,
+          "orderType": "MARKET",
+          "size": 0.04,
+          "stopDistance": 15,
+          "timeInForce": "FILL_OR_KILL"
+        }
+      },
+      "settlement_state": "PROVISIONAL",
+      "dollar_pnl": null,
+      "discovery_learning_quarantined": true
+    },
+    {
+      "deal_id": "DIAAAAR8LW8UXAS",
+      "instrument": "NATGAS",
+      "direction": "short",
+      "entry_price": 3136.0,
+      "ig_size": 0.12,
+      "exit_epoch": 1790553678,
+      "partial_dollar_pnl": 0.0,
+      "broker_entry_evidence": {
+        "accepted_confirmation": {
+          "affectedDeals": [
+            {
+              "dealId": "DIAAAAR8LW8UXAS",
+              "status": "OPENED"
+            }
+          ],
+          "date": "2026-09-27T22:30:57.074",
+          "dealId": "DIAAAAR8LW8UXAS",
+          "dealReference": "RPV2FTENGUETYNV",
+          "dealStatus": "ACCEPTED",
+          "direction": "SELL",
+          "epic": "CC.D.NG.BMU.IP",
+          "expiry": "-",
+          "guaranteedStop": false,
+          "level": 3136.0,
+          "limitDistance": null,
+          "limitLevel": null,
+          "profit": null,
+          "profitCurrency": null,
+          "reason": "SUCCESS",
+          "size": 0.12,
+          "status": "OPEN",
+          "stopDistance": null,
+          "stopLevel": 3148.0,
+          "trailingStop": false
+        },
+        "account_evidence": {
+          "confirmation": {
+            "account_id": "HT2Q8",
+            "currency": "USD",
+            "source": "IG.session.currentAccountId",
+            "verified": true
+          },
+          "order": {
+            "account_id": "HT2Q8",
+            "currency": "USD",
+            "source": "IG.session.currentAccountId",
+            "verified": true
+          }
+        },
+        "account_id": "HT2Q8",
+        "broker_direction": "SELL",
+        "broker_level": 3136.0,
+        "broker_market_snapshot": {
+          "epic": "CC.D.NG.BMU.IP",
+          "fields": {
+            "contractSize": "1",
+            "currencies": [
+              {
+                "baseExchangeRate": 1.0,
+                "code": "$.",
+                "exchangeRate": 0.77,
+                "isDefault": true,
+                "name": "USD",
+                "symbol": "$"
+              }
+            ],
+            "epic": "CC.D.NG.BMU.IP",
+            "lotSize": 1.0,
+            "name": "Natural Gas ($1)",
+            "onePipMeans": "0.001 $ per MMBtu",
+            "type": "COMMODITIES",
+            "unit": "CONTRACTS",
+            "valueOfOnePip": "1.00"
+          },
+          "source": "IG.markets.instrument"
+        },
+        "broker_opened_utc": null,
+        "broker_quantity": 0.12,
+        "confirmation_utc": null,
+        "deal_id": "DIAAAAR8LW8UXAS",
+        "deal_reference": "RPV2FTENGUETYNV",
+        "identity_issues": [],
+        "identity_status": "pending_broker_opening",
+        "instrument": "NATGAS",
+        "local_context": {
+          "conviction": 3,
+          "entry_time": 1790548257.5047445
+        },
+        "missing_for_reconciliation": [
+          "exact_broker_opening_utc",
+          "verified_transaction_instrument_name",
+          "verified_position_currency_and_unit_semantics"
+        ],
+        "opening_response": {
+          "dealReference": "RPV2FTENGUETYNV"
+        },
+        "role": "primary",
+        "schema_version": 1,
+        "source": "june.accepted_entry_path",
+        "submitted_order": {
+          "currencyCode": "USD",
+          "direction": "SELL",
+          "epic": "CC.D.NG.BMU.IP",
+          "expiry": "-",
+          "forceOpen": true,
+          "guaranteedStop": false,
+          "orderType": "MARKET",
+          "size": 0.12,
+          "stopDistance": 12,
+          "timeInForce": "FILL_OR_KILL"
+        }
+      },
+      "settlement_state": "PROVISIONAL",
+      "dollar_pnl": null,
+      "discovery_learning_quarantined": true
+    },
+    {
+      "deal_id": "DIAAAAR9UCFXRAY",
+      "instrument": "OIL",
+      "direction": "short",
+      "entry_price": 10185.7,
+      "ig_size": 0.04,
+      "exit_epoch": 1791151771,
+      "partial_dollar_pnl": 0.0,
+      "broker_entry_evidence": {
+        "schema_version": 1,
+        "source": "june.accepted_entry_path",
+        "identity_status": "pending_broker_opening",
+        "identity_issues": [],
+        "account_id": "HT2Q8",
+        "account_evidence": {
+          "order": {
+            "account_id": "HT2Q8",
+            "currency": "USD",
+            "source": "IG.session.currentAccountId",
+            "verified": true
+          },
+          "confirmation": {
+            "account_id": "HT2Q8",
+            "currency": "USD",
+            "source": "IG.session.currentAccountId",
+            "verified": true
+          }
+        },
+        "instrument": "OIL",
+        "role": "primary",
+        "deal_id": "DIAAAAR9UCFXRAY",
+        "deal_reference": "NHMJXYVTQ2ETYNV",
+        "broker_direction": "SELL",
+        "broker_quantity": 0.04,
+        "broker_level": 10185.7,
+        "broker_opened_utc": null,
+        "confirmation_utc": null,
+        "missing_for_reconciliation": [
+          "exact_broker_opening_utc",
+          "verified_transaction_instrument_name",
+          "verified_position_currency_and_unit_semantics"
+        ],
+        "submitted_order": {
+          "epic": "CC.D.LCO.BMU.IP",
+          "expiry": "-",
+          "direction": "SELL",
+          "size": 0.04,
+          "orderType": "MARKET",
+          "timeInForce": "FILL_OR_KILL",
+          "guaranteedStop": false,
+          "forceOpen": true,
+          "currencyCode": "USD",
+          "stopDistance": 13
+        },
+        "opening_response": {
+          "dealReference": "NHMJXYVTQ2ETYNV"
+        },
+        "accepted_confirmation": {
+          "date": "2026-10-04T22:08:18.015",
+          "status": "OPEN",
+          "reason": "SUCCESS",
+          "dealStatus": "ACCEPTED",
+          "epic": "CC.D.LCO.BMU.IP",
+          "expiry": "-",
+          "dealReference": "NHMJXYVTQ2ETYNV",
+          "dealId": "DIAAAAR9UCFXRAY",
+          "affectedDeals": [
+            {
+              "dealId": "DIAAAAR9UCFXRAY",
+              "status": "OPENED"
+            }
+          ],
+          "level": 10185.7,
+          "size": 0.04,
+          "direction": "SELL",
+          "stopLevel": 10198.7,
+          "limitLevel": null,
+          "stopDistance": null,
+          "limitDistance": null,
+          "guaranteedStop": false,
+          "trailingStop": false,
+          "profit": null,
+          "profitCurrency": null
+        },
+        "broker_market_snapshot": {
+          "source": "IG.markets.instrument",
+          "epic": "CC.D.LCO.BMU.IP",
+          "fields": {
+            "name": "Oil - Brent Crude ($1)",
+            "epic": "CC.D.LCO.BMU.IP",
+            "type": "COMMODITIES",
+            "lotSize": 1.0,
+            "contractSize": "1",
+            "unit": "CONTRACTS",
+            "onePipMeans": "1",
+            "valueOfOnePip": "1.00",
+            "currencies": [
+              {
+                "code": "$.",
+                "name": "USD",
+                "symbol": "$",
+                "baseExchangeRate": 1.0,
+                "exchangeRate": 0.77,
+                "isDefault": true
+              }
+            ]
+          }
+        },
+        "local_context": {
+          "entry_time": 1791151698.4357262,
+          "conviction": 5
+        }
+      },
+      "settlement_state": "PROVISIONAL",
+      "dollar_pnl": null
+    }
+  ],
+  "activities": [
+    {
+      "date": "2026-09-24T11:15:48",
+      "epic": "CC.D.NG.BMU.IP",
+      "period": "-",
+      "dealId": "DIAAAAR79AJG3AX",
+      "channel": "PUBLIC_WEB_API",
+      "type": "POSITION",
+      "status": "ACCEPTED",
+      "description": "Position/s closed: 788TXRA3",
+      "details": {
+        "dealReference": "L6DTQ8TJX9WTYNV",
+        "actions": [
+          {
+            "actionType": "POSITION_CLOSED",
+            "affectedDealId": "DIAAAAR788TXRA3"
+          }
+        ],
+        "marketName": "Natural Gas ($1)",
+        "goodTillDate": null,
+        "currency": "USD",
+        "size": 0.04,
+        "direction": "SELL",
+        "level": 3191,
+        "stopLevel": 3172.259,
+        "stopDistance": 20.741,
+        "guaranteedStop": false,
+        "trailingStopDistance": null,
+        "trailingStep": null,
+        "limitLevel": null,
+        "limitDistance": null
+      }
+    },
+    {
+      "date": "2026-09-24T11:07:53",
+      "epic": "CC.D.NG.BMU.IP",
+      "period": "-",
+      "dealId": "DIAAAAR788XJ3BG",
+      "channel": "PUBLIC_WEB_API",
+      "type": "EDIT_STOP_AND_LIMIT",
+      "status": "ACCEPTED",
+      "description": "Stop/Limit amended: 788TXRA3",
+      "details": {
+        "dealReference": "X4Q2EC6Z2PSTYNV",
+        "actions": [
+          {
+            "actionType": "STOP_LIMIT_AMENDED",
+            "affectedDealId": "DIAAAAR788TXRA3"
+          }
+        ],
+        "marketName": "Natural Gas ($1)",
+        "goodTillDate": null,
+        "currency": "USD",
+        "size": 0.04,
+        "direction": "BUY",
+        "level": 3193,
+        "stopLevel": 3172.259,
+        "stopDistance": 20.741,
+        "guaranteedStop": false,
+        "trailingStopDistance": null,
+        "trailingStep": null,
+        "limitLevel": null,
+        "limitDistance": null
+      }
+    },
+    {
+      "date": "2026-09-24T11:07:52",
+      "epic": "CC.D.NG.BMU.IP",
+      "period": "-",
+      "dealId": "DIAAAAR788TXRA3",
+      "channel": "PUBLIC_WEB_API",
+      "type": "POSITION",
+      "status": "ACCEPTED",
+      "description": "Position opened: 788TXRA3",
+      "details": {
+        "dealReference": "W5MSVXFBFBJTYNV",
+        "actions": [
+          {
+            "actionType": "POSITION_OPENED",
+            "affectedDealId": "DIAAAAR788TXRA3"
+          }
+        ],
+        "marketName": "Natural Gas ($1)",
+        "goodTillDate": null,
+        "currency": "USD",
+        "size": 0.04,
+        "direction": "BUY",
+        "level": 3193,
+        "stopLevel": 3178,
+        "stopDistance": 15,
+        "guaranteedStop": false,
+        "trailingStopDistance": null,
+        "trailingStep": null,
+        "limitLevel": null,
+        "limitDistance": null
+      }
+    },
+    {
+      "date": "2026-09-24T08:35:13",
+      "epic": "CC.D.NG.BMU.IP",
+      "period": "-",
+      "dealId": "DIAAAAR78BNC2BF",
+      "channel": "PUBLIC_WEB_API",
+      "type": "POSITION",
+      "status": "ACCEPTED",
+      "description": "Position/s closed: 78ADVZAE",
+      "details": {
+        "dealReference": "Y5PPSGL4A9JTYNV",
+        "actions": [
+          {
+            "actionType": "POSITION_CLOSED",
+            "affectedDealId": "DIAAAAR78ADVZAE"
+          }
+        ],
+        "marketName": "Natural Gas ($1)",
+        "goodTillDate": null,
+        "currency": "USD",
+        "size": 0.2,
+        "direction": "SELL",
+        "level": 3184,
+        "stopLevel": 3182,
+        "stopDistance": 11,
+        "guaranteedStop": false,
+        "trailingStopDistance": null,
+        "trailingStep": null,
+        "limitLevel": null,
+        "limitDistance": null
+      }
+    },
+    {
+      "date": "2026-09-24T08:29:32",
+      "epic": "CC.D.NG.BMU.IP",
+      "period": "-",
+      "dealId": "DIAAAAR78ADVZAE",
+      "channel": "PUBLIC_WEB_API",
+      "type": "POSITION",
+      "status": "ACCEPTED",
+      "description": "Position opened: 78ADVZAE",
+      "details": {
+        "dealReference": "8KK2RZF6L2JTYNV",
+        "actions": [
+          {
+            "actionType": "POSITION_OPENED",
+            "affectedDealId": "DIAAAAR78ADVZAE"
+          }
+        ],
+        "marketName": "Natural Gas ($1)",
+        "goodTillDate": null,
+        "currency": "USD",
+        "size": 0.2,
+        "direction": "BUY",
+        "level": 3193,
+        "stopLevel": 3182,
+        "stopDistance": 11,
+        "guaranteedStop": false,
+        "trailingStopDistance": null,
+        "trailingStep": null,
+        "limitLevel": null,
+        "limitDistance": null
+      }
+    },
+    {
+      "date": "2026-09-28T00:01:15",
+      "epic": "CC.D.NG.BMU.IP",
+      "period": "-",
+      "dealId": "DIAAAAR8L57C8A2",
+      "channel": "PUBLIC_WEB_API",
+      "type": "POSITION",
+      "status": "ACCEPTED",
+      "description": "Position/s closed: 8LW8UXAS",
+      "details": {
+        "dealReference": "3QKZU5WUEEJTYNV",
+        "actions": [
+          {
+            "actionType": "POSITION_CLOSED",
+            "affectedDealId": "DIAAAAR8LW8UXAS"
+          }
+        ],
+        "marketName": "Natural Gas ($1)",
+        "goodTillDate": null,
+        "currency": "USD",
+        "size": 0.12,
+        "direction": "BUY",
+        "level": 3145,
+        "stopLevel": 3148,
+        "stopDistance": 12,
+        "guaranteedStop": false,
+        "trailingStopDistance": null,
+        "trailingStep": null,
+        "limitLevel": null,
+        "limitDistance": null
+      }
+    },
+    {
+      "date": "2026-09-27T22:30:57",
+      "epic": "CC.D.NG.BMU.IP",
+      "period": "-",
+      "dealId": "DIAAAAR8LW8UXAS",
+      "channel": "PUBLIC_WEB_API",
+      "type": "POSITION",
+      "status": "ACCEPTED",
+      "description": "Position opened: 8LW8UXAS",
+      "details": {
+        "dealReference": "RPV2FTENGUETYNV",
+        "actions": [
+          {
+            "actionType": "POSITION_OPENED",
+            "affectedDealId": "DIAAAAR8LW8UXAS"
+          }
+        ],
+        "marketName": "Natural Gas ($1)",
+        "goodTillDate": null,
+        "currency": "USD",
+        "size": 0.12,
+        "direction": "SELL",
+        "level": 3136,
+        "stopLevel": 3148,
+        "stopDistance": 12,
+        "guaranteedStop": false,
+        "trailingStopDistance": null,
+        "trailingStep": null,
+        "limitLevel": null,
+        "limitDistance": null
+      }
+    },
+    {
+      "date": "2026-09-28T00:01:15",
+      "epic": "CC.D.NG.BMU.IP",
+      "period": "-",
+      "dealId": "DIAAAAR8L57C8A2",
+      "channel": "PUBLIC_WEB_API",
+      "type": "POSITION",
+      "status": "ACCEPTED",
+      "description": "Position/s closed: 8LW8UXAS",
+      "details": {
+        "dealReference": "3QKZU5WUEEJTYNV",
+        "actions": [
+          {
+            "actionType": "POSITION_CLOSED",
+            "affectedDealId": "DIAAAAR8LW8UXAS"
+          }
+        ],
+        "marketName": "Natural Gas ($1)",
+        "goodTillDate": null,
+        "currency": "USD",
+        "size": 0.12,
+        "direction": "BUY",
+        "level": 3145,
+        "stopLevel": 3148,
+        "stopDistance": 12,
+        "guaranteedStop": false,
+        "trailingStopDistance": null,
+        "trailingStep": null,
+        "limitLevel": null,
+        "limitDistance": null
+      }
+    },
+    {
+      "date": "2026-09-27T22:30:57",
+      "epic": "CC.D.NG.BMU.IP",
+      "period": "-",
+      "dealId": "DIAAAAR8LW8UXAS",
+      "channel": "PUBLIC_WEB_API",
+      "type": "POSITION",
+      "status": "ACCEPTED",
+      "description": "Position opened: 8LW8UXAS",
+      "details": {
+        "dealReference": "RPV2FTENGUETYNV",
+        "actions": [
+          {
+            "actionType": "POSITION_OPENED",
+            "affectedDealId": "DIAAAAR8LW8UXAS"
+          }
+        ],
+        "marketName": "Natural Gas ($1)",
+        "goodTillDate": null,
+        "currency": "USD",
+        "size": 0.12,
+        "direction": "SELL",
+        "level": 3136,
+        "stopLevel": 3148,
+        "stopDistance": 12,
+        "guaranteedStop": false,
+        "trailingStopDistance": null,
+        "trailingStep": null,
+        "limitLevel": null,
+        "limitDistance": null
+      }
+    },
+    {
+      "date": "2026-10-02T13:03:18",
+      "epic": "CS.D.CFDSILVER.BMU.IP",
+      "period": "-",
+      "dealId": "DIAAAAR9P279UAH",
+      "channel": "SYSTEM",
+      "type": "POSITION",
+      "status": "ACCEPTED",
+      "description": "Position/s closed: 9P26LJAK",
+      "details": {
+        "dealReference": null,
+        "actions": [
+          {
+            "actionType": "POSITION_CLOSED",
+            "affectedDealId": "DIAAAAR9P26LJAK"
+          }
+        ],
+        "marketName": "Spot Silver ($1)",
+        "goodTillDate": null,
+        "currency": "USD",
+        "size": 0.045,
+        "direction": "SELL",
+        "level": 6191.6,
+        "stopLevel": 6191.69943,
+        "stopDistance": -11.39943,
+        "guaranteedStop": false,
+        "trailingStopDistance": null,
+        "trailingStep": null,
+        "limitLevel": null,
+        "limitDistance": null
+      }
+    },
+    {
+      "date": "2026-10-02T13:02:17",
+      "epic": "CS.D.CFDSILVER.BMU.IP",
+      "period": "-",
+      "dealId": "DIAAAAR9P4Q5XAP",
+      "channel": "PUBLIC_WEB_API",
+      "type": "EDIT_STOP_AND_LIMIT",
+      "status": "ACCEPTED",
+      "description": "Stop/Limit amended: 9P26LJAK",
+      "details": {
+        "dealReference": "2VYNS4YXT2STYNV",
+        "actions": [
+          {
+            "actionType": "STOP_LIMIT_AMENDED",
+            "affectedDealId": "DIAAAAR9P26LJAK"
+          }
+        ],
+        "marketName": "Spot Silver ($1)",
+        "goodTillDate": null,
+        "currency": "USD",
+        "size": 0.045,
+        "direction": "BUY",
+        "level": 6180.3,
+        "stopLevel": 6191.69943,
+        "stopDistance": -11.39943,
+        "guaranteedStop": false,
+        "trailingStopDistance": null,
+        "trailingStep": null,
+        "limitLevel": null,
+        "limitDistance": null
+      }
+    },
+    {
+      "date": "2026-10-02T13:02:14",
+      "epic": "CS.D.CFDSILVER.BMU.IP",
+      "period": "-",
+      "dealId": "DIAAAAR9P3ZAPBB",
+      "channel": "PUBLIC_WEB_API",
+      "type": "POSITION",
+      "status": "ACCEPTED",
+      "description": "Position partially closed: 9P26LJAK",
+      "details": {
+        "dealReference": "LMFBHYFSU8WTYNV",
+        "actions": [
+          {
+            "actionType": "POSITION_PARTIALLY_CLOSED",
+            "affectedDealId": "DIAAAAR9P26LJAK"
+          }
+        ],
+        "marketName": "Spot Silver ($1)",
+        "goodTillDate": null,
+        "currency": "USD",
+        "size": 0.045,
+        "direction": "SELL",
+        "level": 6203.3,
+        "stopLevel": null,
+        "stopDistance": null,
+        "guaranteedStop": false,
+        "trailingStopDistance": null,
+        "trailingStep": null,
+        "limitLevel": null,
+        "limitDistance": null
+      }
+    },
+    {
+      "date": "2026-10-02T13:02:12",
+      "epic": "CS.D.CFDSILVER.BMU.IP",
+      "period": "-",
+      "dealId": "DIAAAAR9P4VT9AQ",
+      "channel": "PUBLIC_WEB_API",
+      "type": "EDIT_STOP_AND_LIMIT",
+      "status": "ACCEPTED",
+      "description": "Stop/Limit amended: 9P26LJAK",
+      "details": {
+        "dealReference": "ZQT94AQXXVSTYNV",
+        "actions": [
+          {
+            "actionType": "STOP_LIMIT_AMENDED",
+            "affectedDealId": "DIAAAAR9P26LJAK"
+          }
+        ],
+        "marketName": "Spot Silver ($1)",
+        "goodTillDate": null,
+        "currency": "USD",
+        "size": 0.09,
+        "direction": "BUY",
+        "level": 6180.3,
+        "stopLevel": 6191.69943,
+        "stopDistance": -11.39943,
+        "guaranteedStop": false,
+        "trailingStopDistance": null,
+        "trailingStep": null,
+        "limitLevel": null,
+        "limitDistance": null
+      }
+    },
+    {
+      "date": "2026-10-02T13:01:00",
+      "epic": "CS.D.CFDSILVER.BMU.IP",
+      "period": "-",
+      "dealId": "DIAAAAR9P26LJAK",
+      "channel": "PUBLIC_WEB_API",
+      "type": "POSITION",
+      "status": "ACCEPTED",
+      "description": "Position opened: 9P26LJAK",
+      "details": {
+        "dealReference": "6DJDZU7BDVNTYNV",
+        "actions": [
+          {
+            "actionType": "POSITION_OPENED",
+            "affectedDealId": "DIAAAAR9P26LJAK"
+          }
+        ],
+        "marketName": "Spot Silver ($1)",
+        "goodTillDate": null,
+        "currency": "USD",
+        "size": 0.09,
+        "direction": "BUY",
+        "level": 6180.3,
+        "stopLevel": 6167.3,
+        "stopDistance": 13,
+        "guaranteedStop": false,
+        "trailingStopDistance": null,
+        "trailingStep": null,
+        "limitLevel": null,
+        "limitDistance": null
+      }
+    },
+    {
+      "date": "2026-10-04T22:08:29",
+      "epic": "CC.D.LCO.BMU.IP",
+      "period": "-",
+      "dealId": "DIAAAAR9UB3JXBA",
+      "channel": "SYSTEM",
+      "type": "POSITION",
+      "status": "ACCEPTED",
+      "description": "Position/s closed: 9UCFXRAY",
+      "details": {
+        "dealReference": null,
+        "actions": [
+          {
+            "actionType": "POSITION_CLOSED",
+            "affectedDealId": "DIAAAAR9UCFXRAY"
+          }
+        ],
+        "marketName": "Oil - Brent Crude ($1)",
+        "goodTillDate": null,
+        "currency": "USD",
+        "size": 0.04,
+        "direction": "BUY",
+        "level": 10198.7,
+        "stopLevel": 10198.7,
+        "stopDistance": 13,
+        "guaranteedStop": false,
+        "trailingStopDistance": null,
+        "trailingStep": null,
+        "limitLevel": null,
+        "limitDistance": null
+      }
+    },
+    {
+      "date": "2026-10-04T22:08:17",
+      "epic": "CC.D.LCO.BMU.IP",
+      "period": "-",
+      "dealId": "DIAAAAR9UCFXRAY",
+      "channel": "PUBLIC_WEB_API",
+      "type": "POSITION",
+      "status": "ACCEPTED",
+      "description": "Position opened: 9UCFXRAY",
+      "details": {
+        "dealReference": "NHMJXYVTQ2ETYNV",
+        "actions": [
+          {
+            "actionType": "POSITION_OPENED",
+            "affectedDealId": "DIAAAAR9UCFXRAY"
+          }
+        ],
+        "marketName": "Oil - Brent Crude ($1)",
+        "goodTillDate": null,
+        "currency": "USD",
+        "size": 0.04,
+        "direction": "SELL",
+        "level": 10185.7,
+        "stopLevel": 10198.7,
+        "stopDistance": 13,
+        "guaranteedStop": false,
+        "trailingStopDistance": null,
+        "trailingStep": null,
+        "limitLevel": null,
+        "limitDistance": null
+      }
+    }
+  ],
+  "transactions": [
+    {
+      "date": "2026-10-05",
+      "dateUtc": "2026-10-04T22:08:29",
+      "openDateUtc": "2026-10-04T22:08:18",
+      "instrumentName": "Oil - Brent Crude ($1)",
+      "period": "-",
+      "profitAndLoss": "$-0.52",
+      "transactionType": "DEAL",
+      "reference": "9UB3JXBA",
+      "openLevel": "10185.7",
+      "closeLevel": "10198.7",
+      "size": "-0.04",
+      "currency": "$",
+      "cashTransaction": false
+    },
+    {
+      "date": "2026-10-02",
+      "dateUtc": "2026-10-02T13:03:18",
+      "openDateUtc": "2026-10-02T13:01:00",
+      "instrumentName": "Spot Silver ($1)",
+      "period": "-",
+      "profitAndLoss": "$0.51",
+      "transactionType": "DEAL",
+      "reference": "9P279UAH",
+      "openLevel": "6180.3",
+      "closeLevel": "6191.6",
+      "size": "+0.04",
+      "currency": "$",
+      "cashTransaction": false
+    },
+    {
+      "date": "2026-10-02",
+      "dateUtc": "2026-10-02T13:02:14",
+      "openDateUtc": "2026-10-02T13:01:00",
+      "instrumentName": "Spot Silver ($1)",
+      "period": "-",
+      "profitAndLoss": "$1.04",
+      "transactionType": "DEAL",
+      "reference": "9P3ZAPBB",
+      "openLevel": "6180.3",
+      "closeLevel": "6203.3",
+      "size": "+0.04",
+      "currency": "$",
+      "cashTransaction": false
+    },
+    {
+      "date": "2026-09-28",
+      "dateUtc": "2026-09-28T00:01:15",
+      "openDateUtc": "2026-09-27T22:30:57",
+      "instrumentName": "Natural Gas ($1)",
+      "period": "-",
+      "profitAndLoss": "$-1.08",
+      "transactionType": "DEAL",
+      "reference": "8L57C8A2",
+      "openLevel": "3136",
+      "closeLevel": "3145",
+      "size": "-0.12",
+      "currency": "$",
+      "cashTransaction": false
+    },
+    {
+      "date": "2026-09-28",
+      "dateUtc": "2026-09-27T22:10:41",
+      "openDateUtc": "2026-09-27T22:06:04",
+      "instrumentName": "Natural Gas ($1)",
+      "period": "-",
+      "profitAndLoss": "$0.18",
+      "transactionType": "DEAL",
+      "reference": "8LVCJQAY",
+      "openLevel": "3136",
+      "closeLevel": "3135",
+      "size": "-0.18",
+      "currency": "$",
+      "cashTransaction": false
+    },
+    {
+      "date": "2026-09-24",
+      "dateUtc": "2026-09-24T11:15:48",
+      "openDateUtc": "2026-09-24T11:07:52",
+      "instrumentName": "Natural Gas ($1)",
+      "period": "-",
+      "profitAndLoss": "$-0.08",
+      "transactionType": "DEAL",
+      "reference": "79AJG3AX",
+      "openLevel": "3193",
+      "closeLevel": "3191",
+      "size": "+0.04",
+      "currency": "$",
+      "cashTransaction": false
+    },
+    {
+      "date": "2026-09-24",
+      "dateUtc": "2026-09-24T08:35:13",
+      "openDateUtc": "2026-09-24T08:29:32",
+      "instrumentName": "Natural Gas ($1)",
+      "period": "-",
+      "profitAndLoss": "$-1.80",
+      "transactionType": "DEAL",
+      "reference": "78BNC2BF",
+      "openLevel": "3193",
+      "closeLevel": "3184",
+      "size": "+0.20",
+      "currency": "$",
+      "cashTransaction": false
+    }
+  ]
+}

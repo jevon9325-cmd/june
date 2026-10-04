@@ -242,7 +242,7 @@ def commit_performance_once(registry, redis, key, previous, stats, observation_i
     has the permanent identity we can acknowledge; otherwise leave it pending and
     refuse automatic replay. A definitive CAS rejection is safely retryable.
     """
-    from exit_authority import commit_performance, identity as digest
+    from exit_authority import commit_performance, identity as digest, PerformanceWriteRejected
     if not observation_id:
         return commit_performance(redis, key, previous, stats, observation_id)
     instrument = key.removeprefix('june_perf_stats:')
@@ -264,7 +264,8 @@ def commit_performance_once(registry, redis, key, previous, stats, observation_i
     try:
         committed = commit_performance(redis, key, previous, stats, observation_id)
     except RuntimeError as exc:
-        if str(exc) == 'Performance history changed concurrently; replay required':
+        if (isinstance(exc, PerformanceWriteRejected)
+                or str(exc) == 'Performance history changed concurrently; replay required'):
             with closing(registry.connect()) as db, db:
                 db.execute('DELETE FROM performance_receipts WHERE account=? AND instrument=? '
                            'AND identity=? AND status=?',

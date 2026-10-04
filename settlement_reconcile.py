@@ -260,6 +260,52 @@ def aggregate_transactions(rows):
             "last_close_level": last_level, "unparseable": unparseable}
 
 
+def _opening_identity_transactions(record, transactions):
+    """Narrow reused price groups using the retained accepted broker opening.
+
+    This is exclusion, never certification. Legacy rows without this linkage
+    keep the existing conservative matcher. IG transaction opening UTC has
+    whole-second precision; accepted opening dates retain fractional seconds.
+    No local clock, outcome or current market state supplies the identity.
+    """
+    opening = record.get('broker_entry_evidence') or {}
+    accepted = opening.get('accepted_confirmation') or {}
+    from datetime import datetime, timezone
+    from math import isfinite
+    def broker_utc(value):
+        try:
+            stamp = datetime.fromisoformat(value.replace('Z', '+00:00'))
+            return (stamp.replace(tzinfo=timezone.utc) if stamp.tzinfo is None else stamp).timestamp()
+        except (AttributeError, TypeError, ValueError, OverflowError):
+            return None
+    opened = broker_utc(accepted.get('date'))
+    level = _to_float(accepted.get('level'))
+    quantity = _to_float(accepted.get('size'))
+    record_level = _to_float(record.get('entry_price'))
+    record_quantity = _to_float(record.get('ig_size'))
+    direction = accepted.get('direction')
+    if (not opening.get('account_id') or opening.get('deal_id') != record.get('deal_id')
+            or accepted.get('dealId') != record.get('deal_id')
+            or accepted.get('dealStatus') != 'ACCEPTED' or accepted.get('status') != 'OPEN'
+            or opened is None or level is None or record_level is None
+            or quantity is None or record_quantity is None
+            or not all(isfinite(v) for v in (level,record_level,quantity,record_quantity))
+            or quantity <= 0 or record_quantity <= 0
+            or abs(level-record_level) >= _LEVEL_EPS
+            or abs(quantity-record_quantity) >= _QTY_EPS
+            or direction not in ('BUY','SELL')):
+        return transactions
+    rows = []
+    for tx in transactions or []:
+        tx_opened = broker_utc(tx.get('openDateUtc'))
+        tx_size = _to_float(tx.get('size'))
+        if (tx_opened is not None and int(tx_opened) == int(opened)
+                and tx_size is not None and isfinite(tx_size) and tx_size != 0
+                and (tx_size > 0) == (direction == 'BUY')):
+            rows.append(tx)
+    return rows
+
+
 def reconcile_settlement(record, activities, transactions, instr_matcher, *, now=None):
     """Decide whether a PROVISIONAL campaign can CONFIRM from broker evidence.
 
@@ -282,6 +328,7 @@ def reconcile_settlement(record, activities, transactions, instr_matcher, *, now
     direction = record.get("direction", "long")
     opening_qty = _to_float(record.get("ig_size"))
     opening_level = record.get("entry_price")
+    transactions = _opening_identity_transactions(record, transactions)
 
     scan = scan_close_activity(deal_id, activities)
 

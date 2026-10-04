@@ -200,7 +200,10 @@ class Store:
                         document.get('commit_id'), document.get('strategy_config_id'), context_id,catalog_id,
                         None, None, 0, 0, None, zlib.compress(encoded(header))))
             for c in document['candidates'].values():
-                db.execute('INSERT OR IGNORE INTO decision_candidates VALUES(?,?,?,?,?,?,?,?)',
+                db.execute('INSERT INTO decision_candidates VALUES(?,?,?,?,?,?,?,?) '
+                           'ON CONFLICT(decision_cycle_id,candidate_id) DO UPDATE SET '
+                           'direction=excluded.direction,initial_rank=excluded.initial_rank,'
+                           'raw_score=excluded.raw_score,final_score=excluded.final_score,payload=excluded.payload',
                            (cid, c['candidate_id'], c['instrument'], c.get('direction'), c.get('rank'),
                             c.get('raw_score'), c.get('final_score'), zlib.compress(encoded(c))))
             for ev in document['events']:
@@ -453,8 +456,7 @@ class Recorder:
                 for rank,(s,score) in enumerate(pairs,1):
                     candidate=doc['candidates'].get(s)
                     if candidate and candidate['rank'] is None:
-                        sig=(values.get('signals') or {}).get(s,{})
-                        candidate.update(rank=rank,raw_score=abs(sig.get('change_5m',0)),final_score=score,
+                        candidate.update(rank=rank,final_score=score,
                                          rank_gap_to_next=score-pairs[rank][1] if rank<len(pairs) else None)
                     ranked.append({'instrument':s,'rank':rank,'score':score})
                 self._event('RANKING',round=doc['ranking_rounds'],ranked=ranked)
@@ -468,6 +470,16 @@ class Recorder:
             elif event=='fallback':
                 self._event('FALLBACK',symbol=symbol,skipped=values.get('_skip'),inputs=inputs)
             elif event=='gate':
+                # Threshold-rejected candidates still have an exact raw rank
+                # input. Only declared gate inputs are safe: other loop locals
+                # may belong to the previous instrument. No final score exists
+                # until the selector actually computes its adjusted rank.
+                candidate=doc['candidates'].get(symbol)
+                if (metadata.get('function')=='_live_select_instrument'
+                        and 'vol' in inputs and candidate is not None
+                        and candidate['raw_score'] is None):
+                    candidate.update(raw_score=freeze(inputs['vol']),
+                                     raw_score_sequence=len(doc['events'])+1)
                 self._event('GATE',symbol=symbol,inputs=inputs,**metadata)
             elif event=='branch':
                 self._event('BRANCH',symbol=symbol,inputs=inputs,**metadata)
@@ -476,6 +488,13 @@ class Recorder:
                 self._event('SCORE_COMPONENTS',symbol=symbol,components=components,total=values.get('raw'),
                             conviction=values.get('_final_conv'),score_kind='conviction_not_ranking')
             elif event=='score_rank':
+                candidate=doc['candidates'].get(symbol)
+                if candidate is not None and 'ranking_score_sequence' not in candidate:
+                    # Exact selector locals, frozen before later gates/fallbacks.
+                    # Conviction SCORE_COMPONENTS is a different score contract.
+                    candidate.update(raw_score=freeze(values.get('vol')),
+                                     final_score=freeze(values.get('eff_vol')),
+                                     ranking_score_sequence=len(doc['events'])+1)
                 self._event('RANK_COMPONENTS',symbol=symbol,raw=values.get('vol'),final=values.get('eff_vol'),
                             regime_weight=values.get('weight'),correlation_weight=values.get('corr_adj'),
                             wide_spread=(values.get('sig') or {}).get('spread_atr_wide'),signal=values.get('sig'))
