@@ -13034,6 +13034,17 @@ def _live_add_pyramid_leg(signals: dict, decision=None) -> None:
     except Exception as exc:
         decision.update(decision="reject", reason="pending_intent_persistence_failed")
         _live_log(f"[PYRAMID] pending intent persistence failed; no order sent: {exc}")
+        try:
+            from submission_recovery import record_abort
+            from pathlib import Path as _SubmissionPath
+            record_abort(_SubmissionPath(__file__).resolve().parent,
+                         _live["pyramid_entry_pending"], exc)
+            # The exception precedes POST: preserve the abort before releasing
+            # this attempt. Unknown outcomes AFTER POST still remain pending.
+            _live.pop("pyramid_entry_pending", None)
+            _live_save_state()
+        except Exception:
+            pass  # no durable abort proof -> retain the pending barrier
         return
     _live_observe("addon_submission", signals, primary,
                   {"order": dict(body), "attempt": _live["pyramid_entry_pending"]["created_at"],

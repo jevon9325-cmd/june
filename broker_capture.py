@@ -174,12 +174,17 @@ class EvidenceCapture:
             return
         try:
             with closing(self._connect()) as db:
+                cursor=getattr(self, '_retention_rowid', 0)
                 rows = db.execute(
-                    'SELECT DISTINCT payload FROM evidence WHERE forwarded=1 '
-                    'ORDER BY rowid DESC LIMIT ?', (max(1, limit) * 20,)).fetchall()
+                    'SELECT rowid,payload FROM evidence WHERE forwarded=1 AND rowid>? '
+                    'ORDER BY rowid LIMIT ?', (cursor,max(1, limit) * 20)).fetchall()
+                if not rows:
+                    self._retention_rowid=0
+                    return
             seen = set()
             released = 0
-            for (raw,) in rows:
+            for rowid,raw in rows:
+                self._retention_rowid=rowid
                 try:
                     event = json.loads(raw)
                 except (ValueError, TypeError):
@@ -195,8 +200,27 @@ class EvidenceCapture:
                 if not durable_settled:
                     continue
                 try:
-                    if self.store_factory(account).prune_settled(deal, True):
-                        released += 1
+                    store=self.store_factory(account)
+                    field=store._field(deal)
+                    payload=store.client.hget(store.key,field)
+                    if payload is None:continue
+                    if isinstance(payload,bytes):payload=payload.decode('utf-8')
+                    entry=json.loads(payload)
+                    if entry.get('account_id')!=account or entry.get('deal_id')!=deal:continue
+                    # Archive the COMPLETE Redis representation, including any
+                    # historical derived fields, before releasing its mirror.
+                    import hashlib
+                    digest=hashlib.sha256(payload.encode()).hexdigest()
+                    with closing(self._connect()) as archive, archive:
+                        archive.execute('PRAGMA synchronous=FULL')
+                        archive.execute('CREATE TABLE IF NOT EXISTS ledger_archives '
+                            '(account TEXT,deal TEXT,digest TEXT,payload TEXT NOT NULL, '
+                            'PRIMARY KEY(account,deal,digest))')
+                        archive.execute('INSERT OR IGNORE INTO ledger_archives VALUES(?,?,?,?)',
+                            (account,deal,digest,payload))
+                    # Concurrent/new evidence cannot be released under this proof.
+                    if store.client.hget(store.key,field) not in (payload,payload.encode()):continue
+                    if store.prune_settled(deal, True, expected_payload=payload):released += 1
                 except Exception:
                     continue  # Redis failure -> keep; retry a later cycle
                 if released >= max(1, limit):

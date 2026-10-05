@@ -343,7 +343,7 @@ class PendingCloseStore:
         raw = self.client.hget(self.key, self._field(deal_id))
         return _entry_view(json.loads(raw)) if raw is not None else None
 
-    def prune_settled(self, deal_id, durable_archive_present):
+    def prune_settled(self, deal_id, durable_archive_present, *, expected_payload=None):
         """Fail-closed removal of ONE redundant trade:<deal> recovery field.
 
         Redis retention repair (repair/redis-retention-0dfab7b). The ledger is a
@@ -389,7 +389,21 @@ class PendingCloseStore:
             return False
         if (entry.get('partial_exit_pending')):
             return False
-        return bool(self.client.hdel(self.key, field))
+        if expected_payload is None:
+            return bool(self.client.hdel(self.key, field))
+        # Archive release must match the exact version durably copied. WATCH
+        # protects an append racing the archive; never drop unarchived evidence.
+        expected=expected_payload.encode() if isinstance(expected_payload,str) else expected_payload
+        try:
+            with self.client.pipeline() as pipe:
+                pipe.watch(self.key)
+                observed=pipe.hget(self.key,field)
+                observed=observed.encode() if isinstance(observed,str) else observed
+                if observed!=expected:return False
+                pipe.multi();pipe.hdel(self.key,field)
+                return bool(pipe.execute()[0])
+        except WatchError:
+            return False
 
     def get_projection(self, consumer):
         """Audit-only view. Never return an old aggregate as certified value.

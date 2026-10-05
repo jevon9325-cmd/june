@@ -3,6 +3,8 @@ on the caller thread. Data is captured at existing evaluation points, never by
 evaluating an unvisited candidate. SQLite and content hashing run in one worker.
 """
 import collections
+import ast
+from functools import lru_cache
 import contextlib
 import hashlib
 import json
@@ -14,6 +16,7 @@ import sqlite3
 import sys
 import threading
 import time
+import traceback
 import uuid
 import zlib
 
@@ -66,6 +69,27 @@ def freeze(value, depth=0, budget=None):
     if type(value) in (tuple, list, set, frozenset, collections.deque):
         return [freeze(v, depth + 1,budget) for v in value]
     raise TypeError('unsupported decision evidence type')
+
+
+@lru_cache(maxsize=512)
+def state_keys(expression):
+    """Literal keys actually read by a recorded predicate; never evaluate it."""
+    try:
+        tree=ast.parse(expression,mode='eval');keys=set();covered=set()
+        for node in ast.walk(tree):
+            if (isinstance(node,ast.Call) and isinstance(node.func,ast.Attribute)
+                    and isinstance(node.func.value,ast.Name) and node.func.value.id=='_live'
+                    and node.func.attr=='get' and node.args and isinstance(node.args[0],ast.Constant)
+                    and isinstance(node.args[0].value,str)):
+                keys.add(node.args[0].value);covered.add(id(node.func.value))
+            if (isinstance(node,ast.Subscript) and isinstance(node.value,ast.Name)
+                    and node.value.id=='_live' and isinstance(node.slice,ast.Constant)
+                    and isinstance(node.slice.value,str)):
+                keys.add(node.slice.value);covered.add(id(node.value))
+        if any(isinstance(n,ast.Name) and n.id=='_live' and id(n) not in covered for n in ast.walk(tree)):
+            return None
+        return tuple(sorted(keys))
+    except (ValueError,SyntaxError,TypeError):return None
 
 
 def encoded(value):
@@ -291,6 +315,7 @@ class Recorder:
         self.drops = 0
         self.failures = 0
         self._last_diagnostic = 0
+        self._last_error = None
         self._thread = None
         # Production constructs this during module initialization, not entry evaluation.
         if asynchronous and enabled:
@@ -307,6 +332,7 @@ class Recorder:
                 self.store.persist(doc)
             except Exception:
                 self.failures += 1
+                self._last_error = ('persist', doc.get('decision_cycle_id'), traceback.format_exc())
             finally:
                 self.queue.task_done()
             self._diagnose()
@@ -318,6 +344,8 @@ class Recorder:
             self._last_diagnostic = now
             try:
                 logging.warning('DECISION LEDGER GAP: failed=%d dropped=%d; trading unaffected', self.failures, self.drops)
+                if self._last_error:
+                    logging.warning('DECISION LEDGER FAILURE DETAIL: %s', self._last_error)
             except Exception:
                 pass
 
@@ -397,6 +425,7 @@ class Recorder:
             else:self.store.persist(snapshot)  # explicit offline/test mode only
         except Exception:
             doc['gaps'].append('storage_enqueue_or_write');self.drops+=1
+            self._last_error = ('checkpoint', doc.get('decision_cycle_id'), traceback.format_exc())
 
     def note(self, event, values, namespace=None, **metadata):
         """All observation exceptions are contained here. Never returns a verdict."""
@@ -427,7 +456,13 @@ class Recorder:
                     # A membership gate only needs the original map's keys here.
                     inputs[name+'_keys']=list(source[name]);continue
                 if name not in inputs and name in source and type(source[name]) in (int,float,str,bool,dict,list,tuple,set,type(None)):
-                    inputs[name]=freeze(source[name])
+                    keys=state_keys(metadata.get('expression')) if name=='_live' else None
+                    if keys is not None and type(source[name]) is dict:
+                        # Preserve present/missing keys and exact values used by
+                        # this predicate, rather than duplicate unrelated history.
+                        inputs[name]=freeze({k:source[name][k] for k in keys if k in source[name]})
+                        inputs['_live_input_keys']=list(keys)
+                    else:inputs[name]=freeze(source[name])
             for name in ('_b1_snapshot','thesis_snapshot','_htf_cg_verdict','_htf_cg_note','_conf_note'):
                 if name in values:inputs[name]=freeze(values[name])
             if event=='universe':
