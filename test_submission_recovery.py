@@ -2,7 +2,7 @@ import copy,json,sqlite3
 from pathlib import Path
 from unittest.mock import Mock,patch
 import pytest
-from submission_recovery import identity,resolve,record_abort,abort_proof,recover_before_startup
+from submission_recovery import identity,resolve,record_abort,abort_proof,recover_before_startup,recovery_checkpoint
 from live_state_durability import checkpoint,read_checkpoint,persist_state
 from live_state_integrity import assess
 from test_winner_accounting import harness
@@ -98,3 +98,44 @@ def test_abort_archive_failure_retains_barrier(tmp_path):
     with patch('submission_recovery.record_abort',side_effect=OSError('disk failed')):
         ns['_live_add_pyramid_leg']({'GOLD':{'price':100.}}, {})
     ns['_ig_live_post'].assert_not_called();assert ns['_live']['pyramid_entry_pending']
+
+@pytest.mark.parametrize('fault',['exposure','baseline','missing','added_null','old_clock','future','nan','boolean'])
+def test_only_newer_polling_clock_can_be_reconciled(evidence,fault):
+    state=evidence['state'];new=copy.deepcopy(state);new['pnl_fetched_at']=state['pnl_fetched_at']+1
+    if fault=='exposure':new['open_position']={'deal_id':'unknown'}
+    if fault=='baseline':new['balance_day_start']+=1
+    if fault=='missing':new.pop('trade_history')
+    if fault=='added_null':new['unknown_field']=None
+    if fault=='old_clock':new['pnl_fetched_at']-=2
+    if fault=='future':new['pnl_fetched_at']=10**12
+    if fault=='nan':new['pnl_fetched_at']=float('nan')
+    if fault=='boolean':new['pnl_fetched_at']=True
+    assert recovery_checkpoint(state,new)==(None,None)
+
+def test_timestamp_only_recovery_prepares_retention_before_oom_write(tmp_path,evidence):
+    import fakeredis
+    install_telemetry(tmp_path,evidence);state=evidence['state'];r=fakeredis.FakeRedis(decode_responses=True)
+    persist_state(r,tmp_path,state);new=copy.deepcopy(state);new['pnl_fetched_at']+=1;checkpoint(tmp_path,new)
+    broker=Mock(side_effect=lambda path,version: history() if path.startswith('/history/') else
+                {'accounts':[{'accountId':'HT2Q8','preferred':True}]} if path=='/accounts' else
+                {'positions':[]} if path=='/positions' else {'workingOrders':[]})
+    prepared=[];original=r.set
+    def prepare():
+        assert broker.call_count==4
+        assert json.loads(r.get('june_live_state'))==state
+        prepared.append(True)
+    def guarded_set(*args,**kwargs):
+        if not prepared:raise OSError('OOM')
+        return original(*args,**kwargs)
+    with patch.object(r,'set',side_effect=guarded_set):
+        recover_before_startup(r,tmp_path,broker,recovery_prepare=prepare)
+    recovered=json.loads(r.get('june_live_state'));assert recovered==read_checkpoint(tmp_path)
+    assert recovered['pnl_fetched_at']==new['pnl_fetched_at']
+    assert recovered['last_submission_recovery']['checkpoint_polling_clock_reconciliation']['redis']==state['pnl_fetched_at']
+    before=broker.call_count;recover_before_startup(r,tmp_path,broker,recovery_prepare=lambda:pytest.fail('duplicate prepare'))
+    assert broker.call_count==before
+
+def test_unproven_recovery_never_runs_retention(tmp_path,evidence):
+    import fakeredis
+    r=fakeredis.FakeRedis(decode_responses=True);persist_state(r,tmp_path,evidence['state'])
+    recover_before_startup(r,tmp_path,Mock(side_effect=AssertionError('unexpected broker')),recovery_prepare=lambda:pytest.fail('unproven prepare'))

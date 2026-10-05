@@ -14628,7 +14628,8 @@ def _live_startup() -> None:
     from live_state_integrity import guard_startup
     from pathlib import Path as _StatePath
     _persisted_state = guard_startup(_redis(), _StatePath(__file__).resolve().parent,
-                                    _ig_live_get)
+                                    _ig_live_get,
+                                    recovery_prepare=lambda: _live_evidence_capture().replay(limit=32))
     loaded = (_live_load_state(persisted_state=_persisted_state)
               if _persisted_state is not None else False)
     if _persisted_state is not None and not loaded:

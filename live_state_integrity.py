@@ -169,9 +169,9 @@ def startup_state(local, *, history, broker_rows=None, working_orders=None, lega
     raise StateRecoveryRequired('LIVE STATE RECOVERY REQUIRED: '+local.kind+'; '+local.reason)
 
 
-def guard_startup(redis_client, root, broker_get):
+def guard_startup(redis_client, root, broker_get, recovery_prepare=None):
     from submission_recovery import recover_before_startup
-    recover_before_startup(redis_client, root, broker_get)
+    recover_before_startup(redis_client, root, broker_get, recovery_prepare=recovery_prepare)
     local = read_state(lambda: redis_client.get('june_live_state'))
     if local.kind in ('KNOWN_FLAT', 'KNOWN_EXPOSED'):
         from live_state_durability import verify_checkpoint

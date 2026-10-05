@@ -9,6 +9,7 @@ import json
 from pathlib import Path
 import sqlite3
 import time
+import math
 from datetime import datetime, timezone, timedelta
 
 def identity(intent):
@@ -81,7 +82,17 @@ def resolve(state, proof, positions, orders, history, *, account):
     candidate['last_submission_recovery']=receipt
     return candidate,receipt
 
-def recover_before_startup(client,root,broker_get):
+def recovery_checkpoint(state, checkpoint):
+    """Only the newer polling clock may differ after a failed Redis write."""
+    if checkpoint == state:return state,None
+    if not isinstance(checkpoint,dict):return None,None
+    if {k:v for k,v in state.items() if k!='pnl_fetched_at'}!={k:v for k,v in checkpoint.items() if k!='pnl_fetched_at'}:return None,None
+    old=state.get('pnl_fetched_at');new=checkpoint.get('pnl_fetched_at')
+    if any(isinstance(x,bool) or not isinstance(x,(int,float)) or not math.isfinite(x) for x in (old,new)):return None,None
+    if not 0<=old<new<=time.time()+5:return None,None
+    return checkpoint,{'field':'pnl_fetched_at','redis':old,'checkpoint':new}
+
+def recover_before_startup(client,root,broker_get,recovery_prepare=None):
     """Normal durable writer, no manual state edit or stale checkpoint replay."""
     from live_state_integrity import assess
     from live_state_durability import read_checkpoint,persist_state
@@ -89,8 +100,9 @@ def recover_before_startup(client,root,broker_get):
     except Exception:return # existing startup guard reports ERROR/fails closed
     local=assess(raw)
     if not local.state or not local.state.get('pyramid_entry_pending'):return
-    state=local.state;intent=state['pyramid_entry_pending']
-    if read_checkpoint(root)!=state:return
+    state,clock=recovery_checkpoint(local.state,read_checkpoint(root))
+    if state is None:return
+    intent=state['pyramid_entry_pending']
     account=(intent.get('risk_decision') or {}).get('account_id')
     # Original primary opening account is retained in immutable telemetry.
     path=Path(root)/'campaign_telemetry.sqlite3'
@@ -111,6 +123,10 @@ def recover_before_startup(client,root,broker_get):
     positions=broker_get('/positions',version='2');orders=broker_get('/workingorders',version='2')
     candidate,receipt=resolve(state,proof,(positions or {}).get('positions'),(orders or {}).get('workingOrders'),history,account=account)
     if not receipt:return
+    if clock:receipt['checkpoint_polling_clock_reconciliation']=clock
+    # Only normal, enabled settlement retention runs here, after all proof.
+    # Its FULL SQLite archive precedes any release of settled Redis evidence.
+    if recovery_prepare is not None:recovery_prepare()
     if client.get('june_live_state')!=raw:raise RuntimeError('Submission recovery state changed')
     # Receipt is in the full synchronous checkpoint before Redis acknowledgement.
     persist_state(client,root,candidate)

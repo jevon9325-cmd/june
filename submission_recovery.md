@@ -17,7 +17,11 @@ or P&L. A changed/unknown/accepted/lost-acknowledgement result cannot use this
 abort path. It remains gated and startup escalates through StateRecoveryRequired;
 the recovery request is bounded to one 500-record history page and does not
 blindly retry a broker order. A missing/divergent checkpoint cannot authorize
-automatic replay.
+automatic replay. The sole permitted difference is a strictly newer finite
+`pnl_fetched_at` checkpoint polling timestamp, with every other field exactly
+equal. Recovery preserves that newer clock and records both values. After all
+proof succeeds, startup runs enabled normal archive-before-release settlement
+retention before the checkpoint/Redis recovery write; it never changes policy.
 
 Decision gate capture now projects only literal `_live` keys read by its
 recorded expression. Present/missing keys, exact values, gate outcomes and the
