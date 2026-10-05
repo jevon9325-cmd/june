@@ -66,10 +66,13 @@ def test_real_state_roundtrip_preserves_defensive_reference_and_pending_risk():
     evaluate(ns)
     saved = json.loads(ns["_redis"]().set.call_args.args[1])
     ns["_redis"]().get.return_value = json.dumps(saved)
-    ns["_live"] = {}
+    # Pending partial state is retained as recovery evidence, never admitted
+    # as a fresh/flat state by the integrity-aware loader.
+    ns["_live"] = saved
     ns["_live_capture_active"] = Mock()
     execute([function("_live_load_state")], ns)
-    assert ns["_live_load_state"]()
+    assert not ns["_live_load_state"]()
+    assert ns["_live"] == saved
     assert ns["_live"]["global_mode_reference"] == 162.27
     rd = ns["_live"]["pyramid_entry_pending"]["risk_decision"]
     assert rd["f50_protected_before"] > 0  # B2: liquidation_after computed post-confirm only

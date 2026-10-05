@@ -7511,10 +7511,17 @@ def _live_b1_update_excursion(pos: dict, pnl_pct: float) -> None:
         _live_save_state()
 
 
+def _live_persist_state() -> None:
+    """Commit a complete recovery checkpoint before writing Redis working state."""
+    from live_state_durability import persist_state
+    from pathlib import Path
+    persist_state(_redis(), Path(__file__).resolve().parent, _live)
+
+
 def _live_save_state() -> None:
     _live_capture_active("state_snapshot")
     try:
-        _redis().set(_LIVE_REDIS_KEY, json.dumps(_live), ex=_LIVE_REDIS_TTL)
+        _live_persist_state()
     except Exception as _e:
         import logging
         logging.warning(f"live_save_state failed: {_e}")
@@ -7523,17 +7530,22 @@ def _live_save_state() -> None:
 def _live_load_state(persisted_state=None) -> bool:
     """Load persisted state from Redis. Returns True if state was found."""
     global _live
+    import logging
+    from live_state_integrity import assess
     try:
         raw = (json.dumps(persisted_state) if persisted_state is not None
                else _redis().get(_LIVE_REDIS_KEY))
-        if raw:
+        checked = assess(raw)
+        if checked.kind not in ("KNOWN_FLAT", "KNOWN_EXPOSED"):
+            logging.error("Live-state load refused: %s; %s", checked.kind, checked.reason)
+            return False
+        if checked.state is not None:
             _live_capture_active("before_state_load")
-            _live.update(json.loads(raw))
+            _live.update(checked.state)
             _live_capture_active("state_loaded")
             try:
                 _live_validate_rolling_state_on_load()
             except Exception as _ve:
-                import logging
                 logging.warning("rolling_state_validation_error: %s", _ve)
             # Build 4A: extended validation supplement
             try:
@@ -7549,8 +7561,8 @@ def _live_load_state(persisted_state=None) -> bool:
             except Exception as _fr_e:
                 logging.warning("fuel reservation reconcile error (non-fatal): %s", _fr_e)
             return True
-    except Exception:
-        pass
+    except Exception as exc:
+        logging.error("Live-state load failed: %s", type(exc).__name__)
     return False
 
 
@@ -7869,11 +7881,10 @@ def _live_poll_balance() -> None:
             _today_utc  = datetime.now(timezone.utc).strftime("%Y-%m-%d")
             _redis_dkey = f"june_balance_day_start:{_today_utc}"
             if _live.get("balance_day_start_date") != _today_utc or _live.get("balance_day_start", 0.0) <= 0:
-                _redis_val = None
-                try:
-                    _redis_val = _redis().get(_redis_dkey)
-                except Exception:
-                    pass
+                from live_state_durability import baseline_for_day, persist_baseline
+                from pathlib import Path as _BaselinePath
+                _baseline_root = _BaselinePath(__file__).resolve().parent
+                _redis_val = baseline_for_day(_redis(), _baseline_root, _today_utc, _live)
                 if _redis_val:
                     # Restore persisted baseline — avoids CB re-fire on same-day restart
                     _cash_only = float(_redis_val)
@@ -7881,10 +7892,7 @@ def _live_poll_balance() -> None:
                 else:
                     # First genuine seed for this UTC day — persist to Redis (TTL 36h)
                     _cash_only = _live["balance"] + _live["balance_margin"]
-                    try:
-                        _redis().setex(_redis_dkey, 36 * 3600, str(_cash_only))
-                    except Exception:
-                        pass
+                    persist_baseline(_redis(), _baseline_root, _today_utc, _cash_only)
                     _live_log(f"Day-start balance recorded: ${_cash_only:.2f} (cash only, excl unrealized P&L) ({_today_utc})")
                 if _live.get("global_mode") == "defensive" and _live.get("balance_day_start", 0) > 0:
                     _live.setdefault("global_mode_reference", _live["balance_day_start"])
@@ -12049,7 +12057,7 @@ def _live_v1_submit_gen2_replacement(signals: dict, primary: dict) -> None:
         "gen2_v1": True, "reservation_id": reservation_id,
         "created_at": time.time(), "status": "submitting"}
     try:
-        _redis().set(_LIVE_REDIS_KEY, json.dumps(_live), ex=_LIVE_REDIS_TTL)
+        _live_persist_state()
     except Exception as exc:
         # Persist failed BEFORE the durable attempt marker and BEFORE any POST:
         # no order was sent, safe to release (reservation still RESERVED).
@@ -13022,7 +13030,7 @@ def _live_add_pyramid_leg(signals: dict, decision=None) -> None:
                    "intended_notional": notional, "rounded_notional": actual_notional})
     try:
         # Unlike the general best-effort snapshot, this write MUST succeed before POST.
-        _redis().set(_LIVE_REDIS_KEY, json.dumps(_live), ex=_LIVE_REDIS_TTL)
+        _live_persist_state()
     except Exception as exc:
         decision.update(decision="reject", reason="pending_intent_persistence_failed")
         _live_log(f"[PYRAMID] pending intent persistence failed; no order sent: {exc}")
@@ -14670,22 +14678,15 @@ def _live_startup() -> None:
     for k, v in defaults.items():
         _live.setdefault(k, v)
 
-    # Post-load: correct balance_day_start from the per-day Redis key when it exists.
-    # The per-day key (june_balance_day_start:YYYY-MM-DD) is written on the first
-    # genuine seed of each UTC day in _live_poll_balance(). If a prior session seeded
-    # from a wrong IG balance (e.g., stale reading with open margin), this override
-    # corrects the value on every restart before the CB can fire against it.
-    try:
-        _pld_today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-        _pld_val   = _redis().get(f"june_balance_day_start:{_pld_today}")
-        if _pld_val:
-            _pld_saved = _live.get("balance_day_start", 0.0)
-            _live["balance_day_start"]      = float(_pld_val)
-            _live["balance_day_start_date"] = _pld_today
-            if abs(_pld_saved - float(_pld_val)) > 0.01:
-                _live_log(f"Day-start balance RESTORED: ${float(_pld_val):.2f} (state had ${_pld_saved:.2f})")
-    except Exception:
-        pass
+    # Resolve the same UTC baseline from cache, checkpoint or verified live state.
+    # An absent auxiliary Redis key must not replace a known baseline with cash.
+    from live_state_durability import baseline_for_day
+    _pld_today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    _pld_val = baseline_for_day(_redis(), _StatePath(__file__).resolve().parent,
+                                _pld_today, _live)
+    if _pld_val is not None:
+        _live["balance_day_start"] = _pld_val
+        _live["balance_day_start_date"] = _pld_today
 
     # Fetch initial balance (immediate, not deferred)
     global _live_balance_polled_at

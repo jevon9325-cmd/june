@@ -137,7 +137,8 @@ def evaluate_restart_gate(local_reader, broker_reader, orders_reader):
 
 def historical_activity(root):
     """Read-only; absent stores are fresh, unreadable/unrecognized stores unknown."""
-    contracts = {'.settlements.sqlite3': ('settlements',),
+    contracts = {'.live-state-checkpoint.sqlite3': ('checkpoint',),
+                 '.settlements.sqlite3': ('settlements',),
                  '.broker-evidence.sqlite3': ('evidence',),
                  'june_decision_ledger.sqlite3': ('decision_cycles',),
                  'campaign_telemetry.sqlite3': ('campaigns',)}
@@ -171,6 +172,8 @@ def startup_state(local, *, history, broker_rows=None, working_orders=None, lega
 def guard_startup(redis_client, root, broker_get):
     local = read_state(lambda: redis_client.get('june_live_state'))
     if local.kind in ('KNOWN_FLAT', 'KNOWN_EXPOSED'):
+        from live_state_durability import verify_checkpoint
+        verify_checkpoint(redis_client, root, local.state)
         return local.state
     history = historical_activity(root)
     legacy = None

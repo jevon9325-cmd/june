@@ -216,8 +216,12 @@ def _load_poll(state, redis_values, account, now_epoch=1_790_740_100.0):
         "_live_save_state": lambda: None,
         "_live_expire_prior_epoch_global_defensive": _load_expirer(state, logs),
     }
-    fn = _exec_function(JUNE_TREE, "_live_poll_balance", ns)
-    fn()
+    # The durable persistence seam needs an isolated filesystem root.
+    import tempfile
+    with tempfile.TemporaryDirectory() as task_root:
+        ns['__file__'] = str(Path(task_root)/'june.py')
+        fn = _exec_function(JUNE_TREE, "_live_poll_balance", ns)
+        fn()
     return fake, logs, ns
 
 

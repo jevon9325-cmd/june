@@ -295,11 +295,13 @@ class RuntimeTests(CaptureTests):
     def test_runtime_state_overwrite_and_failed_save_preserve_evidence(self):
         ns = self.runtime()
         extract({'_live_save_state', '_live_load_state'}, ns)
+        ns['_live_persist_state'] = lambda: ns['_redis']().set('fixture-state', __import__('json').dumps(ns['_live']))
         ns['_LIVE_REDIS_KEY'], ns['_LIVE_REDIS_TTL'] = 'fixture-state', 3600
         client = ns['_redis']()
         client.set.side_effect = OSError('disconnect')
         ns['_live_save_state']()
-        client.get.return_value = '{"open_position":null,"pyramid_legs":[]}'
+        complete = __import__('json').loads(Path(__file__).with_name('fixtures').joinpath('missing_live_state_incident_20261004.json').read_text())['flat']['local']
+        client.get.return_value = __import__('json').dumps(complete)
         self.assertTrue(ns['_live_load_state']())
         self.assertIsNone(ns['_live']['open_position'])
         self.assertTrue(any(r['event'] == 'before_state_load' for r in self.rows()))

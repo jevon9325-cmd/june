@@ -22,6 +22,10 @@ def function(name):
 
 
 def execute(nodes, ns):
+    # Economic AST harness: mock the persistence seam; real durability is tested
+    # separately against isolated SQLite and Redis failure fixtures.
+    if '_live_persist_state' not in ns:
+        ns['_live_persist_state'] = lambda: ns['_redis']().set(ns.get('_LIVE_REDIS_KEY', 'fixture-state'), json.dumps(ns['_live']))
     exec(compile(ast.Module(body=nodes, type_ignores=[]), "extracted_june_identity", "exec"), ns)
 
 
@@ -189,7 +193,12 @@ class RuntimeIdentityTests(unittest.TestCase):
         memory = {}
         client = SimpleNamespace(set=lambda key, value, **_: memory.update({key: value}), get=memory.get)
         ns["_redis"] = lambda: client
-        ns["_live_save_state"]()
+        complete = json.loads(Path(__file__).with_name('fixtures').joinpath('missing_live_state_incident_20261004.json').read_text())['flat']['local']
+        complete.update(ns['_live'])
+        complete['open_position'].update(deal_id='primary-1', direction='long', ig_size=.16, fill_price=4352.53)
+        complete['pyramid_legs'][0].update(deal_id='addon-1', direction='long', ig_size=.16, fill_price=4352.53)
+        ns['_live'] = complete
+        ns['_live_save_state']()
         ns["_live"] = {}
         self.assertTrue(ns["_live_load_state"]())
         self.assertEqual(ns["_live"]["open_position"]["broker_entry_evidence"]["role"], "primary")
