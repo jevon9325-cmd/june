@@ -7520,11 +7520,12 @@ def _live_save_state() -> None:
         logging.warning(f"live_save_state failed: {_e}")
 
 
-def _live_load_state() -> bool:
+def _live_load_state(persisted_state=None) -> bool:
     """Load persisted state from Redis. Returns True if state was found."""
     global _live
     try:
-        raw = _redis().get(_LIVE_REDIS_KEY)
+        raw = (json.dumps(persisted_state) if persisted_state is not None
+               else _redis().get(_LIVE_REDIS_KEY))
         if raw:
             _live_capture_active("before_state_load")
             _live.update(json.loads(raw))
@@ -14603,8 +14604,17 @@ def _live_startup() -> None:
               flush=True)
         return
 
-    # Load persisted state from prior session
-    loaded = _live_load_state()
+    # Prove persisted-state integrity before defaults or any live-state write.
+    # Missing historic state is recovery, never an ordinary fresh account.
+    from live_state_integrity import guard_startup
+    from pathlib import Path as _StatePath
+    _persisted_state = guard_startup(_redis(), _StatePath(__file__).resolve().parent,
+                                    _ig_live_get)
+    loaded = (_live_load_state(persisted_state=_persisted_state)
+              if _persisted_state is not None else False)
+    if _persisted_state is not None and not loaded:
+        from live_state_integrity import StateRecoveryRequired
+        raise StateRecoveryRequired('Verified live state could not be loaded')
 
     # Ensure all required keys present
     defaults = {
