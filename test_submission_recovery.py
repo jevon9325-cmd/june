@@ -139,3 +139,18 @@ def test_unproven_recovery_never_runs_retention(tmp_path,evidence):
     import fakeredis
     r=fakeredis.FakeRedis(decode_responses=True);persist_state(r,tmp_path,evidence['state'])
     recover_before_startup(r,tmp_path,Mock(side_effect=AssertionError('unexpected broker')),recovery_prepare=lambda:pytest.fail('unproven prepare'))
+
+def test_redis_failure_after_broker_ack_never_replays_or_forgets_deal(tmp_path,evidence):
+    import fakeredis
+    install_telemetry(tmp_path,evidence);r=fakeredis.FakeRedis(decode_responses=True)
+    state=evidence['state'];persist_state(r,tmp_path,state)
+    acknowledged=copy.deepcopy(state)
+    acknowledged['pyramid_entry_pending']['deal_ref']='broker-ack'
+    acknowledged['pyramid_entry_pending']['deal_id']='broker-addon'
+    with patch.object(r,'set',side_effect=OSError('OOM')):
+        with pytest.raises(OSError):persist_state(r,tmp_path,acknowledged)
+    # Checkpoint retains the broker identity; Redis cannot authorize its erasure.
+    recover_before_startup(r,tmp_path,Mock(side_effect=AssertionError('unexpected broker')),
+                           recovery_prepare=lambda:pytest.fail('must not release'))
+    assert read_checkpoint(tmp_path)==acknowledged
+    assert json.loads(r.get('june_live_state'))==state
